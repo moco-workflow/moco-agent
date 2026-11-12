@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-PROMOTE-ALL — the daily promotion run over every agent (design §6.16)
+# ================================================================================
+#
+#   in                       out
+#   ──────────────────────── ──────────────────────────────────────────────────────
+#   max_users?,              {ok, data: {agents: [{agent_id, ok, proposed, expired,
+#   max_proposals?            error}], skipped: [agent_id]}, error}
+#
+# Started daily by its schedule (agent-harness.memory_promote, installed by
+# agent-schedules), or by an admin. Lists the deployed agents (agent-registry), resolves
+# each config sequentially (F52), and runs `memory-promote run` for every agent with
+# memory.long_term.enabled and .promotion (the opt-in pool), with that agent's config
+# -- the schedule's creator, the deploying admin, is the admin memory-promote requires. Agents with long-term memory
+# or promotion off are `skipped`. One agent failing is reported, not raised.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-promote-all
+
+context:
+  agent_ids: []
+  resolved: {}
+  targets: []
+  results: []
+  ok: true
+  error:
+
+input:
+  max_users: 30
+  max_proposals: 3
+
+output:
+  ok: "{{ ok }}"
+  data:
+    agents: "{{ results }}"
+    skipped: "{{ [a for a in agent_ids if a not in targets] }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: list-agents
+      workflow:
+        ref: agent-harness-foundation/agent-registry
+        mode: inline
+        input: {mode: list}
+      output:
+        set:
+          - agent_ids: "{{ sorted(str(a.get('agent_id')) for a in ((((_ or {}).get('data') or {}).get('agents')) or []) if a.get('agent_id')) }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'agent_list_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+
+    - task_name: resolve-agent-configs
+      skip_if: "{{ not agent_ids }}"
+      loop:
+        in: "{{ agent_ids }}"
+        foreach: promote_aid
+        # Sequential (F52): parallel iterations whose inline child starts the same
+        # sync grandchild (agent-registry's package-catalog) collide on its workflow id.
+        execute_mode: sequential
+        do:
+          task_name: resolve-agent-config
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input: {mode: resolve, agent_id: "{{ promote_aid }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - resolved: >-
+              {{ {a: (r.get('data') or {}) for a, r in zip(agent_ids, _ or [])
+                  if isinstance(r, dict) and r.get('ok') and ((r.get('data') or {}).get('config'))} }}
+          - targets: >-
+              {{ [a for a in agent_ids if a in resolved
+                  and ((((resolved[a].get('config') or {}).get('memory') or {}).get('long_term') or {}).get('enabled') is True)
+                  and ((((resolved[a].get('config') or {}).get('memory') or {}).get('long_term') or {}).get('promotion') is True)] }}
+
+    - task_name: promote-each-agent
+      skip_if: "{{ not targets }}"
+      loop:
+        in: "{{ targets }}"
+        foreach: promote_target
+        execute_mode: sequential
+        do:
+          task_name: promote-agent
+          workflow:
+            ref: memory-promote
+            mode: inline
+            input:
+              mode: run
+              agent_id: "{{ promote_target }}"
+              config: "{{ resolved[promote_target]['config'] }}"
+              resolved_refs: "{{ resolved[promote_target].get('resolved_refs') or {} }}"
+              max_users: "{{ max_users }}"
+              max_proposals: "{{ max_proposals }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - results: >-
+              {{ [{'agent_id': a, 'ok': isinstance(r, dict) and r.get('ok') == True,
+                   'proposed': ((r.get('data') or {}).get('proposed') or []) if isinstance(r, dict) else [],
+                   'expired': ((r.get('data') or {}).get('expired') or []) if isinstance(r, dict) else [],
+                   'error': (r.get('error') if isinstance(r, dict) else {'code': 'promote_failed', 'message': str(r)[:300]})}
+                  for a, r in zip(targets, _ or [])] }}

@@ -1,0 +1,166 @@
+test_type: unit-test
+
+# agent-cli, phase 0 (plan-16 step 1). send-message (emit_event) and await-answer
+# (wait_for) cannot be mocked, so the id rules and the result shape are tested
+# step by step; the matching itself is agent-cli-match.test.yaml.
+
+wfspec:
+  name: agent-cli
+
+test_groups:
+  - step_name: build-ids
+    test_cases:
+      - id: a-named-session-and-message-id-are-used-as-given
+        input: {agent_id: skeleton, message: "hi", question: null, session_id: s-1, message_id: m-1, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ sid == 's-1' and mid == 'm-1' }}"
+            - "{{ throwaway == False }}"
+            - "{{ problem is None }}"
+            - "{{ session_workflow_id.startswith('agent-session-skeleton-') and session_workflow_id.endswith('-s-1') }}"
+
+      # F25: no session_id -> a minted, throwaway session.
+      - id: a-missing-session-id-mints-a-throwaway-session
+        input: {agent_id: null, message: "hi", question: null, session_id: null, message_id: null, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ throwaway == True }}"
+            - "{{ sid.startswith('cli-') and len(sid) == 16 }}"
+            - "{{ mid.startswith('m-') and len(mid) == 18 }}"
+            - "{{ aid == 'skeleton' }}"
+            - "{{ problem is None }}"
+
+      - id: question-is-an-alias-of-message
+        input: {agent_id: null, message: null, question: "old client", session_id: null, message_id: null, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ text == 'old client' }}"
+            - "{{ problem is None }}"
+
+      # The ids go into a workflow id: nothing is started with an unsafe one.
+      - id: an-unsafe-session-id-is-refused
+        input: {agent_id: null, message: "hi", question: null, session_id: "a b/../c", message_id: null, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ problem.startswith('session_id must match') }}"
+
+      - id: an-unsafe-agent-id-is-refused
+        input: {agent_id: "Bad Agent", message: "hi", question: null, session_id: null, message_id: null, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ problem.startswith('agent_id must match') }}"
+
+      # A UI reply to a pending action needs no text.
+      - id: an-action-with-an-empty-message-is-accepted
+        input: {agent_id: null, message: "", question: null, session_id: s-1, message_id: null, default_agent_id: skeleton, action: {decision: approve}}
+        expect:
+          assert:
+            - "{{ problem is None }}"
+
+      - id: an-empty-message-is-refused
+        input: {agent_id: null, message: "  ", question: null, session_id: null, message_id: null, default_agent_id: skeleton,
+                agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$", session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"}
+        expect:
+          assert:
+            - "{{ problem == 'message is empty' }}"
+
+  - step_name: format-result
+    test_cases:
+      - id: old-ui-compatibility-fields-are-filled
+        input:
+          problem: null
+          sid: s-1
+          mid: m-1
+          client_workflow_id: c
+          session_workflow_id: w
+          answer_event:
+            data: {message_id: m-1, turn: 4, status: ok, answer: "see [1]", route: rag, sources: [{n: 1, title: retries, url: "http://d/r"}, {n: 2, title: "no url"}]}
+        expect:
+          assert:
+            - "{{ cli_result['sources_urls'] == ['http://d/r'] and cli_result['question_count'] == 4 }}"
+
+      - id: an-answer-is-returned-in-the-contract
+        input:
+          problem: null
+          sid: s-1
+          mid: m-1
+          client_workflow_id: "agent-cli:0.1.0:u:t1"
+          session_workflow_id: "agent-session-skeleton-u-s-1"
+          answer_event:
+            data: {message_id: m-1, session_id: s-1, turn: 3, status: ok, answer: "hello", sources: [], route: chat}
+        expect:
+          assert:
+            - "{{ cli_result['answer'] == 'hello' }}"
+            - "{{ cli_result['status'] == 'ok' }}"
+            - "{{ cli_result['turn'] == 3 }}"
+            - "{{ cli_result['route'] == 'chat' }}"
+            - "{{ cli_result['message_id'] == 'm-1' and cli_result['session_id'] == 's-1' }}"
+            - "{{ cli_result['workflow_id'] == 'agent-cli:0.1.0:u:t1' }}"
+            - "{{ cli_result['session_workflow_id'] is None }}"
+            - "{{ cli_result['pending_action'] is None and cli_result['job'] is None and cli_result['setup'] is None }}"
+
+      # F70: a turn that failed because a model is not set up carries what to set up.
+      - id: a-setup-failure-is-passed-through
+        input:
+          problem: null
+          sid: s-1
+          mid: m-1
+          client_workflow_id: "agent-cli:0.1.0:u:t1"
+          session_workflow_id: "agent-session-skeleton-u-s-1"
+          answer_event:
+            data: {message_id: m-1, session_id: s-1, turn: 1, status: error, answer: "set up", sources: [], route: chat,
+                   setup: {role: inference, reason: secret_missing, secret_name: MY_LLM_TOKEN, scope: user}}
+        expect:
+          assert:
+            - "{{ cli_result['status'] == 'error' and cli_result['setup']['secret_name'] == 'MY_LLM_TOKEN' }}"
+
+      - id: busy-is-passed-through
+        input:
+          problem: null
+          sid: s-1
+          mid: m-2
+          client_workflow_id: "c"
+          session_workflow_id: "w"
+          answer_event:
+            data: {message_id: m-2, status: busy, answer: "still working", turn: null}
+        expect:
+          assert:
+            - "{{ cli_result['status'] == 'busy' }}"
+            - "{{ cli_result['turn'] is None }}"
+
+      # §6.15.1: timeout -> status error with workflow_id and message_id; the
+      # turn continues in the entity.
+      - id: a-timeout-is-an-error-that-says-where-to-look
+        input:
+          problem: null
+          sid: s-1
+          mid: m-1
+          client_workflow_id: "c"
+          session_workflow_id: "agent-session-skeleton-u-s-1"
+          answer_event: null
+        expect:
+          assert:
+            - "{{ cli_result['status'] == 'error' }}"
+            - "{{ cli_result['message_id'] == 'm-1' }}"
+            - "{{ cli_result['workflow_id'] == 'c' }}"
+            - "{{ cli_result['session_workflow_id'] == 'agent-session-skeleton-u-s-1' }}"
+            - "{{ 'still running' in cli_result['answer'] }}"
+
+      - id: an-invalid-request-says-why
+        input:
+          problem: "message is empty"
+          sid: s-1
+          mid: m-1
+          client_workflow_id: "c"
+          session_workflow_id: "w"
+          answer_event: null
+        expect:
+          assert:
+            - "{{ cli_result['status'] == 'error' }}"
+            - "{{ cli_result['answer'] == 'Invalid request: message is empty' }}"
+            - "{{ cli_result['session_workflow_id'] is None }}"

@@ -1,0 +1,101 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# CONVERSATION-COMPACTOR — off-path summary and title jobs (design §6.10.4, §6.10.6)
+# ================================================================================
+#
+#   mode     in                                             emits (to the entity)
+#   ──────── ────────────────────────────────────────────── ────────────────────────
+#   compact  summary, exchanges, upto_turn, entity_id,      compacted {summary,
+#            config, resolved_refs                           upto_turn}
+#   title    message, answer, entity_id, config,            titled {title}
+#            resolved_refs
+#
+# Started DETACHED by agent-session after a turn, so neither job costs the user time.
+# It writes NO rows: the entity is the one live writer of its session rows (§4.3).
+# It sends the result back with a plain emit_event (not start-or-signal: if the
+# session has ended, the result is simply dropped and recomputed next time), and the
+# entity applies it in `idle` -- a summary only when its upto_turn is newer than what
+# the entity holds, so a slow job can never overwrite newer context.
+#
+#   compact  folds the exchanges that just fell out of `recent` into the rolling
+#            summary (prompt.summarize, decision role)
+#   title    a short title from the first exchange (prompt.session.title, decision
+#            role), clamped to 60 chars like the provisional one
+#
+# Failure is quiet: no event, and the entity keeps what it has. A lost compaction
+# leaves those exchanges out of the summary (the transcript still has them).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: conversation-compactor
+
+context:
+  valid_modes: ["compact", "title"]
+  title_chars: 60
+  llm: {}
+
+input:
+  mode: compact
+  agent_id:
+  entity_id:
+  summary: ""
+  exchanges: []
+  upto_turn: 0
+  message: ""
+  answer: ""
+  config: {}
+  resolved_refs: {}
+
+output:
+  ok: "{{ bool(llm.get('ok')) }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "conversation-compactor: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: run-prompt
+      workflow:
+        ref: agent-harness-foundation/llm-invoke
+        mode: inline
+        input:
+          mode: render_and_chat
+          agent_id: "{{ agent_id }}"
+          role: decision
+          models: "{{ (config or {}).get('models') or {} }}"
+          prompt: "{{ 'summarize' if mode == 'compact' else 'session.title' }}"
+          resolved_refs: "{{ resolved_refs }}"
+          variables: >-
+            {{ {'summary': summary, 'exchanges': exchanges} if mode == 'compact'
+               else {'message': message, 'answer': answer} }}
+      output:
+        set:
+          - llm: "{{ _ or {} }}"
+
+    - task_name: shape-result
+      set:
+        - text: "{{ str(((llm.get('data') or {}).get('content') or '')).strip() if llm.get('ok') else '' }}"
+        - title: "{{ text.strip().strip('\"').strip()[:title_chars] if mode == 'title' else '' }}"
+
+    - task_name: send-compacted
+      skip_if: "{{ mode != 'compact' or not text or not entity_id }}"
+      emit_event:
+        target_workflow_id: "{{ entity_id }}"
+        topic: agent-session
+        event_type: compacted
+        data: {summary: "{{ text }}", upto_turn: "{{ int(upto_turn) }}"}
+      on_error: {catch: true}
+
+    - task_name: send-titled
+      skip_if: "{{ mode != 'title' or not title or not entity_id }}"
+      emit_event:
+        target_workflow_id: "{{ entity_id }}"
+        topic: agent-session
+        event_type: titled
+        data: {title: "{{ title }}"}
+      on_error: {catch: true}

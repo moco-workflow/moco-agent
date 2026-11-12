@@ -1,0 +1,292 @@
+test_type: integration-test
+
+# query-router (plan-09 steps 1, 3-7, 9; design §6.7.3). decide is mocked whole by
+# task name (`classify-message`, it returns decide's envelope), and the rewrite by
+# `rewrite-query` (llm-invoke's envelope). A sentinel mock (1 / 0) proves a step did
+# NOT run: had it run, the case would fail.
+
+wfspec:
+  name: query-router
+
+test_data:
+  available: &available
+    - {name: chat, route_description: "Greetings and chit-chat.", examples: [], needs_rewrite: false, requires: {}}
+    - {name: rag, route_description: "A question the indexed docs could answer.", examples: [], needs_rewrite: true, requires: {sources: true}}
+  catalog: &catalog
+    - {name: k8s-runbooks, description: "K8s"}
+    - {name: moco-docs, description: "Moco docs"}
+  config: &config
+    router: {default_profile: chat, slash: {/rag: rag, /claude: claude}}
+    decisions: {route: {source_min_p: 0.55, clarify_min_score: 1.5, min_confidence: 0.5, rewrite_min_p: 0.5}}
+    models: {}
+    memory: {long_term: {enabled: false}}
+  rag_decision: &rag_decision
+    ok: true
+    data:
+      choices: {route: rag}
+      nouls: {moco-docs: 0.8, k8s-runbooks: 0.3, needs_context: 0.1}
+      scores: {ambiguity: 0.2}
+      confidence: {route: 0.8}
+      probabilities: {route: {chat: 0.2, rag: 0.8}}
+      decided_by: system_one
+  sentinel: &sentinel "{{ 1 / 0 }}"
+
+test_cases:
+
+  # ── fast paths ──────────────────────────────────────────────────────────
+  - id: an-action-with-a-pending-action-is-a-pending-reply
+    input: {message: "", action: {decision: approve}, pending_action: {id: pa-1, summary: "restart"}, available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: pending_reply
+        - pending_reply: {decision: approve, feedback: ""}
+        - decided_by: fast_path
+
+  - id: an-empty-message-goes-to-the-default-profile
+    input: {message: "  ", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: chat
+        - decided_by: fast_path
+
+  - id: a-slash-command-picks-its-profile-and-strips-the-command
+    input: {message: "/rag how do retries work?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: rag
+        - rewritten_query: "how do retries work?"
+        - decided_by: fast_path
+
+  - id: a-slash-command-for-an-unavailable-profile-is-classified-normally
+    input: {message: "/claude write me a poem", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: {ok: true, data: {choices: {route: chat}, nouls: {}, scores: {ambiguity: 0}, confidence: {route: 0.9}, probabilities: {route: {chat: 0.9, rag: 0.1}}, decided_by: system_one}}}
+    expect:
+      output:
+        - route: chat
+        - decided_by: system_one
+        - rewritten_query: "/claude write me a poem"
+
+  - id: one-available-profile-needs-no-classifier
+    input: {message: "hello", available: [{name: chat, route_description: "x", requires: {}}], catalog: [], config: *config}
+    mocks:
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: chat
+        - decided_by: only_profile
+
+  - id: classifier-off-means-the-default-profile
+    input: {message: "how do retries work?", available: *available, catalog: *catalog, config: {router: {default_profile: chat, classifier: false}}}
+    mocks:
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: chat
+        - decided_by: fast_path
+
+  # ── classify + interpret ────────────────────────────────────────────────
+  - id: a-self-contained-question-is-routed-with-no-chat-model-call
+    input: {message: "how do retries work?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *rag_decision}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      output:
+        - route: rag
+        - sources: [moco-docs]
+        - confidence: 0.8
+        - decided_by: system_one
+        - rewritten_query: "how do retries work?"
+        - clarify: null
+
+  - id: a-follow-up-that-needs-context-is-rewritten-once
+    input: {message: "and how do I set that?", router_view: [{role: user, content: "how do retries work?"}], available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.9, needs_context: 0.85}, scores: {ambiguity: 0.1}, confidence: {route: 0.9}, probabilities: {route: {chat: 0.1, rag: 0.9}}, decided_by: system_one}}
+      - {step_name: rewrite-query, _: {ok: true, data: {parsed: {rewritten_query: "how do I set a moco retry policy?"}}}}
+    expect:
+      output:
+        - rewritten_query: "how do I set a moco retry policy?"
+      assert:
+        - "{{ trace['rewritten'] == True }}"
+
+  - id: a-failed-rewrite-keeps-the-original
+    input: {message: "and that?", router_view: [{role: user, content: "x"}], available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.9, needs_context: 0.9}, scores: {}, confidence: {route: 0.9}, probabilities: {}, decided_by: system_one}}
+      - {step_name: rewrite-query, _: {ok: false, data: null, error: {code: timeout}}}
+    expect:
+      output:
+        - rewritten_query: "and that?"
+
+  - id: no-source-above-threshold-takes-the-top-one
+    input: {message: "something about pods?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.4, k8s-runbooks: 0.5}, scores: {}, confidence: {route: 0.7}, probabilities: {}, decided_by: system_one}}
+    expect:
+      output:
+        - route: rag
+        - sources: [k8s-runbooks]
+
+  - id: a-sources-profile-with-no-source-asked-about-goes-to-the-default
+    input: {message: "q", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: {ok: true, data: {choices: {route: rag}, nouls: {}, scores: {}, confidence: {route: 0.7}, probabilities: {}, decided_by: system_one}}}
+    expect:
+      output:
+        - route: chat
+        - sources: []
+
+  - id: an-ambiguous-low-confidence-message-asks-to-clarify
+    input: {message: "retries?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.6}, scores: {ambiguity: 1.8}, confidence: {route: 0.45}, probabilities: {route: {chat: 0.55, rag: 0.45}}, decided_by: system_one}}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      output:
+        - route: clarify
+        - clarify: {question: "I'm not sure what you'd like. Is this (a) greetings and chit-chat, or (b) a question the indexed docs could answer?", options: [chat, rag]}
+        - sources: []
+
+  - id: ambiguous-but-confident-is-not-a-clarify
+    input: {message: "retries?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.6}, scores: {ambiguity: 1.8}, confidence: {route: 0.8}, probabilities: {route: {chat: 0.2, rag: 0.8}}, decided_by: system_one}}
+    expect:
+      output:
+        - route: rag
+
+  - id: a-pending-label-with-a-pending-action-is-a-pending-reply
+    input: {message: "yes, go ahead", pending_action: {id: pa-1, summary: "restart"}, available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: {ok: true, data: {choices: {route: pending_approve}, nouls: {}, scores: {}, confidence: {route: 0.9}, probabilities: {}, decided_by: system_one}}}
+    expect:
+      output:
+        - route: pending_reply
+        - pending_reply: {decision: approve, feedback: "yes, go ahead"}
+
+  # Re-validation (§11.1): a label the router never offered cannot get through.
+  - id: a-pending-label-without-a-pending-action-is-the-default
+    input: {message: "yes", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: {ok: true, data: {choices: {route: pending_approve}, nouls: {}, scores: {}, confidence: {route: 0.9}, probabilities: {}, decided_by: llm}}}
+    expect:
+      output:
+        - route: chat
+        - pending_reply: null
+
+  - id: both-backends-down-means-the-default-profile
+    input: {message: "how do retries work?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: {ok: false, data: null, error: {code: unavailable}}}
+    expect:
+      output:
+        - route: chat
+        - decided_by: default
+
+  - id: tags-are-message-words-in-the-vocabulary
+    input: {message: "Retry the Helm deploy", tag_vocabulary: [helm, retry, kafka], available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *rag_decision}
+    expect:
+      output:
+        - tags: [helm, retry]
+
+  - id: no-available-profile-raises
+    input: {message: "hi", available: [], config: *config}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "query-router: no profile is available (check profile-availability's reasons)"
+
+  # Follow-up backstop (plan-09 §8): the noul says no, the words say "its".
+  - id: a-deictic-follow-up-is-rewritten-even-when-the-noul-misses-it
+    input: {message: "and what is its default timeout?", router_view: [{role: user, content: "retries?"}], available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - step_name: classify-message
+        _: {ok: true, data: {choices: {route: rag}, nouls: {moco-docs: 0.6, needs_context: 0.17}, scores: {}, confidence: {route: 0.8}, probabilities: {}, decided_by: system_one}}
+      - {step_name: rewrite-query, _: {ok: true, data: {parsed: {rewritten_query: "what is the default timeout of an activity retry policy?"}}}}
+    expect:
+      output:
+        - rewritten_query: "what is the default timeout of an activity retry policy?"
+      assert:
+        - "{{ trace['deictic'] == True and trace['needs_context'] == 0.17 }}"
+
+  - id: without-history-a-deictic-word-is-not-a-follow-up
+    input: {message: "what is that error about timeouts?", available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *rag_decision}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      assert:
+        - "{{ trace['deictic'] == False and rewritten_query == 'what is that error about timeouts?' }}"
+
+  - id: a-self-contained-question-with-history-is-not-rewritten
+    input: {message: "what is a state machine checkpoint?", router_view: [{role: user, content: "hi"}], available: *available, catalog: *catalog, config: *config}
+    mocks:
+      - {step_name: classify-message, _: *rag_decision}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      assert:
+        - "{{ trace['deictic'] == False and trace['rewritten'] == False }}"
+
+  # ── custom router (phase 2, §6.7.2) ─────────────────────────────────────
+  - id: a-custom-router-replaces-the-pipeline-and-is-revalidated
+    input:
+      message: "how do retries work?"
+      available: *available
+      catalog: *catalog
+      config: {router: {default_profile: chat, custom: router.house}, decisions: {route: {source_min_p: 0.55, clarify_min_score: 1.5, min_confidence: 0.5, rewrite_min_p: 0.5}}, models: {}}
+    mocks:
+      - {step_name: run-custom-router, _: {route: rag, confidence: 0.9, sources: [moco-docs, not-a-source], rewritten_query: "how do moco retries work?", decided_by: house-rules}}
+      - {step_name: classify-message, _: *sentinel}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      output:
+        - route: rag
+        - sources: [moco-docs]
+        - rewritten_query: "how do moco retries work?"
+        - decided_by: house-rules
+        - confidence: 0.9
+
+  - id: a-custom-route-to-an-unavailable-profile-falls-to-the-default
+    input:
+      message: "x"
+      available: *available
+      catalog: *catalog
+      config: {router: {default_profile: chat, custom: router.house}, decisions: {route: {source_min_p: 0.55, clarify_min_score: 1.5, min_confidence: 0.5, rewrite_min_p: 0.5}}, models: {}}
+    mocks:
+      - {step_name: run-custom-router, _: {route: claude}}
+      - {step_name: classify-message, _: *sentinel}
+    expect:
+      output:
+        - route: chat
+      assert:
+        - "{{ trace['revalidated'] == True }}"
+
+  - id: a-failing-custom-router-falls-back-to-the-pipeline
+    input:
+      message: "how do retries work?"
+      available: *available
+      catalog: *catalog
+      config: {router: {default_profile: chat, custom: router.house}, decisions: {route: {source_min_p: 0.55, clarify_min_score: 1.5, min_confidence: 0.5, rewrite_min_p: 0.5}}, models: {}}
+    mocks:
+      - {step_name: run-custom-router, _: *sentinel}
+      - {step_name: classify-message, _: *rag_decision}
+      - {step_name: rewrite-query, _: *sentinel}
+    expect:
+      output:
+        - route: rag
+        - decided_by: system_one

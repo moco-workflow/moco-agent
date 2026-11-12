@@ -1,0 +1,8 @@
+{
+    "wfspec_package_name": "agent-ops-assistant",
+    "wfspec_package_version": "1.4.1",
+    "wfspec_description": "Ops Assistant: the minimal second agent (plan-18 step 4). Phase 2: chat + react over read-only k8s tool manifests, still no logic wfspecs.",
+    "share_to_all": true,
+    "sources": ["src/**/*.yaml"],
+    "tests": ["tests/**/*.test.yaml"]
+}

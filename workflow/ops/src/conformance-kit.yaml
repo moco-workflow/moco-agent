@@ -1,0 +1,146 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# CONFORMANCE-KIT — does an extension honour its contract? (plan-03 step 9, §5.5)
+# ================================================================================
+#
+#   in                                         out
+#   ────────────────────────────────────────── ──────────────────────────────────────
+#   kind: profile | source | hook | guard |    {conforms, problems: [text], output}
+#         provider | router, wfspec, input?,
+#         timeout_sec?
+#
+# Runs the extension (a `sync` child, bounded) with a SHARED FIXTURE for its kind --
+# or the caller's `input` -- and checks the output against the contract:
+#   profile   §6.8.1  status in the six, answer a string, sources a list of {title?, url?},
+#                     grounded a bool, usage a mapping; needs_approval → a pending_action
+#                     with kind + summary; handoff → handoff.profile
+#   source    §6.5.2  passages a list of {text, title?, url?, score?}; error null | {code, message}
+#   hook      §5.4    action in continue | patch | block; patch a mapping when patch
+#   guard     §6.13   verdict present, action in annotate | redact | block; redact → answer
+#   provider  §6.6.2  block a mapping with content or items; droppable_unit whole | item
+#   router    §6.7.2  route a string; sources, tags lists; decided_by a string
+# For CI on the dev stage, every agent package's extensions (references resolve only
+# against deployed packages, P7). A run that raises does not conform.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: conformance-kit
+
+context:
+  valid_kinds: ["profile", "source", "hook", "guard", "provider", "router"]
+  fixtures:
+    profile:
+      profile: {name: kit, kind: wfspec}
+      query: "how do retries work?"
+      rewritten_query: "how do retries work in moco?"
+      router: {route: kit, sources: [], tags: [], confidence: 0.9}
+      context_bundle: {blocks: [{id: question, items: [{original: "how do retries work?", rewritten: ""}]}], used_memory: []}
+      config: {}
+      resolved_refs: {}
+      budget_sec: 30
+      session_id: kit-session
+      turn: 1
+    source: {query: "how do retries work?", top_k: 2, config: {}, budget_sec: 10}
+    hook: {hook_event: answer.ready, payload: {answer: "Retries are per activity.", sources: []}, agent_id: kit, session_id: kit-session}
+    guard: {question: "how do retries work?", answer: "Retries are per activity.", passages: [{n: 1, text: "Retries are configured per activity."}], agent_id: kit}
+    provider:
+      session_id: kit-session
+      question: {original: "how do retries work?", rewritten: ""}
+      memory_recall: {}
+      conversation: {recent: []}
+      pending_action:
+      jobs: []
+      config: {}
+    router:
+      message: "how do retries work?"
+      router_view: []
+      profiles: [{name: chat, route_description: "chit-chat"}, {name: rag, route_description: "docs questions"}]
+      sources: [{name: moco-docs, description: "Moco docs"}]
+      pending_action:
+      tag_vocabulary: []
+      config: {}
+  run_out:
+  run_error:
+
+input:
+  kind:
+  wfspec:
+  input:
+  timeout_sec: 60
+
+output:
+  conforms: "{{ conforms }}"
+  problems: "{{ problems }}"
+  output: "{{ run_out }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-kind
+      raise:
+        if: "{{ kind not in valid_kinds or not wfspec }}"
+        type: error
+        error_type: AbortError
+        message: "conformance-kit: kind must be one of {{ ', '.join(valid_kinds) }} and wfspec is required"
+
+    - task_name: run-extension
+      workflow:
+        ref: "{{ wfspec }}"
+        mode: sync
+        input: "{{ input if isinstance(input, dict) else fixtures[kind] }}"
+        options:
+          retry_policy:
+            timeout_sec: "{{ int(timeout_sec) }}"
+            max_attempts: 1
+      output:
+        set:
+          - run_out: "{{ _ }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - run_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:300] }}"
+
+    - task_name: check-contract
+      set:
+        - o: "{{ run_out if isinstance(run_out, dict) else {} }}"
+        - _src: "{{ o.get('sources') }}"
+        - problems#: >-
+            {{ (['the run failed: ' + run_error] if run_error else
+                ['the output is not a mapping'] if not isinstance(run_out, dict) else []) +
+               ([] if run_error or not isinstance(run_out, dict) else
+                [p for p in (
+                  [('status must be one of ok, declined, needs_approval, async_started, handoff, error')
+                     if o.get('status') not in ['ok', 'declined', 'needs_approval', 'async_started', 'handoff', 'error'] else None,
+                   'answer must be a string' if not isinstance(o.get('answer'), str) else None,
+                   'sources must be a list of mappings' if not (isinstance(_src, list) and all(isinstance(x, dict) for x in _src)) else None,
+                   'grounded must be a bool' if not isinstance(o.get('grounded'), bool) else None,
+                   'usage must be a mapping' if not isinstance(o.get('usage'), dict) else None,
+                   'needs_approval needs pending_action {kind, summary}'
+                     if o.get('status') == 'needs_approval' and not (isinstance(o.get('pending_action'), dict)
+                        and o['pending_action'].get('kind') and o['pending_action'].get('summary')) else None,
+                   'handoff needs handoff.profile'
+                     if o.get('status') == 'handoff' and not (o.get('handoff') or {}).get('profile') else None]
+                   if kind == 'profile' else
+                  ['passages must be a list of {text, ...}'
+                     if not (isinstance(o.get('passages'), list) and all(isinstance(x, dict) and isinstance(x.get('text'), str) for x in o['passages'])) else None,
+                   'error must be null or {code, message}'
+                     if o.get('error') is not None and not (isinstance(o['error'], dict) and o['error'].get('code')) else None]
+                   if kind == 'source' else
+                  ['action must be continue, patch or block' if o.get('action') not in ['continue', 'patch', 'block'] else None,
+                   'a patch needs a patch mapping' if o.get('action') == 'patch' and not isinstance(o.get('patch'), dict) else None]
+                   if kind == 'hook' else
+                  ['verdict is required' if 'verdict' not in o else None,
+                   'action must be annotate, redact or block' if o.get('action', 'annotate') not in ['annotate', 'redact', 'block'] else None,
+                   'redact needs an answer' if o.get('action') == 'redact' and not isinstance(o.get('answer'), str) else None]
+                   if kind == 'guard' else
+                  ['block must be a mapping with content or items'
+                     if not (isinstance(o.get('block'), dict) and (o['block'].get('content') or isinstance(o['block'].get('items'), list))) else None,
+                   'droppable_unit must be whole or item'
+                     if isinstance(o.get('block'), dict) and o['block'].get('droppable_unit') not in [None, 'whole', 'item'] else None]
+                   if kind == 'provider' else
+                  ['route must be a string' if not isinstance(o.get('route'), str) else None,
+                   'sources and tags must be lists' if not (isinstance(o.get('sources', []), list) and isinstance(o.get('tags', []), list)) else None,
+                   'decided_by must be a string' if not isinstance(o.get('decided_by', ''), str) else None])
+                 if p is not None]) }}
+        - conforms: "{{ not problems }}"

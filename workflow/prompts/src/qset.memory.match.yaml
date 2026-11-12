@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.MEMORY.MATCH — does this exchange repeat or contradict a remembered item?
+# ================================================================================
+#
+#   variables                        out
+#   ──────────────────────────────── ─────────────────────────────────────────────
+#   exchange: {user, assistant},     {kind: system_one, state, questions, keymap}
+#   | note: {title, text},
+#   candidates: [{key, title, text}]
+#
+# memory-curator's pre-match (design §6.4.6, refined in memory-curator's header). The
+# state is ONE exchange; the questions are about the candidates -- many questions
+# about one state, the working pattern (F44):
+#   same_<i>      noul  the exchange says the same thing as candidate i
+#   conflict_<i>  noul  the exchange contradicts candidate i
+# At most `max_candidates` (10, §7.3: ≤ 20 questions offline). Keys are positional;
+# keymap is empty, so the curator reads same_<i> against its own candidate list.
+#
+# NOTE instead of an exchange (memory-promote, phase 3): the state is one remembered
+# note ("Note: <title> -- <text>") and the questions ask whether it says the same as /
+# contradicts each candidate note of other users. Same keys, same reading.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.memory.match
+
+context:
+  exchange_chars: 1500
+  item_chars: 300
+  max_candidates: 10
+
+input:
+  exchange: {}
+  note: {}
+  candidates: []
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: {}
+
+main:
+  task_name: build-match-qset
+  set:
+    - _x: "{{ exchange if isinstance(exchange, dict) else {} }}"
+    - _note: "{{ note if isinstance(note, dict) and note.get('title') else None }}"
+    - _what: "{{ 'note' if _note else 'exchange' }}"
+    - state: >-
+        {{ ('Note: ' + str(_note.get('title') or '').strip() + ' -- ' + str(_note.get('text') or '').strip())[:exchange_chars] if _note else
+           ('User: ' + str(_x.get('user') or '').strip() + '\n\nAssistant: ' + str(_x.get('assistant') or '').strip())[:exchange_chars] }}
+    - _c: "{{ [c for c in (candidates or []) if isinstance(c, dict)][:max_candidates] }}"
+    - _all: >-
+        {{ dict([('same_' + str(i), {'type': 'noul',
+                                     'instructions': 'Does this ' + _what + ' state the same thing as this remembered note: "'
+                                                     + (str(c.get('title') or '') + ' -- ' + str(c.get('text') or ''))[:item_chars] + '"?'})
+                 for i, c in enumerate(_c)]
+                + [('conflict_' + str(i), {'type': 'noul',
+                                           'instructions': 'Does this ' + _what + ' contradict this remembered note: "'
+                                                           + (str(c.get('title') or '') + ' -- ' + str(c.get('text') or ''))[:item_chars] + '"?'})
+                   for i, c in enumerate(_c)]) }}
+    - questions: "{{ {k: dict(sorted(_all[k].items())) for k in sorted(_all)} }}"

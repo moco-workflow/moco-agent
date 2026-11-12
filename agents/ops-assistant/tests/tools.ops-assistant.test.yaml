@@ -1,0 +1,27 @@
+test_type: integration-test
+
+# tools.ops-assistant: the manifests are data with unevaluated templates, every tool
+# is in the k8s-readonly toolset, bindings stay on the allowlist (k8s.get / k8s.list),
+# and only k8s_get_secret needs approval. plan-10 §6's "every manifest passes validate
+# and dry_run" runs against the harness (seed-tools, deployed).
+
+wfspec:
+  name: tools.ops-assistant
+
+test_cases:
+  - id: five-readonly-manifests-in-one-toolset
+    input: {}
+    expect:
+      assert:
+        - "{{ sorted(t['name'] for t in tools) == ['k8s_get_deployment', 'k8s_get_secret', 'k8s_list_deployments', 'k8s_list_events', 'k8s_list_pods'] }}"
+        - "{{ toolsets[0]['name'] == 'k8s-readonly' and sorted(toolsets[0]['tools']) == sorted(t['name'] for t in tools) }}"
+        - "{{ all(list(t['binding']) == ['activity'] and t['binding']['activity']['type'] in ['k8s.get', 'k8s.list'] for t in tools) }}"
+        - "{{ all(t['policy']['side_effects'] == 'read' for t in tools) }}"
+        - "{{ [t['name'] for t in tools if t['policy']['permission'] != 'auto'] == ['k8s_get_secret'] }}"
+
+  - id: templates-are-kept-for-the-executor
+    input: {}
+    expect:
+      assert:
+        # chr(123): a literal pair of braces in the assert would turn it into a string
+        - "{{ [t for t in tools if t['name'] == 'k8s_list_pods'][0]['binding']['activity']['input_template']['connection']['api_server'] == chr(123) * 2 + \" config['api_server'] \" + chr(125) * 2 }}"

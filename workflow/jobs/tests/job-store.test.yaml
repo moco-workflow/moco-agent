@@ -1,0 +1,321 @@
+test_type: integration-test
+
+# job-store (plan-13, design §6.12): create, every legal transition and the illegal
+# ones, progress updates, pending_action kept only while awaiting, the result shape,
+# mark_delivered (once, then already), list filters, delete, owner checks.
+
+wfspec:
+  name: job-store
+
+test_data:
+  queued: &queued
+    {schema_version: 1, job_id: job-a1, session_id: s1, profile: builder, wfspec: subagent.builder, workflow_id: agent-job-ops-u1-job-a1, summary: "build it", status: queued, progress: null, pending_action: null, result: null, error: null, created_at: "2026-10-13T10:00:00", updated_at: "2026-10-13T10:00:00", delivered_at: null}
+  running: &running
+    {schema_version: 1, job_id: job-a1, session_id: s1, profile: builder, status: running, progress: {message: started}, pending_action: null, result: null, error: null, created_at: "2026-10-13T10:00:00", delivered_at: null}
+  awaiting: &awaiting
+    {schema_version: 1, job_id: job-a1, session_id: s1, profile: builder, status: awaiting_input, progress: {message: planned}, pending_action: {kind: plan_review, summary: "Plan ready"}, result: null, error: null, created_at: "2026-10-13T10:00:00", delivered_at: null}
+  completed: &completed
+    {schema_version: 1, job_id: job-a1, session_id: s1, profile: builder, status: completed, progress: null, pending_action: null, result: {answer: done, sources: [], artifacts: []}, error: null, created_at: "2026-10-13T10:00:00", delivered_at: null}
+  delivered: &delivered
+    {schema_version: 1, job_id: job-a1, session_id: s1, profile: builder, status: completed, result: {answer: done, sources: [], artifacts: []}, created_at: "2026-10-13T10:00:00", delivered_at: "2026-10-13T11:00:00"}
+  newer: &newer
+    {schema_version: 9, job_id: job-a1, status: running}
+
+test_cases:
+
+  # ── create ──────────────────────────────────────────────────────────────
+  - id: create-writes-a-queued-row
+    input: {mode: create, agent_id: ops, job_id: job-a1, session_id: s1, profile: builder, wfspec: subagent.builder, workflow_id: agent-job-ops-u1-job-a1, summary: "build it"}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'queued' and data['job']['schema_version'] == 1 and data['job']['delivered_at'] is None }}"
+        - "{{ data['job']['session_id'] == 's1' and data['job']['wfspec'] == 'subagent.builder' and data['job']['workflow_id'] == 'agent-job-ops-u1-job-a1' }}"
+
+  - id: create-over-an-existing-row-is-already-exists
+    input: {mode: create, agent_id: ops, job_id: job-a1, session_id: s1, profile: builder, wfspec: subagent.builder}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: already_exists, message: "job job-a1 already exists", retryable: false}
+
+  - id: create-without-a-wfspec-is-invalid-input
+    input: {mode: create, agent_id: ops, job_id: job-a1, session_id: s1, profile: builder}
+    mocks:
+      - {step_name: read-current, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "create needs session_id, profile and wfspec", retryable: false}
+
+  # ── legal transitions ───────────────────────────────────────────────────
+  - id: queued-to-running
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running, progress: {message: started}}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'running' and data['job']['progress'] == {'message': 'started'} }}"
+
+  - id: queued-to-failed-when-the-entity-cannot-start
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: failed, error_info: {code: start_failed, message: "no entity"}}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'failed' and data['job']['error'] == {'code': 'start_failed', 'message': 'no entity'} }}"
+
+  - id: queued-to-cancelled
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: cancelled, error_info: "user asked"}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'cancelled' and data['job']['error'] == {'code': 'cancelled', 'message': 'user asked'} }}"
+
+  - id: running-to-running-is-a-progress-update
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running, progress: {message: "step 2 of 3"}}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'running' and data['job']['progress'] == {'message': 'step 2 of 3'} }}"
+
+  - id: a-transition-without-progress-keeps-the-old-progress
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['job']['progress'] == {'message': 'started'} }}"
+
+  - id: running-to-awaiting-input-keeps-the-pending-action
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: awaiting_input, pending_action: {kind: plan_review, summary: "Plan ready", detail: {plan: p1}}}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'awaiting_input' and data['job']['pending_action']['detail'] == {'plan': 'p1'} }}"
+
+  - id: awaiting-input-to-running-drops-the-pending-action
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'running' and data['job']['pending_action'] is None }}"
+
+  - id: awaiting-input-to-cancelled
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: cancelled, error_info: {code: expired, message: "too late"}}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'cancelled' and data['job']['error']['code'] == 'expired' and data['job']['pending_action'] is None }}"
+
+  - id: awaiting-input-to-failed
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: failed, error_info: {code: job_failed, message: boom}}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'failed' }}"
+
+  - id: running-to-completed-stores-the-result-shape
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: completed, result: {status: ok, answer: "Built hello-world", sources: [{title: spec}], artifacts: [{name: hello.yaml}], trace: {big: true}}}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'completed' and data['job']['result'] == {'answer': 'Built hello-world', 'sources': [{'title': 'spec'}], 'artifacts': [{'name': 'hello.yaml'}]} }}"
+        - "{{ data['job']['error'] is None and data['job']['pending_action'] is None }}"
+
+  - id: running-to-failed
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: failed, error_info: {code: job_failed, message: "it broke"}}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'failed' and data['job']['error'] == {'code': 'job_failed', 'message': 'it broke'} }}"
+
+  - id: running-to-cancelled
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: cancelled}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'cancelled' }}"
+
+  # ── illegal transitions ─────────────────────────────────────────────────
+  - id: queued-to-completed-is-invalid-state
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: completed}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is queued; it cannot become completed", retryable: false}
+
+  - id: queued-to-awaiting-input-is-invalid-state
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: awaiting_input}
+    mocks:
+      - {step_name: read-current, _: *queued}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is queued; it cannot become awaiting_input", retryable: false}
+
+  - id: awaiting-input-to-completed-is-invalid-state
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: completed}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is awaiting_input; it cannot become completed", retryable: false}
+
+  - id: a-finished-job-cannot-run-again
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running}
+    mocks:
+      - {step_name: read-current, _: *completed}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is completed; it cannot become running", retryable: false}
+
+  - id: a-cancelled-job-refuses-a-late-report
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: completed}
+    mocks:
+      - {step_name: read-current, _: {schema_version: 1, job_id: job-a1, status: cancelled}}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is cancelled; it cannot become completed", retryable: false}
+
+  - id: transition-of-a-missing-job-is-not-found
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: not_found, message: "no job job-a1", retryable: false}
+
+  - id: a-newer-schema-row-is-not-read
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: running}
+    mocks:
+      - {step_name: read-current, _: *newer}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: not_found, message: "no job job-a1", retryable: false}
+
+  - id: an-unknown-status-is-invalid-input
+    input: {mode: transition, agent_id: ops, job_id: job-a1, to: paused}
+    mocks:
+      - {step_name: read-current, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "to must be one of queued, running, awaiting_input, completed, failed, cancelled", retryable: false}
+
+  - id: a-bad-job-id-is-invalid-input
+    input: {mode: get, agent_id: ops, job_id: "job a1"}
+    mocks:
+      - {step_name: read-current, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "job_id must match ^[A-Za-z0-9_.-]{1,64}$", retryable: false}
+
+  # ── get / mark_delivered ────────────────────────────────────────────────
+  - id: get-returns-the-row-or-null
+    input: {mode: get, agent_id: ops, job_id: job-a1}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data == {'job': None} }}"
+
+  - id: mark-delivered-stamps-a-finished-job
+    input: {mode: mark_delivered, agent_id: ops, job_id: job-a1}
+    mocks:
+      - {step_name: read-current, _: *completed}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['already'] == False and bool(data['job']['delivered_at']) and data['job']['status'] == 'completed' }}"
+
+  - id: mark-delivered-twice-is-ok-and-writes-nothing
+    input: {mode: mark_delivered, agent_id: ops, job_id: job-a1}
+    mocks:
+      - {step_name: read-current, _: *delivered}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['already'] == True and data['job']['delivered_at'] == '2026-10-13T11:00:00' }}"
+
+  - id: mark-delivered-on-a-running-job-is-invalid-state
+    input: {mode: mark_delivered, agent_id: ops, job_id: job-a1}
+    mocks:
+      - {step_name: read-current, _: *running}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-a1 is running; only a finished job is delivered", retryable: false}
+
+  # ── list / delete ───────────────────────────────────────────────────────
+  - id: list-filters-by-session-and-status-oldest-first
+    input: {mode: list, agent_id: ops, session_id: s1, status: [queued, running, awaiting_input]}
+    mocks:
+      - {step_name: list-job-keys, _: [{key: "job:a"}, {key: "job:b"}, {key: "job:c"}, {key: "job:d"}]}
+      # Loops cannot be mocked, the activity inside can: one row per job_key.
+      - step_name: read-job-row
+        _: >-
+          {{ {'job:a': {'schema_version': 1, 'job_id': 'a', 'session_id': 's1', 'status': 'queued', 'created_at': '2026-10-13T10:01:00'},
+              'job:b': {'schema_version': 1, 'job_id': 'b', 'session_id': 's1', 'status': 'running', 'created_at': '2026-10-13T10:05:00'},
+              'job:c': {'schema_version': 1, 'job_id': 'c', 'session_id': 's2', 'status': 'running', 'created_at': '2026-10-13T10:00:00'},
+              'job:d': {'schema_version': 1, 'job_id': 'd', 'session_id': 's1', 'status': 'completed', 'created_at': '2026-10-13T09:00:00'}}[job_key] }}
+    expect:
+      assert:
+        - "{{ ok == True and [j['job_id'] for j in data['jobs']] == ['a', 'b'] }}"
+
+  - id: list-with-an-unknown-status-is-invalid-input
+    input: {mode: list, agent_id: ops, status: [done]}
+    mocks:
+      - {step_name: list-job-keys, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "status must be among queued, running, awaiting_input, completed, failed, cancelled", retryable: false}
+
+  - id: delete-removes-the-row
+    input: {mode: delete, agent_id: ops, job_id: job-a1}
+    mocks:
+      - {step_name: read-current, _: *completed}
+      - {step_name: delete-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data == {'deleted': True} }}"
+
+  # ── F50 closed: an owner_user_id input is ignored ───────────────────────
+  - id: an-owner-user-id-input-addresses-only-the-callers-rows
+    input: {mode: get, agent_id: ops, job_id: job-a1, owner_user_id: someone-else}
+    mocks:
+      - step_name: read-current
+        _: "{{ None if sessions_ns == 'agent.ops.sessions' else 1 / 0 }}"
+    expect:
+      assert:
+        - "{{ ok == True and data == {'job': None} }}"

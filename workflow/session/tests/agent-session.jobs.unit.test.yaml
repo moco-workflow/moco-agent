@@ -1,0 +1,322 @@
+test_type: unit-test
+
+# agent-session, phase 3: jobs (plan-13, plan-14 step 24). Split from
+# agent-session.unit.test.yaml so each suite stays under moco test's default 300 s request
+# timeout. Same approach: the decisions live in named steps.
+#
+#   decide-tick        no retire or idle stop while a job is active
+#   finish-job         a started job in the answer and meta.jobs; limit / start failures
+#   plan-relay         what to deliver, what to open, what to drop, the jobs list
+#   finish-relay       the relayed turns, the pending action, the meta patch
+#   finish-job-resume  a reply to a job's question: sent / rejected / job already gone
+
+wfspec:
+  name: agent-session
+
+test_data:
+  config: &config
+    session: {idle_tick_sec: 300, checkpoint_sec: 240, apology_text: "SORRY"}
+    limits: {turn_budget_sec: 110, max_queued_messages: 1, retire_after_idle_sec: 86400, retire_throwaway_after_idle_sec: 600}
+    memory: {short_term: {recent_turns: 2}}
+    persona_text: "You are terse."
+
+test_groups:
+  - step_name: decide-tick
+    test_cases:
+      - id: an-active-job-keeps-an-idle-session-alive
+        input:
+          config: *config
+          meta: {throwaway: false}
+          jobs: [{job_id: j1, status: awaiting_input}]
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=86401)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == False and stop_due == False }}"
+
+      - id: an-active-job-holds-off-the-idle-stop
+        input:
+          config: *config
+          meta: {throwaway: false}
+          jobs: [{job_id: j1, status: running}]
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=900)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ stop_due == False and tick_stop_reason == '' }}"
+
+      - id: a-finished-job-does-not
+        input:
+          config: *config
+          meta: {throwaway: false}
+          jobs: [{job_id: j1, status: completed}]
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=86401)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == True }}"
+
+  - step_name: finish-job
+    test_cases:
+      - id: a-started-job-joins-meta-and-the-answer
+        input:
+          turn_status: async_started
+          turn_answer: "Planning your workflow in the background."
+          profile: {name: builder}
+          jobs: []
+          job_start_result: {ok: true, data: {job_id: job-abc, workflow_id: agent-job-x, job: {summary: "build hello"}}}
+          answer_event: {message_id: m1, status: async_started, answer: "Planning your workflow in the background."}
+          turn_entries: [{role: user, content: q}, {role: assistant, content: "Planning your workflow in the background.", status: async_started}]
+          new_recent: [{role: user, content: q}, {role: assistant, content: "Planning your workflow in the background."}]
+          meta_patch: {title: t}
+        expect:
+          assert:
+            - "{{ turn_status == 'async_started' and answer_event['job'] == {'job_id': 'job-abc', 'status': 'queued'} }}"
+            - "{{ [j['job_id'] for j in jobs] == ['job-abc'] and jobs[0]['status'] == 'queued' and meta_patch['jobs'] == jobs }}"
+            - "{{ turn_entries[1]['job_id'] == 'job-abc' and turn_answer == 'Planning your workflow in the background.' }}"
+
+      - id: a-started-job-with-no-answer-gets-the-default
+        input:
+          turn_status: async_started
+          turn_answer: ""
+          profile: {name: builder}
+          jobs: []
+          job_start_result: {ok: true, data: {job_id: job-abc, job: {}}}
+          answer_event: {status: async_started, answer: ""}
+          turn_entries: [{role: user}, {role: assistant, content: ""}]
+          new_recent: [{role: user, content: q}, {role: assistant, content: ""}]
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ turn_answer.startswith('I started a background job') and new_recent[-1]['content'] == turn_answer }}"
+
+      - id: over-the-limit-is-declined-and-says-why
+        input:
+          turn_status: async_started
+          turn_answer: "Starting"
+          profile: {name: builder}
+          jobs: [{job_id: job-old, status: running}]
+          job_start_result: {ok: false, error: {code: limit_exceeded, message: busy}}
+          answer_event: {status: async_started, answer: "Starting"}
+          turn_entries: [{role: user}, {role: assistant, content: "Starting"}]
+          new_recent: [{role: user, content: q}, {role: assistant, content: "Starting"}]
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'declined' and turn_answer.startswith('A background job is already running') and answer_event['job'] is None }}"
+            - "{{ [j['job_id'] for j in jobs] == ['job-old'] and new_recent[-1]['content'] == turn_answer }}"
+
+      - id: a-job-that-cannot-start-is-an-error
+        input:
+          turn_status: async_started
+          turn_answer: "Starting"
+          profile: {name: builder}
+          jobs: []
+          job_start_result: {ok: false, error: {code: start_failed, message: x}}
+          answer_event: {status: async_started, answer: "Starting"}
+          turn_entries: [{role: user}, {role: assistant, content: "Starting"}]
+          new_recent: []
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'error' and turn_answer == 'I could not start that background job. Please try again.' and jobs == [] }}"
+
+      - id: an-ordinary-turn-is-untouched-but-meta-carries-the-jobs
+        input:
+          turn_status: ok
+          turn_answer: "a"
+          profile: {name: chat}
+          jobs: [{job_id: j1, status: running}]
+          job_start_result: {}
+          answer_event: {status: ok, answer: "a"}
+          turn_entries: [{role: user}, {role: assistant, content: "a"}]
+          new_recent: [{role: user, content: q}, {role: assistant, content: "a"}]
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'ok' and turn_answer == 'a' and answer_event['job'] is None and meta_patch['jobs'] == [{'job_id': 'j1', 'status': 'running'}] }}"
+
+  - step_name: plan-relay
+    test_cases:
+      - id: a-finished-job-becomes-a-turn-and-leaves-the-jobs-list
+        input:
+          turn_count: 4
+          pending:
+          jobs: [{job_id: j1, status: running}, {job_id: j9, status: running}]
+          relay_rows:
+            - {job_id: j1, session_id: s1, status: completed, summary: "build hello", result: {answer: "Built it.", sources: [{title: spec}]}, delivered_at: null}
+        expect:
+          assert:
+            - "{{ [r['job_id'] for r in relay_done] == ['j1'] and relay_open is None and relay_question is None }}"
+            - "{{ relay_entries == [{'turn': 5, 'role': 'assistant', 'route': 'job', 'job_id': 'j1', 'status': 'ok', 'sources': [{'title': 'spec'}], 'content': 'Built it.', 'ts': relay_entries[0]['ts']}] }}"
+            - "{{ [j['job_id'] for j in jobs] == ['j9'] }}"
+
+      - id: failed-and-expired-jobs-say-what-happened
+        input:
+          turn_count: 0
+          pending:
+          jobs: []
+          relay_rows:
+            - {job_id: j1, status: failed, summary: "build", error: {code: job_failed, message: "no model"}, delivered_at: null}
+            - {job_id: j2, status: cancelled, error: {code: expired, message: late}, delivered_at: null}
+        expect:
+          assert:
+            - "{{ [e['turn'] for e in relay_entries] == [1, 2] and [e['status'] for e in relay_entries] == ['error', 'error'] }}"
+            - "{{ relay_entries[0]['content'] == 'The background job (build) failed: no model' }}"
+            - "{{ relay_entries[1]['content'] == 'The background job was cancelled: nobody answered its question in time.' }}"
+
+      - id: an-already-delivered-job-is-not-relayed-again
+        input:
+          turn_count: 4
+          pending:
+          jobs: []
+          relay_rows: [{job_id: j1, status: completed, result: {answer: x}, delivered_at: "2026-10-13T10:00:00"}]
+        expect:
+          assert:
+            - "{{ relay_done == [] and relay_entries == [] }}"
+
+      - id: a-jobs-question-is-opened-with-its-ttl
+        input:
+          turn_count: 2
+          pending:
+          jobs: [{job_id: j1, status: running}]
+          relay_rows:
+            - {job_id: j1, status: awaiting_input, profile: builder, summary: "build hello", progress: {message: planned}, pending_action: {kind: plan_review, summary: "1. read spec 2. write yaml", expires_at: "{{ (now() + dt.timedelta(hours=2)).isoformat() }}"}}
+        expect:
+          assert:
+            - "{{ relay_open['job_id'] == 'j1' and 7000 < relay_ttl <= 7200 }}"
+            - "{{ relay_question.startswith('The background job (build hello) needs your review:') and '1. read spec' in relay_question }}"
+            - "{{ jobs == [{'job_id': 'j1', 'status': 'awaiting_input', 'profile': 'builder', 'summary': 'build hello', 'progress': {'message': 'planned'}, 'updated_at': None}] }}"
+
+      - id: a-held-action-blocks-opening-another
+        input:
+          turn_count: 2
+          pending: {id: pa-s1-2, kind: tool_call, detail: {}}
+          jobs: []
+          relay_rows: [{job_id: j1, status: awaiting_input, pending_action: {kind: plan_review, summary: p}}]
+        expect:
+          assert:
+            - "{{ relay_open is None }}"
+
+      - id: a-progress-event-only-updates-the-list
+        input:
+          turn_count: 2
+          pending:
+          jobs: [{job_id: j1, status: queued}]
+          relay_rows: [{job_id: j1, status: running, profile: builder, progress: {message: "step 2"}}]
+        expect:
+          assert:
+            - "{{ relay_done == [] and relay_open is None and jobs[0]['status'] == 'running' and jobs[0]['progress'] == {'message': 'step 2'} }}"
+
+  - step_name: finish-relay
+    test_cases:
+      - id: an-opened-question-becomes-the-last-turn-and-the-pending-action
+        input:
+          turn_count: 4
+          pending:
+          config: {memory: {short_term: {recent_turns: 6}}}
+          recent: [{role: user, content: q}, {role: assistant, content: a}]
+          jobs: [{job_id: j2, status: awaiting_input}]
+          relay_entries: [{turn: 5, role: assistant, content: "Built it.", job_id: j1}]
+          relay_open: {job_id: j2}
+          relay_question: "Review the plan"
+          relay_open_result: {ok: true, data: {pending: {id: pa-s1-6, kind: plan_review, detail: {job_id: j2}}}}
+        expect:
+          assert:
+            - "{{ [e['turn'] for e in relay_entries] == [5, 6] and relay_entries[1]['status'] == 'needs_approval' and relay_entries[1]['content'] == 'Review the plan' }}"
+            - "{{ relay_turn_no == 6 and pending['id'] == 'pa-s1-6' and relay_meta == {'jobs': jobs, 'pending_action_id': 'pa-s1-6'} }}"
+            - "{{ relay_recent[-2:] == [{'role': 'assistant', 'content': 'Built it.'}, {'role': 'assistant', 'content': 'Review the plan'}] }}"
+
+      - id: a-question-that-could-not-be-opened-is-not-shown
+        input:
+          turn_count: 4
+          pending:
+          config: {}
+          recent: []
+          jobs: []
+          relay_entries: []
+          relay_open: {job_id: j2}
+          relay_question: "Review the plan"
+          relay_open_result: {ok: false, error: {code: already_open}}
+        expect:
+          assert:
+            - "{{ relay_entries == [] and relay_turn_no == 4 and pending is None }}"
+
+  - step_name: finish-job-resume
+    test_cases:
+      - id: an-approval-goes-to-the-job-and-nothing-runs-here
+        input:
+          job_pending_id: j1
+          job_decision: approve
+          resolve_result: {ok: true}
+          job_forward_result: {ok: true, data: {sent: true}}
+          jobs: [{job_id: j1, status: awaiting_input}]
+          resume_input: {pending_action: {id: pa-1}}
+          result: {}
+        expect:
+          assert:
+            - "{{ resume_input is None and jobs[0]['status'] == 'running' and result['answer'].startswith('Thanks. I passed that on') }}"
+
+      - id: a-reject-cancels-the-job
+        input:
+          job_pending_id: j1
+          job_decision: reject
+          resolve_result: {ok: true}
+          job_forward_result: {}
+          jobs: [{job_id: j1, status: awaiting_input}]
+          resume_input: {pending_action: {id: pa-1}}
+          result: {}
+        expect:
+          assert:
+            - "{{ resume_input is None and jobs == [] and result['answer'] == 'OK, I cancelled the background job.' }}"
+
+      - id: an-answer-to-a-stopped-job-says-so
+        input:
+          job_pending_id: j1
+          job_decision: approve
+          resolve_result: {ok: true}
+          job_forward_result: {ok: false, error: {code: not_running}}
+          jobs: [{job_id: j1, status: awaiting_input}]
+          resume_input: {pending_action: {id: pa-1}}
+          result: {}
+        expect:
+          assert:
+            - "{{ resume_input is None and jobs == [] and result['answer'].startswith('The background job had already stopped') }}"
+
+  - step_name: plan-relay
+    test_cases:
+      - id: a-finished-job-drops-the-action-it-held
+        input:
+          turn_count: 3
+          pending: {id: pa-s1-3, kind: plan_review, detail: {job_id: j1}}
+          jobs: [{job_id: j1, status: awaiting_input}]
+          relay_rows: [{job_id: j1, status: cancelled, error: {code: cancelled, message: "cancelled by the user"}, delivered_at: null}]
+        expect:
+          assert:
+            - "{{ relay_drop_pending == True and [e['content'] for e in relay_entries] == ['The background job was cancelled.'] and jobs == [] }}"
+
+      - id: an-unrelated-held-action-stays
+        input:
+          turn_count: 3
+          pending: {id: pa-s1-3, kind: tool_call, detail: {}}
+          jobs: []
+          relay_rows: [{job_id: j1, status: completed, result: {answer: done}, delivered_at: null}]
+        expect:
+          assert:
+            - "{{ relay_drop_pending == False }}"
+
+  - step_name: finish-job
+    test_cases:
+      - id: a-job-started-beside-an-approval-prompt-is-mentioned
+        input:
+          turn_status: needs_approval
+          turn_answer: "I need your approval to continue: Scale web?"
+          profile: {name: react}
+          result: {job_request: {wfspec: tool-job, input: {}}}
+          jobs: []
+          job_start_result: {ok: true, data: {job_id: job-9, job: {summary: "Pod report"}}}
+          answer_event: {status: needs_approval, answer: "x"}
+          turn_entries: [{role: user}, {role: assistant, content: "x"}]
+          new_recent: [{role: user, content: q}, {role: assistant, content: "x"}]
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'needs_approval' and turn_answer.endswith('(I also started a background job; its result will be posted here.)') }}"
+            - "{{ answer_event['job'] == {'job_id': 'job-9', 'status': 'queued'} and [j['job_id'] for j in jobs] == ['job-9'] and new_recent[-1]['content'] == turn_answer }}"

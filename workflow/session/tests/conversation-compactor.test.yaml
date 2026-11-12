@@ -1,0 +1,32 @@
+test_type: integration-test
+
+# conversation-compactor (plan-14 steps 15-16). The prompt call is mocked
+# (`run-prompt`, llm-invoke's envelope). The result is sent with emit_event, which
+# cannot be mocked, so these cases leave entity_id empty and check what was built.
+
+wfspec:
+  name: conversation-compactor
+
+test_cases:
+  - id: compact-succeeds-on-a-summary
+    input: {mode: compact, summary: "old", exchanges: [{role: user, content: "q"}], upto_turn: 4}
+    mocks:
+      - {step_name: run-prompt, _: {ok: true, data: {content: "  The user asked q.  "}}}
+    expect:
+      output:
+        - ok: true
+
+  - id: a-failed-prompt-sends-nothing
+    input: {mode: compact, summary: "old", exchanges: [], upto_turn: 4, entity_id: "agent-session-x"}
+    mocks:
+      - {step_name: run-prompt, _: {ok: false, data: null, error: {code: timeout}}}
+    expect:
+      output:
+        - ok: false
+
+  - id: an-unknown-mode-raises
+    input: {mode: tidy}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "conversation-compactor: invalid mode 'tidy'. Must be one of: compact, title"

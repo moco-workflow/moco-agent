@@ -1,0 +1,103 @@
+test_type: integration-test
+
+# prompt-render (plan-01 steps 1, 6). The child is dynamic (its ref comes from
+# resolved_refs), so it is mocked by task name `render-prompt` (P7).
+
+wfspec:
+  name: prompt-render
+
+test_data:
+  refs: &refs
+    route: {wfspec: "agent-harness-prompts/qset.route", version: "0.2.0"}
+    rag.answer: {wfspec: "agent-moco-assistant/prompt.moco-assistant.rag.answer", version: "1.1.0"}
+
+test_cases:
+
+  - id: render-runs-the-resolved-wfspec-and-stamps-name-and-version
+    input: {mode: render, name: route, variables: {message: hi}, resolved_refs: *refs}
+    mocks:
+      - step_name: render-prompt
+        _: {kind: system_one, state: "Current message: hi", questions: {route: {type: choice}}, keymap: {}}
+    expect:
+      output:
+        - ok: true
+        - error: null
+      assert:
+        - "{{ data['kind'] == 'system_one' and data['state'] == 'Current message: hi' }}"
+        - "{{ data['version'] == '0.2.0' and data['name'] == 'route' }}"
+
+  - id: an-agent-local-prompt-renders-the-same-way
+    input: {mode: render, name: rag.answer, variables: {}, resolved_refs: *refs}
+    mocks:
+      - step_name: render-prompt
+        _: {kind: chat, messages: [{role: system, content: "s"}], response_format: null, schema: null}
+    expect:
+      assert:
+        - "{{ data['kind'] == 'chat' and data['version'] == '1.1.0' }}"
+
+  - id: a-name-missing-from-resolved-refs-raises
+    input: {mode: render, name: summarize, resolved_refs: *refs}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "prompt-render: 'summarize' is not in resolved_refs (was agent-registry load skipped?)"
+
+  - id: a-prompt-without-a-kind-raises
+    input: {mode: render, name: route, resolved_refs: *refs}
+    mocks:
+      - step_name: render-prompt
+        _: {messages: []}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: list-returns-the-catalog
+    input: {mode: list}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ sorted(p['name'] for p in data) == ['decide.fallback', 'episode.digest', 'guard.content', 'guard.input', 'guard.output', 'guard.tool', 'loop', 'memory.command', 'memory.extract', 'memory.gate', 'memory.match', 'memory.merge', 'rag.answer', 'rewrite', 'route', 'session.title', 'summarize', 'system.base', 'tools'] }}"
+
+  - id: an-unknown-mode-raises
+    input: {mode: resolve}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "prompt-render: invalid mode 'resolve'. Must be one of: render, list, resolve_names"
+
+  # ── resolve_names (pure; agent-registry passes the catalogs) ────────────
+  - id: resolve-names-prefers-the-agent-override-then-its-own-then-the-harness
+    input:
+      mode: resolve_names
+      agent_id: moco
+      names: [rag.answer, persona.moco, route, loop]
+      catalogs:
+        agent: {package: agent-moco, version: "1.2.0", wfspecs: [prompt.moco.rag.answer, prompt.rag.answer, prompt.persona.moco]}
+        harness: {package: agent-harness-prompts, version: "0.3.0", wfspecs: [prompt.rag.answer, prompt.loop, qset.route]}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['resolved_refs']['rag.answer']['wfspec'] == 'agent-moco/prompt.moco.rag.answer' }}"
+        - "{{ data['resolved_refs']['persona.moco'] == {'wfspec': 'agent-moco/prompt.persona.moco', 'version': '1.2.0', 'owner': 'moco'} }}"
+        - "{{ data['resolved_refs']['route'] == {'wfspec': 'agent-harness-prompts/qset.route', 'version': '0.3.0', 'owner': 'harness'} }}"
+        - "{{ data['resolved_refs']['loop']['owner'] == 'harness' and data['missing'] == [] }}"
+
+  - id: resolve-names-reports-what-is-found-nowhere
+    input:
+      mode: resolve_names
+      agent_id: moco
+      names: [loop, persona.typo]
+      catalogs:
+        agent: {package: agent-moco, version: "1.2.0", wfspecs: []}
+        harness: {package: agent-harness-prompts, version: "0.3.0", wfspecs: [prompt.loop]}
+    expect:
+      assert:
+        - "{{ sorted(data['resolved_refs']) == ['loop'] and data['missing'] == ['persona.typo'] }}"
+
+  - id: an-empty-catalog-finds-nothing
+    input: {mode: resolve_names, agent_id: moco, names: [loop], catalogs: {agent: {}, harness: {package: agent-harness-prompts, version: null, wfspecs: []}}}
+    expect:
+      output:
+        - data: {resolved_refs: {}, missing: [loop]}

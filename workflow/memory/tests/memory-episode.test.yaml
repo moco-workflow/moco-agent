@@ -1,0 +1,95 @@
+test_type: integration-test
+
+# memory-episode (design §6.4.6, plan-07 step 8): the digest becomes one episode item
+# (title, summary + outcomes + open items, topics as tags, unpinned, evidence
+# `learned` at upto_turn); a failed digest falls back to the session title and
+# summary; with neither nothing is written; a store refusal (a forgotten episode is
+# retired) is reported, not raised. llm-invoke and memory-store are mocked by task name.
+
+wfspec:
+  name: memory-episode
+
+test_cases:
+
+  - id: the-digest-becomes-one-episode-item
+    input:
+      agent_id: ops
+      session_id: s1
+      key: "mem:episode:s-0000000000000662"
+      title: "Retries"
+      summary: "User set up retries."
+      exchanges: [{role: user, content: "how do retries work?"}, {role: assistant, content: "per attempt"}]
+      upto_turn: 4
+      config: {access: {}}
+    mocks:
+      - step_name: digest-session
+        _:
+          ok: true
+          data:
+            parsed:
+              title: "Configuring activity retries"
+              summary: "The user configured retries for an http activity."
+              topics: ["Retry", "http activity", "retry"]
+              outcomes: ["timeout_sec is per attempt.", " . "]
+              open_items: ["check backoff  defaults"]
+      - step_name: save-episode
+        _: "{{ {'ok': True, 'data': {'item': {}, 'created': True}} }}"
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['key'] == 'mem:episode:s-0000000000000662' and data['digested'] == True and data['created'] == True }}"
+        - "{{ data['item']['kind'] == 'episode' and data['item']['slug'] == 's-0000000000000662' and data['item']['pinned'] == False }}"
+        - "{{ data['item']['title'] == 'Configuring activity retries' and data['item']['tags'] == ['retry', 'http-activity'] }}"
+        - "{{ data['item']['text'] == 'The user configured retries for an http activity.\\nOutcomes: timeout_sec is per attempt\\nOpen items: check backoff defaults' }}"
+        - "{{ data['item']['evidence'] == [{'session_id': 's1', 'turn': 4, 'source': 'learned'}] }}"
+
+  - id: a-failed-digest-falls-back-to-the-title-and-summary
+    input: {agent_id: ops, session_id: s1, key: "mem:episode:s-1", title: "Retries", summary: "User set up retries.", upto_turn: 3, config: {access: {}}}
+    mocks:
+      - {step_name: digest-session, _: "{{ 1 / 0 }}"}
+      - step_name: save-episode
+        _: "{{ {'ok': True, 'data': {'item': {}, 'created': False}} }}"
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['digested'] == False and data['created'] == False }}"
+        - "{{ data['item']['title'] == 'Retries' and data['item']['text'] == 'User set up retries.' and data['item']['tags'] == [] }}"
+
+  - id: a-digest-without-a-title-counts-as-failed
+    input: {agent_id: ops, session_id: s1, key: "mem:episode:s-1", title: "", summary: "User set up retries.", upto_turn: 3, config: {access: {}}}
+    mocks:
+      - {step_name: digest-session, _: {ok: true, data: {parsed: {title: "", summary: "ignored"}}}}
+      - {step_name: save-episode, _: "{{ {'ok': True, 'data': {'item': {}}} }}"}
+    expect:
+      assert:
+        - "{{ data['digested'] == False and data['item']['text'] == 'User set up retries.' and data['item']['title'].startswith('Conversation on ') }}"
+
+  - id: nothing-to-record-writes-nothing
+    input: {agent_id: ops, session_id: s1, key: "mem:episode:s-1", summary: "", upto_turn: 3, config: {access: {}}}
+    mocks:
+      - {step_name: digest-session, _: {ok: false, error: {code: model_error}}}
+      - {step_name: save-episode, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+      assert:
+        - "{{ error['code'] == 'nothing_to_record' }}"
+
+  - id: a-store-refusal-is-reported
+    input: {agent_id: ops, session_id: s1, key: "mem:episode:s-1", summary: "User set up retries.", upto_turn: 3, config: {access: {}}}
+    mocks:
+      - {step_name: digest-session, _: {ok: false}}
+      - {step_name: save-episode, _: {ok: false, error: {code: invalid_state, message: "mem:episode:s-1 is retired", retryable: false}}}
+    expect:
+      output:
+        - ok: false
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-bad-key-is-a-bug
+    input: {agent_id: ops, session_id: s1, key: "mem:fact:x", summary: "x"}
+    expect:
+      error:
+        error_type: AbortError

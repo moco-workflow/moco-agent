@@ -1,0 +1,297 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KNOWLEDGE INDEX RUN — index a source list into one already-planned table
+# ================================================================================
+#
+# The inner half of knowledge-indexer, ported from the old agent (plan-06 §4): it
+# indexes a source list into a table the caller already planned, and writes no
+# registry row -- knowledge-indexer records the verdict through source-registry.
+#
+# knowledge-indexer runs it as a `sync` child with `on_error: {catch: true}`, so an
+# unsupported kind or a dead endpoint fails here and becomes a `failed` row instead of
+# taking the bookkeeping down with it. The table name and embedding config are
+# decided once by the caller, so a retry cannot plan a different table.
+#
+# `domain` is the source name; it is kept under that name because it is stamped into
+# each node's metadata, and tables indexed by the old agent already carry it.
+# ================================================================================
+
+# Index a heterogeneous list of sources into one pgvector table and roll the
+# per-source results up. Writes no registry entry -- knowledge-indexer owns that.
+header:
+  schema_version: 2.0.0
+  workflow_name: knowledge-index-run
+input:
+  domain: ""
+  # Planned by the caller, not derived here: a retry must hit the same table the
+  # registry entry already names.
+  table_name: ""
+  sources: []
+  overwrite: true
+  # Empty: the activities use the worker's MOCO_PGVECTOR_CONN.
+  pgvector_secret_key: ""
+  # Required. The caller resolves it from agent-config or a per-domain override;
+  # there is deliberately no default here, because silently embedding with the
+  # wrong model produces a table that can never be queried correctly.
+  embed_model_info:
+  chunk_size: 1024
+  chunk_overlap: 200
+
+output:
+  domain: "{{ domain }}"
+  table_name: "{{ table_name }}"
+  node_count: "{{ total_nodes }}"
+  document_count: "{{ total_docs }}"
+  indexed_sources: "{{ all_indexed }}"
+  failed_sources: "{{ all_failed }}"
+  per_source: "{{ per_source_results }}"
+
+main:
+  tasks:
+
+    # ------------------------------------------------------------------
+    # 1. Plan. vectordb_info is assembled here rather than inlined on each
+    #    activity purely to avoid repeating it six times.
+    # ------------------------------------------------------------------
+    - task_name: plan-run
+      set:
+        - vectordb_info:
+            connection_string_secret_key: "{{ pgvector_secret_key }}"
+            table_name: "{{ table_name }}"
+        # There is no iteration index variable, so stamp one on up front. `idx`
+        # is what drives the overwrite-once-only rule below.
+        - source_plan: "{{ [dict(s, idx=i) for i, s in enumerate(sources)] }}"
+
+    - task_name: require-sources
+      raise:
+        if: "{{ not source_plan }}"
+        type: error
+        error_type: AbortError
+        message: "No sources given -- nothing to index for domain '{{ domain }}'."
+
+    # model_name and base_url may be null: the activity's environment defaults
+    # (MOCO_LLM_DEFAULT_EMBED_MODEL_NAME / _BASE_URL). embed_dim is required: it sizes
+    # the table's vector column.
+    - task_name: require-embed-config
+      raise:
+        if: >-
+          {{ not (isinstance(embed_model_info, dict)
+                  and embed_model_info.get('embed_dim')) }}
+        type: error
+        error_type: AbortError
+        message: "embed_model_info must carry embed_dim; got: {{ embed_model_info }}"
+
+    # ------------------------------------------------------------------
+    # 2. Index every source into the one table.
+    #
+    #    iter_type MUST be sequence. `overwrite: true` truncates the ENTIRE
+    #    table, not just the rows belonging to this source, so only the first
+    #    source may set it and the rest must run strictly after it.
+    # ------------------------------------------------------------------
+    - task_name: index-each-source
+      loop:
+        in: "{{ source_plan }}"
+        foreach: item
+        do:
+          tasks:
+            - task_name: source-common
+              set:
+                - kind@: '{{ (item.get("kind") or "").strip().lower() }}'
+                - wipe_first@: '{{ bool(overwrite) and item["idx"] == 0 }}'
+                - meta@:
+                    domain: "{{ domain }}"
+                    source_kind: "{{ kind }}"
+                # Seeded null so the guard below can detect an unhandled kind:
+                # a statement whose condition is false returns None and never
+                # runs its output_data.
+                - out@:
+
+            # `loader` is a bare enum in the schema, so it cannot be an
+            # expression -- hence two near-identical activities rather than one
+            # parameterised step. Which one runs is decided by the source's
+            # optional `loader` field.
+            #
+            # Pick 'trafilatura' for HTML pages: 'download' keeps the raw markup,
+            # so navigation, CSS class names and inline SVG path data end up
+            # embedded as if they were content, and they surface as retrieved
+            # "passages" that say nothing. 'download' is still the right default
+            # because it is the only loader that parses PDF/DOCX/CSV by extension.
+            - task_name: index-web
+              skip_if: '{{ not (kind == "web" and item.get("loader") != "trafilatura") }}'
+              activity:
+                type: llama_index.index_web
+                input:
+                  urls: '{{ item["urls"] }}'
+                  loader: download
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 900
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: index-web-article
+              skip_if: '{{ not (kind == "web" and item.get("loader") == "trafilatura") }}'
+              activity:
+                type: llama_index.index_web
+                input:
+                  urls: '{{ item["urls"] }}'
+                  loader: trafilatura
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 900
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: index-site
+              skip_if: '{{ kind != "site" }}'
+              activity:
+                type: llama_index.index_site
+                input:
+                  url: '{{ item["url"] }}'
+                  crawler: sitemap
+                  prefix: '{{ item.get("prefix") }}'
+                  max_depth: '{{ item.get("max_depth", 3) }}'
+                  limit: '{{ item.get("limit", 50) }}'
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 1800
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: index-github
+              skip_if: '{{ kind != "github" }}'
+              activity:
+                type: llama_index.index_github
+                input:
+                  auth: '{{ {"token_secret_key": item.get("token_secret_key"), "base_url": item.get("api_base_url", "https://api.github.com")} }}'
+                  owner: '{{ item["owner"] }}'
+                  repo: '{{ item["repo"] }}'
+                  branch: '{{ item.get("branch") }}'
+                  include_directories: '{{ item.get("include_directories", []) }}'
+                  include_extensions: '{{ item.get("include_extensions", []) }}'
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 1800
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: index-files
+              skip_if: '{{ kind != "files" }}'
+              activity:
+                type: llama_index.index_files
+                input:
+                  # Relative to MOCO_RAG_FILE_DIR; escaping that root is rejected.
+                  path: '{{ item["path"] }}'
+                  recursive: '{{ item.get("recursive", True) }}'
+                  required_extensions: '{{ item.get("required_extensions", []) }}'
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 900
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: index-gdrive
+              skip_if: '{{ kind != "gdrive" }}'
+              activity:
+                type: llama_index.index_gdrive
+                input:
+                  auth: '{{ {"credentials_secret_key": item["credentials_secret_key"]} }}'
+                  folder_id: '{{ item.get("folder_id") }}'
+                  file_ids: '{{ item.get("file_ids", []) }}'
+                  drive_id: '{{ item.get("drive_id") }}'
+                  vectordb_info: "{{ vectordb_info }}"
+                  embed_model_info: "{{ embed_model_info }}"
+                  chunk_size: "{{ chunk_size }}"
+                  chunk_overlap: "{{ chunk_overlap }}"
+                  overwrite: "{{ wipe_first }}"
+                  metadata: "{{ meta }}"
+                options:
+                  retry_policy:
+                    timeout_sec: 1800
+                    max_attempts: 1
+              output:
+                set:
+                  - out@: "{{ _ }}"
+
+            - task_name: reject-unknown-kind
+              raise:
+                if: "{{ out is None }}"
+                type: error
+                error_type: AbortError
+                message: "Unsupported source kind '{{ kind }}'. Use one of: web, site, github, files, gdrive."
+
+          # What this source contributes to per_source_results. `overwrote` is
+          # reported so the wipe-once-only rule is observable from the output
+          # rather than being an invisible internal detail.
+          output:
+            set:
+              - kind: "{{ kind }}"
+              - overwrote: "{{ wipe_first }}"
+              - node_count: '{{ out.get("node_count", 0) }}'
+              - document_count: '{{ out.get("document_count", 0) }}'
+              - indexed_sources: '{{ out.get("indexed_sources", []) }}'
+              - failed_sources: '{{ out.get("failed_sources", []) }}'
+            data:
+              kind: '{{ kind }}'
+              overwrote: '{{ overwrote }}'
+              node_count: '{{ node_count }}'
+              document_count: '{{ document_count }}'
+              indexed_sources: '{{ indexed_sources }}'
+              failed_sources: '{{ failed_sources }}'
+      output:
+        as: per_source_results
+
+    # ------------------------------------------------------------------
+    # 3. Roll the per-source results up.
+    #
+    #    No "did we index anything?" check here -- that verdict belongs to
+    #    knowledge-indexer, which turns it into a `failed` registry entry.
+    #    Aborting here would erase the attempt, which is the bug this split
+    #    exists to fix.
+    # ------------------------------------------------------------------
+    - task_name: summarize
+      set:
+        - total_nodes#: '{{ sum([r.get("node_count", 0) for r in per_source_results]) }}'
+        - total_docs: '{{ sum([r.get("document_count", 0) for r in per_source_results]) }}'
+        - all_indexed: '{{ [s for r in per_source_results for s in r.get("indexed_sources", [])] }}'
+        - all_failed#: '{{ [f for r in per_source_results for f in r.get("failed_sources", [])] }}'

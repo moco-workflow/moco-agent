@@ -1,0 +1,68 @@
+test_type: integration-test
+
+# tool-render (plan-10 step 7): typed values, interpolation, nested mappings,
+# plain data, and the scope -- only args, result, config and user_id.
+# Integration input is literal (never evaluated), so templates pass through as is.
+
+wfspec:
+  name: tool-render
+
+test_cases:
+
+  - id: a-whole-expression-keeps-its-type
+    input: {template: "{{ args['n'] * 2 }}", args: {n: 21}}
+    expect:
+      output:
+        - rendered: 42
+
+  - id: interpolation-makes-a-string
+    input: {template: "pods in {{ args['ns'] }} ({{ user_id }})", args: {ns: staging}, user_id: u1}
+    expect:
+      output:
+        - rendered: "pods in staging (u1)"
+
+  - id: a-mapping-is-rendered-leaf-by-leaf
+    input:
+      template: {kind: Pod, namespace: "{{ args['ns'] }}", limit: "{{ args.get('limit', 50) }}", flags: [true, null, "x-{{ args['ns'] }}"], nested: {base: "{{ config['base'] }}/api"}}
+      args: {ns: staging}
+      config: {base: "https://k8s"}
+    expect:
+      output:
+        - rendered: {kind: Pod, namespace: staging, limit: 50, flags: [true, null, "x-staging"], nested: {base: "https://k8s/api"}}
+
+  - id: a-shape-projects-the-result
+    input:
+      template: "{{ [{'name': i['metadata']['name'], 'phase': i['status']['phase']} for i in result['items']] }}"
+      result: {items: [{metadata: {name: web-1}, status: {phase: Running}}]}
+    expect:
+      output:
+        - rendered: [{name: web-1, phase: Running}]
+
+  # The k8s_get_secret shape: a dict comprehension inside a dict ends in `}} }}`.
+  - id: a-whole-expression-may-end-in-nested-braces
+    input:
+      template: "{{ {'name': result['name'], 'keys': {k: len(v) for k, v in result['data'].items()}} }}"
+      result: {name: db, data: {password: "abcd"}}
+    expect:
+      output:
+        - rendered: {name: db, keys: {password: 4}}
+
+  - id: plain-data-and-quotes-pass-through
+    input: {template: {msg: "say \"hi\" and 'bye'", n: 3}}
+    expect:
+      output:
+        - rendered: {msg: "say \"hi\" and 'bye'", n: 3}
+
+  - id: null-renders-null
+    input: {template: null}
+    expect:
+      output:
+        - rendered: null
+
+  # The caller's context (session, memory, secrets) is not there: a fresh context.
+  - id: a-template-cannot-see-the-callers-context
+    input: {template: "{{ session_id }}", args: {}}
+    expect:
+      error:
+        error_type: ExpressionEvalError
+        error_message: null

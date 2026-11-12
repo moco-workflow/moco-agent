@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-DISPATCH — run one activity- or mcp-bound tool call (design §6.9.9 dispatch)
+# ================================================================================
+#
+#   in                                              out
+#   ─────────────────────────────────────────────── ──────────
+#   kind: activity|mcp, activity_type, input,       {result}
+#   endpoint, tool_name, arguments
+#
+# WHY A CHILD. tool-executor runs this file as a `sync` child with timeout
+# min(tool timeout, budget left), so every tool call has its own bound and its own
+# failure isolation, and its payload stays out of the caller's history. (It was first
+# justified by activity timeouts having to be literals, P20; they need not.) The activity type is an expression;
+# tool-registry `validate` has already held it to the allowlist, and tool-executor
+# re-checks the manifest's binding before it gets here.
+#
+# Failures RAISE (no on_error here): tool-executor catches them on the calling task,
+# where the timeout raises too (P19), and classifies them for its retry rule.
+# Secrets never pass through: the input carries secret NAMES only (§4.3).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-dispatch
+
+context:
+  result:
+
+input:
+  kind: activity
+  activity_type:
+  input: {}
+  endpoint:
+  tool_name:
+  arguments: {}
+
+output:
+  result: "{{ result }}"
+
+main:
+  tasks:
+    - task_name: call-activity
+      skip_if: "{{ kind != 'activity' }}"
+      activity:
+        type: "{{ activity_type }}"
+        input: "{{ input }}"
+        options:
+          retry_policy: {max_attempts: 1, timeout_sec: 300}
+      output:
+        set:
+          - result: "{{ _ }}"
+
+    - task_name: call-mcp
+      skip_if: "{{ kind != 'mcp' }}"
+      activity:
+        type: mcp.call_tool
+        input:
+          endpoint: "{{ endpoint }}"
+          tool_name: "{{ tool_name }}"
+          arguments: "{{ arguments or {} }}"
+        options:
+          retry_policy: {max_attempts: 1, timeout_sec: 300}
+      output:
+        set:
+          - result: "{{ _ }}"

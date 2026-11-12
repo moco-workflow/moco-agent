@@ -1,0 +1,36 @@
+test_type: integration-test
+
+# qset.memory.match: one state (the exchange), same_<i> / conflict_<i> per candidate,
+# capped at 10, sorted, empty keymap.
+
+wfspec:
+  name: qset.memory.match
+
+test_cases:
+  - id: same-and-conflict-per-candidate
+    input:
+      exchange: {user: "timeout_sec is per attempt, right?", assistant: "Yes."}
+      candidates: [{key: "mem:lesson:a", title: "Retry timeout is per attempt", text: "x"}, {key: "mem:fact:b", title: "Helm", text: "y"}]
+    expect:
+      output:
+        - keymap: {}
+      assert:
+        - "{{ list(questions) == ['conflict_0', 'conflict_1', 'same_0', 'same_1'] }}"
+        - "{{ all(q['type'] == 'noul' and bool(q['instructions']) for q in questions.values()) and 'Retry timeout is per attempt' in questions['same_0']['instructions'] }}"
+
+  - id: at-most-ten-candidates
+    input:
+      exchange: {user: "x", assistant: "y"}
+      candidates: [{title: a}, {title: b}, {title: c}, {title: d}, {title: e}, {title: f}, {title: g}, {title: h}, {title: i}, {title: j}, {title: k}, {title: l}]
+    expect:
+      assert:
+        - "{{ len(questions) == 20 and 'same_10' not in questions }}"
+
+  - id: a-note-is-judged-against-other-notes
+    input:
+      note: {title: "Retry timeout is per attempt", text: "timeout_sec applies to each attempt"}
+      candidates: [{key: "mem:lesson:a", title: "timeout_sec counts per try", text: "x"}]
+    expect:
+      assert:
+        - "{{ state == 'Note: Retry timeout is per attempt -- timeout_sec applies to each attempt' }}"
+        - "{{ questions['same_0']['instructions'].startswith('Does this note state the same thing') }}"

@@ -1,0 +1,35 @@
+test_type: integration-test
+
+# qset.tools (plan-10 step 6): one noul per tool about one state, positional keys,
+# sorted, capped at max_questions; every question has instructions.
+
+wfspec:
+  name: qset.tools
+
+test_cases:
+
+  - id: one-noul-per-tool-about-the-request
+    input:
+      request: "list the pods in staging"
+      tools:
+        - {name: k8s_pods, description: "List pods.", example: "pods in staging"}
+        - {name: current_time, description: "The time."}
+    expect:
+      output:
+        - kind: system_one
+        - state: "Current request: list the pods in staging"
+        - keymap: {tool_0: k8s_pods, tool_1: current_time}
+      assert:
+        - "{{ list(questions) == ['tool_0', 'tool_1'] and all(q['type'] == 'noul' and q['instructions'] for q in questions.values()) }}"
+        - "{{ 'k8s_pods' in questions['tool_0']['instructions'] and 'For example: pods in staging' in questions['tool_0']['instructions'] }}"
+        - "{{ list(questions['tool_0']) == sorted(questions['tool_0']) }}"
+
+  - id: extra-tools-are-dropped-and-reported
+    input:
+      request: "x"
+      max_questions: 2
+      tools: [{name: a_1}, {name: a_2}, {name: a_3}]
+    expect:
+      output:
+        - keymap: {tool_0: a_1, tool_1: a_2}
+        - trace: {question_count: 2, dropped: [a_3]}

@@ -1,0 +1,114 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M6 entity — checkpoints after EVERY handled event, with more events buffered
+# ================================================================================
+#
+# The question M6 answers (design §19): does the idle checkpoint (continue-as-new)
+# lose anything held in memory, or any message waiting to be handled?
+#
+# agent-session never holds a queue in memory -- a message that arrives mid-turn
+# waits in Temporal's signal buffer (see its header). So the real risk is a
+# checkpoint taken while signals are buffered but not yet handled. This entity
+# makes that happen on purpose:
+#
+#   - `idle` checkpoints after every handled event (event_count: 1, enforce: true);
+#   - each `ping` takes ~2s (builtin.delay), so the driver's burst queues up
+#     behind it and is still buffered when the checkpoint fires;
+#   - `pending_summary` stands in for the in-memory pending-action summary and
+#     must come back unchanged on every pong.
+#
+# Every ping is answered with a pong carrying the running count, the summary and
+# whether this execution is a continue-as-new, and the package version this execution
+# sees (F43). See measure-m6-driver.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m6-entity
+
+context:
+  pending_summary: ""
+  count: 0
+  seen: []
+  m6_entity_output: {}
+
+input:
+  sentinel: PENDING-SUMMARY-SENTINEL
+
+output: '{{ m6_entity_output }}'
+
+main:
+  task_name: measure-m6-entity
+  state_machine:
+    initial_state: init
+    event_source_topic: measure-m6
+    states:
+      - name: init
+        on_enter:
+          task_name: seed-memory
+          set:
+            - pending_summary: "{{ sentinel }}"
+
+      - name: idle
+        timers:
+          # Safety net: an abandoned measurement ends itself.
+          - name: give_up
+            timeout_sec: 900
+        checkpoint_policy:
+          event_count: 1
+          enforce: true
+          serialize_context: true
+          auto_resume: true
+
+      - name: done
+        is_terminal: true
+        on_enter:
+          task_name: build-output
+          set:
+            - m6_entity_output: {count: "{{ count }}", seen: "{{ seen }}", pending_summary: "{{ pending_summary }}"}
+
+    transitions:
+      - from_state: init
+        to_state: idle
+        trigger: {}
+
+      # Internal (to_state null): counts toward event_count, so every ping is
+      # followed by a checkpoint.
+      - from_state: idle
+        to_state:
+        trigger:
+          event_type: ping
+          action:
+            tasks:
+              - task_name: slow-handling
+                activity:
+                  type: builtin.delay
+                  input:
+                    duration: 2
+              - task_name: record-ping
+                set:
+                  - count: "{{ count + 1 }}"
+                  - seen: "{{ seen + [(event.get('data') or {}).get('id')] }}"
+              - task_name: pong
+                emit_event:
+                  target_workflow_id: "{{ (event.get('data') or {}).get('reply_to') }}"
+                  topic: measure-m6
+                  event_type: pong
+                  data:
+                    id: "{{ (event.get('data') or {}).get('id') }}"
+                    count: "{{ count }}"
+                    seen: "{{ seen }}"
+                    pending_summary: "{{ pending_summary }}"
+                    is_continue_as_new: "{{ bool(__sys_info__.get('is_continue_as_new')) }}"
+                    # F43: a package restored after continue-as-new must keep its version.
+                    package_version: "{{ __sys_info__.get('wfspec_version') }}"
+                on_error: {catch: true}
+
+      - from_state: idle
+        to_state: done
+        trigger:
+          event_type: stop
+
+      - from_state: idle
+        to_state: done
+        trigger:
+          event_type: sys.timer.give_up

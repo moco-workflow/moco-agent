@@ -1,0 +1,156 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# HOOK-RUNNER — run an event's hooks; patch within the allowlist; block (§5.4)
+# ================================================================================
+#
+#   in                                        out
+#   ───────────────────────────────────────── ──────────────────────────────────────
+#   hook_event, payload, hooks (config.hooks),     {action: continue | block, payload, reason,
+#   agent_id, session_id                       trace: [{hook, action, dropped, failure}]}
+#
+# EVENT-AGNOSTIC. The events and what a hook may do (the allowlist is this literal
+# table, so a change shows in a diff):
+#   turn.received      patch message           block → the reason is the answer
+#   tool.before        patch —                 block → the call is denied
+#   answer.ready       patch answer, sources   no block (a block is ignored, logged)
+#   phase 3 (the deferred events):
+#   route.decided      patch sources           no block; the session keeps only a SUBSET
+#                                              of the router's sources
+#   context.assembled  observe only            (block ids and sizes, not content)
+#   tool.after         patch content           no block; an ok call's result, before the
+#                                              model reads it (redaction)
+#   turn.committed     observe only
+#   session.retired    observe only
+# Hook contract: input {hook_event, payload, agent_id, session_id} (`event` is a
+# reserved name in DSL v2, so the key is hook_event), output {action:
+# continue | patch | block, patch?, reason?}.
+#
+# Hooks whose definition `event` matches run in DECLARATION ORDER, sequentially; the patched payload
+# is the next hook's input, and a block stops the chain.
+#   mode sync   a `sync` child with run timeout timeout_sec (default 5): a timeout or
+#               error is `continue` and logged as hook_failure# (a hook cannot break
+#               a turn)
+#   mode async  started detached with the current payload; observe-only, its result
+#               is never read
+# A bare hook name is the agent's own (agent-registry checks it against the agent
+# package) and is run package-qualified, `agent-<agent_id>/<name>`: a bare name
+# resolves only where the agent package is already loaded, which a break-away
+# caller (agent-loop, for tool.before / tool.after) is not -- there it was looked up
+# as a package, failed, and the failure read as `continue`. A name with a `/` is
+# run as written.
+# Patch fields outside the allowlist are dropped and listed in trace[].dropped. A
+# hook can tighten (redact, block a tool), never grant: there is nothing in the
+# allowlist that widens a permission.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: hook-runner
+
+context:
+  patchable:
+    turn.received: [message]
+    tool.before: []
+    answer.ready: [answer, sources]
+    route.decided: [sources]
+    context.assembled: []
+    tool.after: [content]
+    turn.committed: []
+    session.retired: []
+  blockable: ["turn.received", "tool.before"]
+  default_timeout_sec: 5
+  action: continue
+  reason:
+  hook_trace: []
+  blocked: false
+  hook_result: {}
+
+input:
+  hook_event:
+  payload: {}
+  hooks: []
+  agent_id:
+  session_id:
+
+output:
+  action: "{{ action }}"
+  payload: "{{ payload }}"
+  reason: "{{ reason }}"
+  trace: "{{ hook_trace }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-event
+      raise:
+        if: "{{ hook_event not in patchable }}"
+        type: error
+        error_type: AbortError
+        message: "hook-runner: unknown hook_event '{{ hook_event }}' (one of {{ ', '.join(patchable) }})"
+
+    - task_name: pick-hooks
+      set:
+        - selected_hooks#: >-
+            {{ [dict(h, ref=(str(h['wfspec']) if '/' in str(h['wfspec']) else 'agent-' + str(agent_id) + '/' + str(h['wfspec'])))
+                for h in (hooks or []) if isinstance(h, dict) and h.get('event') == hook_event and h.get('wfspec')] }}
+
+    - task_name: run-hooks
+      skip_if: "{{ not selected_hooks }}"
+      loop:
+        in: "{{ selected_hooks }}"
+        foreach: hook
+        do:
+          tasks:
+            - task_name: run-sync-hook
+              skip_if: "{{ hook.get('mode', 'sync') != 'sync' }}"
+              workflow:
+                ref: "{{ hook['ref'] }}"
+                mode: sync
+                input: {hook_event: "{{ hook_event }}", payload: "{{ payload }}", agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ int(hook.get('timeout_sec') or default_timeout_sec) }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - hook_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - hook_result: "{{ {'action': 'continue', 'failure': str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:300]} }}"
+
+            - task_name: run-async-hook
+              skip_if: "{{ hook.get('mode', 'sync') != 'async' }}"
+              workflow:
+                ref: "{{ hook['ref'] }}"
+                mode: detached
+                input: {hook_event: "{{ hook_event }}", payload: "{{ payload }}", agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - hook_result: {action: continue, observed: true}
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - hook_result: "{{ {'action': 'continue', 'failure': str(_.get('error_message'))[:300]} }}"
+
+            - task_name: apply-hook
+              set:
+                - _act: "{{ str(hook_result.get('action') or 'continue') }}"
+                - _patch: "{{ hook_result.get('patch') if isinstance(hook_result.get('patch'), dict) else {} }}"
+                - _kept: "{{ {k: v for k, v in _patch.items() if k in patchable[hook_event]} if _act == 'patch' else {} }}"
+                - payload: "{{ dict(payload or {}, **_kept) }}"
+                - blocked: "{{ _act == 'block' and hook_event in blockable }}"
+                - action: "{{ 'block' if blocked else action }}"
+                - reason: "{{ str(hook_result.get('reason') or 'blocked by ' + str(hook['wfspec'])) if blocked else reason }}"
+                - hook_failure#: "{{ hook_result.get('failure') }}"
+                - hook_trace: >-
+                    {{ hook_trace + [{'hook': hook['wfspec'], 'action': _act if not (_act == 'block' and not blocked) else 'block_ignored',
+                                      'dropped': sorted(k for k in _patch if k not in _kept) if _act == 'patch' else [],
+                                      'failure': hook_result.get('failure')}] }}
+                - hook_result: {}
+
+            - task_name: stop-when-blocked
+              raise:
+                if: "{{ blocked }}"
+                type: break

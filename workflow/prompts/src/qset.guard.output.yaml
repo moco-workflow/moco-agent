@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.GUARD.OUTPUT — is the answer grounded, and does it answer? (design §6.13)
+# ================================================================================
+#
+#   variables                     out
+#   ───────────────────────────── ─────────────────────────────────────────────
+#   question, answer, passages    {kind: system_one, state, questions, keymap}
+#
+# guard check_output's request. `answered` is always asked; `grounded` only when
+# there are passages to be grounded in (without them the loop's grounding is none,
+# §6.8.3). Passages are numbered by their `n`, as the answer cites them, and clamped.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.guard.output
+
+context:
+  passage_chars: 800
+  answer_chars: 3000
+  max_passages: 10
+
+input:
+  question: ""
+  answer: ""
+  passages: []
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: "{{ keymap }}"
+
+main:
+  task_name: build-output-qset
+  set:
+    - _ps: "{{ [p for p in (passages or []) if isinstance(p, dict) and p.get('text')][:max_passages] }}"
+    - state: >-
+        {{ 'Question: ' + str(question or '').strip() + '\n\n'
+           + 'Answer: ' + str(answer or '').strip()[:answer_chars]
+           + (('\n\nSource passages:\n' + '\n\n'.join('[' + str(p.get('n') or (i + 1)) + '] '
+                                                      + str(p['text'])[:passage_chars]
+                                                      for i, p in enumerate(_ps)))
+              if _ps else '') }}
+    - _q: >-
+        {{ dict({'answered': {'type': 'noul',
+                              'instructions': 'Does the answer actually address the question, rather than '
+                                              'declining, deflecting or answering something else?'}},
+                **({'grounded': {'type': 'noul',
+                                 'instructions': 'Is every factual claim in the answer supported by the source '
+                                                 'passages, with citations like [n] pointing at passages that say it?'}}
+                   if _ps else {})) }}
+    - questions: "{{ {k: dict(sorted(_q[k].items())) for k in sorted(_q)} }}"
+    - keymap: {}

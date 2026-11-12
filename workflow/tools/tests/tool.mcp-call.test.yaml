@@ -1,0 +1,49 @@
+test_type: integration-test
+
+# tool.mcp-call (design §6.9.4, F49): a credentialed MCP tool fetches its secret
+# (global for service, the user's own for user) and passes it encrypted to
+# mcp.call_tool; the target comes from the binding, never from args. Mocked by task name.
+
+wfspec:
+  name: tool.mcp-call
+
+test_cases:
+  - id: a-user-credential-is-the-callers-own-secret
+    input:
+      args: {jql: "project = MOCO"}
+      binding: {name: tool.mcp-call, mcp: {endpoint: "https://mcp.example.com/a", tool_name: search, secret_key: ATLASSIAN_TOKEN, credential_mode: user}}
+    mocks:
+      - step_name: get-credential
+        _: "{{ {'blob': 'enc', 'ok': skey == 'ATLASSIAN_TOKEN' and not is_global} }}"
+      - step_name: call-tool
+        _: "{{ {'stopped': True, 'result': {'content': [{'type': 'text', 'text': 'ok'}], 'token_ok': token.get('ok'), 'args': args}} }}"
+    expect:
+      assert:
+        - "{{ stopped == True and result['token_ok'] == True and result['args'] == {'jql': 'project = MOCO'} }}"
+
+  - id: a-service-credential-is-a-global-secret
+    input:
+      binding: {mcp: {endpoint: "https://mcp.example.com/a", tool_name: search, secret_key: "global/ATLASSIAN", credential_mode: service}}
+    mocks:
+      - {step_name: get-credential, _: "{{ {'name_ok': is_global} }}"}
+      - {step_name: call-tool, _: "{{ {'stopped': True, 'result': token} }}"}
+    expect:
+      assert:
+        - "{{ result == {'name_ok': True} }}"
+
+  - id: no-secret-calls-without-a-token
+    input:
+      binding: {mcp: {endpoint: "https://mcp.example.com/a", tool_name: search}}
+    mocks:
+      - {step_name: get-credential, _: "{{ 1 / 0 }}"}
+      - {step_name: call-tool, _: "{{ {'stopped': True, 'result': {'token': token}} }}"}
+    expect:
+      assert:
+        - "{{ result == {'token': None} }}"
+
+  - id: a-service-credential-that-is-not-global-is-a-bug
+    input:
+      binding: {mcp: {endpoint: "https://x", tool_name: t, secret_key: TOKEN, credential_mode: service}}
+    expect:
+      error:
+        error_type: AbortError

@@ -1,0 +1,273 @@
+test_type: integration-test
+
+# tool-policy (plan-10 step 5, design §6.9.7): the permission lattice row by row,
+# including the "cannot loosen" cases, hiding, credential readiness, and grants.
+# Preferences: tool-policy.prefs.test.yaml.
+# Membership, grants, secrets and access are mocked by task name. The per-effect
+# access check runs in a loop, so one mock answers for every side_effects value:
+# cases that need "guest" use tools of a single side_effects value.
+
+wfspec:
+  name: tool-policy
+
+test_data:
+  allow: &allow {ok: true, data: {allow: true, reason: ok}}
+  user: &user {ok: true, data: {role: user}}
+  config: &config {access: {admin_user_ids: [], guest_user_ids: [guest]}}
+
+test_cases:
+
+  # ── baseline ────────────────────────────────────────────────────────────
+  - id: a-read-tool-is-auto-and-a-write-tool-needs-approval
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods, scale], always_offer: [pods]}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}},
+                                     {name: scale, status: enabled, policy: {side_effects: write, permission: approve}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ ok == True and [(t['name'], t['effective_permission']) for t in data['offerable']] == [('pods', 'auto'), ('scale', 'approve')] }}"
+        - "{{ data['always_offer'] == ['pods'] and data['hidden'] == [] and data['needs_credential'] == [] }}"
+
+  - id: a-manifest-deny-hides-the-tool
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [nuke], always_offer: [nuke]}},
+                             tools: [{name: nuke, status: enabled, policy: {side_effects: external, permission: deny}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'] == [] and data['hidden'] == [{'name': 'nuke', 'reason': 'denied'}] and data['always_offer'] == [] }}"
+
+  # ── agent overrides ─────────────────────────────────────────────────────
+  - id: an-override-may-tighten-auto-to-approve
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {pods: {permission: approve}}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: []}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'approve' }}"
+
+  - id: an-override-may-tighten-to-deny-with-a-bare-string
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {pods: deny}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: []}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'] == [] and data['hidden'] == [{'name': 'pods', 'reason': 'denied'}] }}"
+
+  - id: an-override-may-loosen-a-read-tool-down-to-its-default-auto
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {pods: auto}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: []}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: approve}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'auto' }}"
+
+  - id: cannot-loosen-an-external-tool-to-auto
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {post: auto}}}, toolsets: [web]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {web: {found: true, members: [post], always_offer: []}},
+                             tools: [{name: post, status: enabled, policy: {side_effects: external, permission: approve}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'approve' }}"
+
+  - id: loosening-a-denied-write-tool-stops-at-approve
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {scale: auto}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [scale], always_offer: []}},
+                             tools: [{name: scale, status: enabled, policy: {side_effects: write, permission: deny}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'approve' }}"
+
+  - id: an-unknown-override-word-fails-closed
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {pods: yes-please}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: []}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['hidden'] == [{'name': 'pods', 'reason': 'denied'}] }}"
+
+  # ── session grants ──────────────────────────────────────────────────────
+  - id: a-session-grant-lifts-approve-to-auto
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s], session_id: s1}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [scale], always_offer: []}},
+                             tools: [{name: scale, status: enabled, policy: {side_effects: write, permission: approve, allow_session_grant: true}}]}}
+      - {step_name: list-grants, _: [{key: "tool_grant:s1:scale", topic: tool-grant}]}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'auto' and data['offerable'][0]['grant_used'] == True }}"
+
+  - id: a-grant-without-allow-session-grant-grants-nothing
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s], session_id: s1}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [scale], always_offer: []}},
+                             tools: [{name: scale, status: enabled, policy: {side_effects: write, permission: approve, allow_session_grant: false}}]}}
+      - {step_name: list-grants, _: [{key: "tool_grant:s1:scale", topic: tool-grant}]}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'][0]['effective_permission'] == 'approve' and data['offerable'][0]['grant_used'] == False }}"
+
+  - id: a-grant-never-lifts-a-deny
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {scale: deny}}}, toolsets: [k8s], session_id: s1}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [scale], always_offer: []}},
+                             tools: [{name: scale, status: enabled, policy: {side_effects: write, permission: approve, allow_session_grant: true}}]}}
+      - {step_name: list-grants, _: [{key: "tool_grant:s1:scale", topic: tool-grant}]}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'] == [] and data['hidden'][0]['reason'] == 'denied' }}"
+
+  # ── guest, status, enabled_for ──────────────────────────────────────────
+  - id: a-guest-gets-no-read-tool
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: [pods]}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: {ok: true, data: {allow: false, reason: guest_side_effects}}}
+      - {step_name: identify-caller, _: {ok: true, data: {role: guest}}}
+    expect:
+      assert:
+        - "{{ data['offerable'] == [] and data['hidden'] == [{'name': 'pods', 'reason': 'guest_side_effects'}] and data['role'] == 'guest' }}"
+
+  - id: disabled-tools-are-hidden-and-deprecated-ones-flagged
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [old, off], always_offer: []}},
+                             tools: [{name: old, status: deprecated, policy: {side_effects: read, permission: auto}},
+                                     {name: off, status: disabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ [(t['name'], t['deprecated']) for t in data['offerable']] == [('old', True)] }}"
+        - "{{ data['hidden'] == [{'name': 'off', 'reason': 'status'}] }}"
+
+  - id: a-tool-enabled-for-other-users-only-is-hidden
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true, members: [pods], always_offer: []}},
+                             tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto, enabled_for: {users: [someone-else]}}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['hidden'] == [{'name': 'pods', 'reason': 'not_enabled_for_user'}] }}"
+
+  # ── credentials ─────────────────────────────────────────────────────────
+  - id: a-missing-user-credential-means-needs-credential-not-offered
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [jira]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {jira: {found: true, members: [jira_search], always_offer: [jira_search]}},
+                             tools: [{name: jira_search, status: enabled, policy: {side_effects: read, permission: auto},
+                                      credential: {mode: user, secret_key: JIRA_TOKEN, connect_hint: "Store your Jira token as secret JIRA_TOKEN"}}]}}
+      - {step_name: list-user-secrets, _: [OTHER]}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ data['offerable'] == [] and data['always_offer'] == [] }}"
+        - "{{ data['needs_credential'] == [{'name': 'jira_search', 'connect_hint': 'Store your Jira token as secret JIRA_TOKEN'}] }}"
+
+  - id: a-present-user-credential-offers-the-tool
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [jira]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {jira: {found: true, members: [jira_search], always_offer: []}},
+                             tools: [{name: jira_search, status: enabled, policy: {side_effects: read, permission: auto},
+                                      credential: {mode: user, secret_key: JIRA_TOKEN}}]}}
+      - {step_name: list-user-secrets, _: [JIRA_TOKEN]}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+    expect:
+      assert:
+        - "{{ [t['name'] for t in data['offerable']] == ['jira_search'] }}"
+
+  - id: no-toolsets-offers-nothing-and-reads-nothing
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: []}
+    mocks:
+      - {step_name: read-members, _: "{{ 1 / 0 }}"}
+      - {step_name: authorize-effect, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {offerable: [], always_offer: [], needs_credential: [], hidden: [], role: user}
+
+  # ── grant / revoke ──────────────────────────────────────────────────────
+  - id: grant-writes-a-grant-row
+    input: {mode: grant, agent_id: ops, config: *config, session_id: s1, name: scale, tool_version: 3}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-grant, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['grant']['name'] == 'scale' and data['grant']['session_id'] == 's1' and data['grant']['tool_version'] == 3 and data['grant']['schema_version'] == 1 }}"
+
+  - id: a-guest-cannot-grant
+    input: {mode: grant, agent_id: ops, config: *config, session_id: s1, name: scale}
+    mocks:
+      - {step_name: authorize-write, _: {ok: true, data: {allow: false, reason: guest_write}}}
+      - {step_name: write-grant, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: grant-needs-a-session
+    input: {mode: grant, agent_id: ops, config: *config, name: scale}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: revoke-without-a-session-revokes-every-session
+    input: {mode: revoke, agent_id: ops, config: *config, name: scale}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: list-revocable, _: [{key: "tool_grant:s1:scale"}, {key: "tool_grant:s2:scale"}, {key: "tool_grant:s3:scale_up"}]}
+      - {step_name: delete-grant, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {revoked: [s1, s2]}

@@ -1,0 +1,63 @@
+test_type: integration-test
+
+# admin.tools (plan-16 phase 2): ops route to the owners with the agent's access lists.
+
+wfspec:
+  name: admin.tools
+
+test_data:
+  cfg: &cfg {ok: true, data: {config: {access: {admin_user_ids: [u1]}}}}
+
+test_cases:
+  - id: list-tools-reads-both-scopes-by-default
+    input: {op: list_tools, agent_id: ops}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: call-registry, _: "{{ {'ok': True, 'data': {'tools': []}} }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {tools: []}
+
+  - id: save-tool-passes-the-access-lists
+    input: {op: save_tool, agent_id: ops, name: k8s_pods, scope: agent, manifest: {description: x}}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: call-registry, _: {ok: true, data: {tool: {status: draft}}}}
+    expect:
+      assert:
+        - "{{ ok == True and data['tool']['status'] == 'draft' }}"
+
+  - id: dry-run-renders-the-stored-manifest
+    input: {op: dry_run_tool, agent_id: ops, name: k8s_pods, arguments: {namespace: a}}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: find-tool, _: {ok: true, data: {tool: {name: k8s_pods}}}}
+      - {step_name: dry-run-tool, _: {ok: true, data: {validated: true, would_require: auto}}}
+    expect:
+      output:
+        - data: {validated: true, would_require: auto}
+
+  - id: dry-run-of-an-unknown-tool-is-not-found
+    input: {op: dry_run_tool, agent_id: ops, name: nope}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: find-tool, _: {ok: false, error: {code: not_found, message: "no agent tool nope"}}}
+      - {step_name: dry-run-tool, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  - id: tool-stats-needs-no-config
+    input: {op: tool_stats, agent_id: ops}
+    mocks:
+      - {step_name: resolve-config, _: "{{ 1 / 0 }}"}
+      - {step_name: read-tool-stats, _: {ok: true, data: {stats: []}}}
+    expect:
+      output:
+        - data: {stats: []}
+
+  - id: an-unknown-op-is-a-bug
+    input: {op: nuke_tools, agent_id: ops}
+    expect:
+      error: {error_type: AbortError, error_message: null}

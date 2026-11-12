@@ -1,0 +1,18 @@
+test_type: integration-test
+
+# admin.usage (plan-16 phase 2): totals and per-route counts from the caller's session metas.
+
+wfspec:
+  name: admin.usage
+
+test_cases:
+  - id: usage-is-summed-and-grouped-by-route
+    input: {op: usage_report, agent_id: moco}
+    mocks:
+      - step_name: list-sessions
+        _: {ok: true, data: {sessions: [{last_route: rag, usage: {turns: 3, llm_calls: 3, tokens_in: 300}}, {last_route: chat, usage: {turns: 1, llm_calls: 1, tokens_in: 20}}, {last_route: rag, usage: {turns: 2, tool_calls: 2}}]}}
+      - {step_name: read-tool-stats, _: {ok: true, data: {stats: [{name: k8s_list_pods, calls: 2}]}}}
+    expect:
+      assert:
+        - "{{ data['sessions'] == 3 and data['totals']['turns'] == 6 and data['totals']['tokens_in'] == 320 and data['totals']['tool_calls'] == 2 }}"
+        - "{{ data['by_route'] == {'chat': {'sessions': 1, 'turns': 1}, 'rag': {'sessions': 2, 'turns': 5}} and data['tools'][0]['name'] == 'k8s_list_pods' }}"

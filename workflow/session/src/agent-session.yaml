@@ -1,0 +1,2210 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-SESSION — one conversation with one agent, as an entity workflow (§6.10)
+# ================================================================================
+#
+# Workflow id `agent-session-<agent_id>-<user_id>-<session_id>`, started (or
+# signalled) by agent-cli. It is the ONLY live writer of its session rows (§4.3),
+# and it treats every profile identically (§6.8.1).
+#
+#                   ┌──────────── user_message ────────────┐
+#                   │                                      ▼
+#   init ──▶ idle ◀─┼── [not accepted: busy] ──────── receiving
+#             ▲ │   │                                      │ [accepted]
+#             │ │   │      preparing ◀─────────────────────┘
+#             │ │   │          ▼
+#             │ │   │      routing ─▶ assembling ─┬─▶ running ────┐
+#             │ │   │                             ├─▶ resuming ─┬─▶ running
+#             │ │   │                             │             └─(expired / stale)─┤
+#             │ │   │                             └─▶ clarifying ─┤
+#             │ │   └── delivering ◀── finalizing ◀───────────────┘
+#             │ │
+#             │ ├─ compacted / titled (internal: applied, idle is not left)
+#             │ ├─ subagent_event ─▶ relaying ─▶ idle      (init ─[jobs to relay]─▶ relaying too)
+#             │ └─ idle_tick ─▶ ticking ─┬─ [neither due] ──▶ idle
+#             │                          ├─ [retire due] ───▶ retiring ─▶ done
+#             └─ retire ─────────────────┼──────────────────▶ retiring
+#                                        └─ [stop due] ─────▶ retiring ─▶ done (stop_only:
+#                                                             the row stays `active`)
+#
+# PHASE 1 (plan-14 steps 6-17). The turn pipeline: preparing (config version check
+# -- re-resolving only when a tier row moved --, router view, knowledge catalog,
+# profile availability), routing (query-router), assembling (context-builder),
+# running (the routed profile) or clarifying (the router's question), finalizing
+# (normalise, apology), delivering (answer, commit, and two detached jobs: the
+# compactor for exchanges that left `recent`, and the title after the first turn).
+# Every child in the pipeline degrades instead of raising: an error would end this
+# entity.
+#
+# PHASE 2 (plan-14 step 19, plan-12). PENDING ACTIONS: a profile that returns
+# needs_approval has its pending_action stored by `hitl open` in finalizing, and the
+# answer is the approval prompt (or the ask_user question). While one is awaiting,
+# the router sees it: a UI action payload, a "yes/no/change it" reply, or any
+# message answering an ask_user question routes to `pending_reply`, and `resuming`
+# runs `hitl resolve` → (`tool-policy grant` for approve_session) → `running` with
+# the resume input, on the profile that suspended. A late or stale answer runs
+# nothing and is told so. A message unrelated to the action is answered normally
+# and the action stays awaiting. Rows survive retirement: `init` reloads the
+# awaiting action (expiring it if overdue), so approve-and-resume works across a
+# retire. Each turn's tool audit records (trace.tool_audit) go to commit_turn's
+# toolcalls, and per-tool counts accumulate in meta.tool_counts for the per-session
+# limits. Cost limits, hooks, check_input and memory are later phase-2 steps.
+#
+# PHASE 3 (plan-13, plan-14 step 24). JOBS: a profile (or an async tool) that
+# returns async_started with a job_request has its job started by `job-manager
+# start` in finalizing (F6), and the answer says so. The job entity reports by
+# writing its row and sending subagent_event; `relaying` reads the row: a finished
+# job becomes an assistant-only turn (then mark_delivered), a job's question is
+# opened as the pending action (detail.job_id) and the reply in `resuming` goes to
+# `job-manager send` (reject → cancel) instead of a profile run. `init` reconciles,
+# so a job that finished while the session was retired is relayed when it wakes
+# (the job's report wakes it). meta.jobs mirrors the active jobs; no retire while
+# one is active.
+#
+# THE QUEUE IS TEMPORAL'S, NOT OURS. The state machine processes one event at a
+# time and runs a whole transition chain (on_enter + automatic transitions)
+# before it reads the next (workflow_engine `_event_loop`). A user_message that
+# arrives mid-turn therefore waits in the signal buffer and is handled once the
+# machine settles in `idle` -- there is no "turn state" in which it could be
+# enqueued, so design §6.10.2's queue rows cannot fire as written. Depth is
+# enforced from timestamps instead (classify-message): agent-cli stamps
+# `sent_at`; a message sent before the PREVIOUS turn even started has waited
+# behind two turns and is answered `busy` (max_queued_messages 1), and with
+# max_queued_messages 0 any message sent during a turn is.
+#
+# THE BODY IS ONE state_machine (P5): `checkpoint_policy` only resumes when the
+# machine IS the body. `idle` checkpoints (continue-as-new) with the data
+# context; `init` does not re-run after a checkpoint. The checkpoint timer is
+# cancelled whenever the machine leaves `idle`, and every idle_tick leaves it, so
+# `session.checkpoint_sec` must be shorter than `session.idle_tick_sec`.
+#
+# persist_state is the source of truth: `init` rehydrates, so a cold resume and a
+# live one behave the same.
+#
+# IDLE STOP (§4.3, F66). The entity and its inline children stay on the harness
+# packages they started with (wfspec_store keeps every package it loaded, across
+# continue-as-new too). So the entity does not live until it retires: once it has
+# been idle `session.idle_stop_sec` (600) with no active job, it ENDS without
+# retiring -- the curator gets the exchanges it has not seen, the episode is
+# (re)written, meta.status stays `active` -- and the next message's start-or-signal
+# boots whatever is deployed then. That replaced the upgrade-on-idle version probe:
+# a redeploy of any harness package reaches a session within one idle stop. The
+# janitor retires the row once it is idle past `retire_after_idle_sec` (a throwaway
+# session still retires itself, at the same tick).
+#
+# Profile runs are `sync` children with
+# `on_error: {catch: true}` on the calling task. A sync child that overruns its
+# run timeout raises in the PARENT (P19); the task's on_error catches that too,
+# so neither can fail this entity.
+#
+# Events (topic agent-session)
+#   in   user_message {message, message_id, caller_workflow_id, sent_at, progress?}
+#        progress: true -> the caller also gets `agent_answer` events with kind: progress
+#        (routed, running; the loop adds searching / thinking / calling), so a per-turn
+#        caller can show them -- the entity's own `progress#` debug events go to the
+#        trace of the turn that STARTED it, not this one.
+#        retire {}                                   admin-initiated retire
+#        subagent_event {job_id, kind, status}       a job reported (job-manager)
+#   out  agent_answer {message_id, session_id, turn, status, answer, sources, route, timing}
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-session
+
+context:
+  # Seeded with the timer settings so the idle timers can be armed even if a
+  # future change reorders init; replaced by the resolved config in `init`.
+  config:
+    session: {idle_tick_sec: 600, idle_stop_sec: 600, checkpoint_sec: 240, apology_text: "Sorry, something went wrong while answering that. Please try again."}
+    limits: {turn_budget_sec: 110, max_queued_messages: 1, retire_after_idle_sec: 86400, retire_throwaway_after_idle_sec: 600}
+    memory: {short_term: {recent_turns: 6}}
+  profiles: {}
+  config_version:
+  profile: {}
+  resolved_refs: {}
+  # The tier rows' versions behind config_version; compared every turn (preparing).
+  cfg_versions: {}
+  version_now: {}
+  reloaded:
+  # init's intermediate results; seeded because conditional steps may skip.
+  cfg_result:
+  got: {}
+  created:
+  reactivated:
+
+  # ── conversation (rehydrated in init) ──
+  meta: {}
+  recent: []
+  turn_count: 0
+  title: ""
+
+  # ── conversation summary (compaction, plan-14 step 15) ──
+  summary: ""
+  summary_upto_turn: 0
+  compaction_exchanges: []
+
+  # ── the current turn ──
+  inbound: {}
+  turn_ctx: {}
+  result: {}
+  # classify-setup (F70): the turn's setup failure, and the fixed answer for it.
+  turn_setup:
+  setup_answer:
+  accept: false
+  # The phase-1 pipeline's intermediate results, seeded for the skipped paths.
+  catalog: []
+  available: []
+  role: user
+  router_view: []
+  router_result: {}
+  context_bundle: {}
+  budget_sec: 40
+
+  # ── pending action + tools (phase 2) ──
+  pending:
+  pending_got: {}
+  resume_input:
+  resolve_result: {}
+  grant_result: {}
+  open_result: {}
+  tool_counts: {}
+  turn_audit: []
+  has_tools: false
+  turn_blocked: false
+  usage_day: {}
+  limit_hit:
+  handoff_target:
+  handoff_fits: false
+  # ── async jobs (phase 3, §6.12) ──
+  # Non-terminal jobs of this session ({job_id, status, profile, summary, ...}),
+  # mirrored to meta.jobs; and the job ids `relaying` has to look at.
+  jobs: []
+  jobs_to_relay: []
+  relay_rows: []
+  relay_open:
+  relay_drop_pending: false
+  relay_done: []
+  relay_entries: []
+  relay_open_result: {}
+  relay_commit: {}
+  job_start_result: {}
+  job_forward_result: {}
+  # ── long-term memory (phase 2, §6.4) ──
+  agent_mem_items: []
+  memory_recall: {}
+  pending_exchanges: []
+  last_curated_turn: 0
+  curate_now: false
+
+  # ── lifetime (ISO strings: they survive the checkpoint serialisation) ──
+  last_activity_at: ""
+  last_turn_started_at: ""
+  last_turn_ended_at: ""
+  retire_due: false
+  stop_due: false
+  # The idle stop goes through `retiring` with this set: memory and the episode
+  # as on a retire, but the row is not marked retired and no hook fires.
+  stop_only: false
+  episode_due: false
+  episode_started: false
+  # Set by a retire that came from deleting the session: skip curation and the episode.
+  session_deleted: false
+  write_failed: false
+  stop_reason: ""
+
+
+input:
+  agent_id:
+  session_id:
+  # Set by agent-cli when it minted the session id (guests, one-off questions):
+  # such sessions retire after retire_throwaway_after_idle_sec (F25). Only honoured
+  # on create -- an existing session keeps what its row says.
+  throwaway: false
+
+output:
+  agent_id: "{{ agent_id }}"
+  session_id: "{{ session_id }}"
+  ended_as: "{{ 'idle_stop' if stop_only else 'retired' }}"
+  stop_reason: "{{ stop_reason }}"
+  turn_count: "{{ turn_count }}"
+
+main:
+  task_name: agent-session
+  state_machine:
+    initial_state: init
+    event_source_topic: agent-session
+
+    states:
+
+      # ════════════════════════════════════════════════════════════════════
+      # INIT — config, session row, rehydration, running version.
+      #
+      # Misconfiguration fails loudly (§11.2): an entity that cannot resolve its
+      # config or read its rows has nothing useful to do, and an empty config
+      # would surface to the user as a model outage.
+      # ════════════════════════════════════════════════════════════════════
+      - name: init
+        on_enter:
+          tasks:
+            - task_name: init-ids
+              set:
+                - workflow_id#: "{{ __sys_info__.get('workflow_id') }}"
+                - last_activity_at: "{{ last_activity_at or now().isoformat() }}"
+
+            - task_name: load-config
+              workflow:
+                ref: agent-harness-foundation/agent-config
+                mode: inline
+                input:
+                  mode: resolve
+                  agent_id: "{{ agent_id }}"
+              output:
+                set:
+                  - cfg_result: "{{ _ }}"
+
+            - task_name: reject-unresolvable-config
+              raise:
+                if: "{{ not (isinstance(cfg_result, dict) and cfg_result.get('ok')) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-session: cannot resolve config for agent '{{ agent_id }}': {{ (cfg_result or {}).get('error') }}"
+
+            # Phase 0 has no router: every turn goes to the default profile.
+            - task_name: read-config
+              set:
+                - config: "{{ cfg_result['data']['config'] }}"
+                - profiles: "{{ cfg_result['data']['profiles'] }}"
+                - config_version#: "{{ cfg_result['data']['config_version'] }}"
+                - resolved_refs: "{{ cfg_result['data'].get('resolved_refs') or {} }}"
+                - cfg_versions: "{{ {k: (cfg_result['data'].get('versions') or {}).get(k) for k in ['agent_row', 'user_row']} }}"
+                - profile#: "{{ profiles.get((config.get('router') or {}).get('default_profile')) or {} }}"
+
+            - task_name: reject-missing-default-profile
+              raise:
+                if: "{{ not profile }}"
+                type: error
+                error_type: AbortError
+                message: "agent-session: agent '{{ agent_id }}' has no usable default_profile"
+
+            - task_name: load-session
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: get
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  parts: [meta, context]
+              output:
+                set:
+                  - got: "{{ _ }}"
+
+            - task_name: reject-unreadable-session
+              raise:
+                if: "{{ not got.get('ok') and (got.get('error') or {}).get('code') != 'not_found' }}"
+                type: error
+                error_type: AbortError
+                message: "agent-session: cannot read session '{{ session_id }}': {{ got.get('error') }}"
+
+            - task_name: create-session
+              skip_if: "{{ bool(got.get('ok')) }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: create
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  throwaway: "{{ bool(throwaway) }}"
+              output:
+                set:
+                  - created: "{{ _ }}"
+
+            - task_name: pick-stored-session
+              set:
+                - _source: "{{ got if got.get('ok') else (created if isinstance(created, dict) else {}) }}"
+                - stored_meta: "{{ (_source.get('data') or {}).get('meta') or {} }}"
+                - stored_context: "{{ (got.get('data') or {}).get('context') or {} if got.get('ok') else {} }}"
+
+            - task_name: reject-uncreatable-session
+              raise:
+                if: "{{ not stored_meta }}"
+                type: error
+                error_type: AbortError
+                message: "agent-session: cannot create session '{{ session_id }}'"
+
+            # A retired session that gets a new message comes back to life. The
+            # row state machine allows retired -> active.
+            - task_name: reactivate-session
+              skip_if: "{{ stored_meta.get('status') != 'retired' }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: patch_meta
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  patch: {status: active}
+              output:
+                set:
+                  - reactivated: "{{ _ }}"
+
+            - task_name: restore-session
+              set:
+                - meta#: >-
+                    {{ reactivated['data']['meta']
+                       if stored_meta.get('status') == 'retired'
+                          and isinstance(reactivated, dict) and reactivated.get('ok')
+                       else stored_meta }}
+                - recent: "{{ stored_context.get('recent') or [] }}"
+                - summary: "{{ stored_context.get('summary') or '' }}"
+                - summary_upto_turn: "{{ int(stored_context.get('summary_upto_turn') or 0) }}"
+                - turn_count#: "{{ meta.get('turn_count') or 0 }}"
+                - title: "{{ meta.get('title') or '' }}"
+                - tool_counts: "{{ dict(meta.get('tool_counts') or {}) }}"
+
+            # The awaiting action survives retirement and checkpoints (§6.11): expire
+            # returns it unchanged unless it is overdue, in which case it is expired.
+            - task_name: load-pending
+              workflow:
+                ref: hitl
+                mode: inline
+                input: {mode: get, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - pending_got: "{{ (((_ or {}).get('data') or {}).get('pending')) or {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - pending_got: {}
+
+            - task_name: expire-due-pending
+              skip_if: "{{ pending_got.get('status') != 'awaiting' }}"
+              workflow:
+                ref: hitl
+                mode: inline
+                input: {mode: expire, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - pending_got: "{{ (((_ or {}).get('data') or {}).get('pending')) or pending_got }}"
+              on_error:
+                catch: true
+
+            - task_name: keep-awaiting-pending
+              set:
+                - pending#: "{{ pending_got if pending_got.get('status') == 'awaiting' else None }}"
+                - last_curated_turn: "{{ int(meta.get('last_curated_turn') or 0) }}"
+
+            # Jobs (§6.12): a session that retired mid-job catches up here. The rows are
+            # the truth: finished-and-undelivered or awaiting-input jobs go to relaying.
+            # reconcile also fails a stuck job whose entity is gone (as this user).
+            - task_name: reconcile-jobs
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input: {mode: reconcile, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}", config: "{{ config }}"}
+              output:
+                set:
+                  - jobs: "{{ (((_ or {}).get('data') or {}).get('active')) or [] if (_ or {}).get('ok') else list(meta.get('jobs') or []) }}"
+                  - jobs_to_relay#: "{{ [r.get('job_id') for r in ((((_ or {}).get('data') or {}).get('to_relay')) or [])] if (_ or {}).get('ok') else [] }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - jobs: "{{ list(meta.get('jobs') or []) }}"
+                    - jobs_to_relay: []
+
+            # Long-term memory (§6.4.5): the agent scope changes only by seeding and
+            # promotion, so it is cached here (and refreshed on idle ticks).
+            - task_name: load-agent-memory
+              skip_if: "{{ not (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) }}"
+              workflow:
+                ref: agent-harness-memory/memory-store
+                mode: inline
+                input: {mode: agent_scope_snapshot, agent_id: "{{ agent_id }}"}
+              output:
+                set:
+                  - agent_mem_items: "{{ (((_ or {}).get('data') or {}).get('items')) or [] }}"
+              on_error:
+                catch: true
+
+      # ════════════════════════════════════════════════════════════════════
+      # IDLE — wait for the next message; checkpoint while waiting.
+      # ════════════════════════════════════════════════════════════════════
+      - name: idle
+        timers:
+          - name: idle_tick
+            timeout_sec: "{{ config['session']['idle_tick_sec'] }}"
+        checkpoint_policy:
+          timeout_sec: "{{ config['session']['checkpoint_sec'] }}"
+          serialize_context: true
+          # Safe: nothing in `init` starts an async_mode activity.
+          auto_resume: true
+
+      # ════════════════════════════════════════════════════════════════════
+      # RECEIVING — accept the message, or answer it `busy` / `error`.
+      # ════════════════════════════════════════════════════════════════════
+      - name: receiving
+        on_enter:
+          tasks:
+            - task_name: classify-message
+              set:
+                - _d: "{{ inbound if isinstance(inbound, dict) else {} }}"
+                - _message: "{{ str(_d.get('message') or '') }}"
+                - _message_id: "{{ str(_d.get('message_id') or '') }}"
+                - _sent_at: "{{ str(_d.get('sent_at') or '') }}"
+                - _max_q: "{{ int((config.get('limits') or {}).get('max_queued_messages') or 0) }}"
+                - was_queued#: "{{ bool(_sent_at and last_turn_ended_at and _sent_at < last_turn_ended_at) }}"
+                - _over_queue: >-
+                    {{ was_queued and (_max_q < 1
+                                       or bool(last_turn_started_at and _sent_at < last_turn_started_at)) }}
+                - _action: "{{ _d.get('action') if isinstance(_d.get('action'), dict) else None }}"
+                - _invalid: "{{ (not _message.strip() and not _action) or not _message_id }}"
+                - accept#: "{{ not _over_queue and not _invalid }}"
+                - reject_status: "{{ 'busy' if _over_queue else 'error' }}"
+                - reject_answer: >-
+                    {{ 'I am still working on your earlier messages. Please send this again in a moment.'
+                       if _over_queue else 'The message was empty or had no message_id.' }}
+                - reject_message_id: "{{ _message_id }}"
+                - reject_caller: "{{ str(_d.get('caller_workflow_id') or '') }}"
+                - turn_ctx: >-
+                    {{ {'message': _message,
+                        'action': _action,
+                        'message_id': _message_id,
+                        'caller_workflow_id': str(_d.get('caller_workflow_id') or ''),
+                        'progress': _d.get('progress') is True,
+                        'sent_at': _sent_at,
+                        'received_at': now().isoformat()}
+                       if accept else {} }}
+                - last_activity_at: "{{ now().isoformat() if accept else last_activity_at }}"
+
+            - task_name: reply-rejected
+              skip_if: "{{ not (not accept and reject_caller != '') }}"
+              emit_event:
+                target_workflow_id: "{{ reject_caller }}"
+                topic: agent-session
+                event_type: agent_answer
+                data:
+                  message_id: "{{ reject_message_id }}"
+                  session_id: "{{ session_id }}"
+                  turn:
+                  status: "{{ reject_status }}"
+                  answer: "{{ reject_answer }}"
+                  sources: []
+                  route:
+              # A caller that has already gone must not fail the entity.
+              on_error: {catch: true}
+
+      # ════════════════════════════════════════════════════════════════════
+      # PREPARING — config check, router view, catalog, availability (§6.10.3).
+      # Every child here degrades rather than raising: a raised error would end
+      # this long-lived entity.
+      # ════════════════════════════════════════════════════════════════════
+      - name: preparing
+        on_enter:
+          tasks:
+            - task_name: start-turn
+              set:
+                - last_turn_started_at: "{{ now().isoformat() }}"
+                # The progress channel (§11.4): best-effort `progress#` at stage
+                # boundaries, seen on the debug feed of the turn's trace. Never read.
+                - progress#: "{{ {'stage': 'received', 'turn': turn_count + 1} }}"
+                - turn_blocked: false
+
+            # Hooks (§5.4): turn.received may redact the message or block the turn.
+            - task_name: hook-turn-received
+              skip_if: "{{ not any(isinstance(h, dict) and h.get('event') == 'turn.received' for h in (config.get('hooks') or [])) }}"
+              workflow:
+                ref: agent-harness-foundation/hook-runner
+                mode: inline
+                input:
+                  hook_event: turn.received
+                  payload: {message: "{{ turn_ctx.get('message') }}", meta: {title: "{{ title }}", turn_count: "{{ turn_count }}"}}
+                  hooks: "{{ config.get('hooks') or [] }}"
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+              output:
+                set:
+                  - turn_blocked#: "{{ (_ or {}).get('action') == 'block' }}"
+                  - turn_ctx: "{{ dict(turn_ctx, message=str(((_ or {}).get('payload') or {}).get('message') or turn_ctx.get('message'))) }}"
+                  - result: >-
+                      {{ {'status': 'ok', 'answer': str((_ or {}).get('reason') or 'This request was blocked.'), 'sources': [],
+                          'usage': {}, 'trace': {'hooks': (_ or {}).get('trace')}} if (_ or {}).get('action') == 'block' else result }}
+              on_error:
+                catch: true
+
+            # Cost limits (§6.10.5): the user's daily row, owned by this entity. Soft: a
+            # turn that starts under the limit finishes; concurrent sessions of one user
+            # may overshoot a little (no compare-and-set, P15). The row is GLOBAL
+            # (`agent.<id>.usage`, key usage_day:<day>:<uid>) so the janitor's agent-wide
+            # rollup can sum it without reading any user's namespace; it holds counters
+            # only.
+            - task_name: read-usage-day
+              skip_if: "{{ turn_blocked }}"
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "agent.{{ agent_id }}.usage", key: "usage_day:{{ now().date().isoformat() }}:{{ __user_info__.get('user_id') }}"}
+              output:
+                set:
+                  - usage_day: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - usage_day: {}
+
+            - task_name: check-cost-limits
+              skip_if: "{{ turn_blocked }}"
+              set:
+                - _cost: "{{ (config.get('limits') or {}).get('cost') or {} }}"
+                - _tokens: "{{ int(usage_day.get('tokens_in') or 0) + int(usage_day.get('tokens_out') or 0) }}"
+                - limit_hit#: >-
+                    {{ 'paused' if (config.get('limits') or {}).get('paused') is True else
+                       'turns' if _cost.get('user_daily_turns') is not None and int(usage_day.get('turns') or 0) >= int(_cost['user_daily_turns']) else
+                       'tokens' if _cost.get('user_daily_tokens') is not None and _tokens >= int(_cost['user_daily_tokens']) else None }}
+                - turn_blocked: "{{ limit_hit is not None }}"
+                - result: >-
+                    {{ result if limit_hit is None else
+                       {'status': 'ok', 'sources': [], 'usage': {}, 'trace': {'limit': limit_hit},
+                        'answer': str((config.get('session') or {}).get('paused_text') or 'This assistant is paused for today. Please try again later.')
+                                  if limit_hit == 'paused' else
+                                  str((config.get('session') or {}).get('limit_text') or 'You have reached your daily limit for this assistant. Please try again tomorrow.')} }}
+
+            # guard check_input (off by default, §6.13): a blocked message is refused
+            # with no routing and no model call. It fails open.
+            - task_name: check-input
+              skip_if: "{{ turn_blocked or not ((config.get('guard') or {}).get('input_check') is True) }}"
+              workflow:
+                ref: agent-harness-loop/guard
+                mode: inline
+                input:
+                  mode: check_input
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  message: "{{ turn_ctx.get('message') }}"
+              output:
+                set:
+                  - turn_blocked#: "{{ ((_ or {}).get('data') or {}).get('allow') == False }}"
+                  - result: >-
+                      {{ {'status': 'ok', 'answer': str(((_ or {}).get('data') or {}).get('reason') or 'I cannot help with that.'),
+                          'sources': [], 'usage': {'classifier_calls': 1},
+                          'trace': {'input_check': {k: ((_ or {}).get('data') or {}).get(k) for k in ['flags', 'injection_p', 'harmful_p']}}}
+                         if ((_ or {}).get('data') or {}).get('allow') == False else result }}
+              on_error:
+                catch: true
+
+            # Two reads; a full resolve only when an admin or the user saved config.
+            - task_name: check-config-version
+              workflow:
+                ref: agent-harness-foundation/agent-config
+                mode: inline
+                input: {mode: version, agent_id: "{{ agent_id }}"}
+              output:
+                set:
+                  - version_now: "{{ ((_ or {}).get('data') or {}) }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - version_now: "{{ cfg_versions }}"
+
+            - task_name: reload-config
+              skip_if: "{{ {k: version_now.get(k) for k in ['agent_row', 'user_row']} == cfg_versions }}"
+              workflow:
+                ref: agent-harness-foundation/agent-config
+                mode: inline
+                input: {mode: resolve, agent_id: "{{ agent_id }}"}
+              output:
+                set:
+                  - reloaded: "{{ _ if isinstance(_, dict) and _.get('ok') else None }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - reloaded: null
+
+            - task_name: apply-reloaded-config
+              skip_if: "{{ not reloaded }}"
+              set:
+                - config: "{{ reloaded['data']['config'] }}"
+                - profiles: "{{ reloaded['data']['profiles'] }}"
+                - resolved_refs: "{{ reloaded['data'].get('resolved_refs') or {} }}"
+                - config_version#: "{{ reloaded['data']['config_version'] }}"
+                - cfg_versions: "{{ {k: (reloaded['data'].get('versions') or {}).get(k) for k in ['agent_row', 'user_row']} }}"
+                - reloaded: null
+
+            - task_name: build-router-view
+              workflow:
+                ref: agent-harness-loop/context-builder
+                mode: inline
+                input: {mode: conversation, agent_id: "{{ agent_id }}", conversation: {recent: "{{ recent }}"}}
+              output:
+                set:
+                  - router_view: "{{ ((_ or {}).get('data') or {}).get('router_view') or [] }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - router_view: []
+
+            - task_name: read-catalog
+              workflow:
+                ref: agent-harness-knowledge/knowledge
+                mode: inline
+                input: {mode: catalog, agent_id: "{{ agent_id }}", config: "{{ config }}"}
+              output:
+                set:
+                  - catalog: "{{ ((_ or {}).get('data') or {}).get('sources') or [] }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - catalog: []
+
+            # react and other tool profiles are offered only when a tool is offerable
+            # to THIS caller now (enabled, credential present, not hidden for guests).
+            - task_name: check-tools
+              skip_if: >-
+                {{ not (config.get('toolsets') or [])
+                   or not any((p.get('requires') or {}).get('tools') for p in profiles.values() if isinstance(p, dict)) }}
+              workflow:
+                ref: agent-harness-tools/tool-policy
+                mode: inline
+                input: {mode: resolve, agent_id: "{{ agent_id }}", config: "{{ config }}", toolsets: "{{ config.get('toolsets') or [] }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - has_tools#: "{{ bool((((_ or {}).get('data') or {}).get('offerable') or [])) }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - has_tools: false
+
+            - task_name: check-availability
+              workflow:
+                ref: profile-availability
+                mode: inline
+                input: {agent_id: "{{ agent_id }}", config: "{{ config }}", profiles: "{{ profiles }}", catalog: "{{ catalog }}", has_tools: "{{ has_tools }}", agent_worker: "{{ (config.get('deployment') or {}).get('agent_worker') is True }}"}
+              output:
+                set:
+                  - available: "{{ (_ or {}).get('available') or [] }}"
+                  - role: "{{ (_ or {}).get('role') or 'user' }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - available: []
+
+      # ════════════════════════════════════════════════════════════════════
+      # ROUTING — which profile, with what query, over which sources (§6.7).
+      # ════════════════════════════════════════════════════════════════════
+      - name: routing
+        on_enter:
+          tasks:
+          - task_name: route-message
+            workflow:
+              ref: agent-harness-loop/query-router
+              mode: inline
+              input:
+                agent_id: "{{ agent_id }}"
+                message: "{{ turn_ctx.get('message') }}"
+                action: "{{ turn_ctx.get('action') }}"
+                router_view: "{{ router_view }}"
+                available: "{{ available }}"
+                catalog: "{{ catalog }}"
+                previous_answer: "{{ turn_count > 0 }}"
+                pending_action: "{{ {'id': pending['id'], 'kind': pending.get('kind'), 'summary': pending.get('summary')} if pending else None }}"
+                role: "{{ role }}"
+                config: "{{ config }}"
+                resolved_refs: "{{ resolved_refs }}"
+            output:
+              set:
+                - router_result#: "{{ _ if isinstance(_, dict) else {} }}"
+            # No profile available, or a router bug: the default profile, logged.
+            on_error:
+              catch: true
+              do:
+                set:
+                  - router_result#: >-
+                      {{ {'route': (config.get('router') or {}).get('default_profile'), 'sources': [], 'tags': [],
+                          'rewritten_query': turn_ctx.get('message'), 'decided_by': 'default',
+                          'trace': {'error': str(_.get('error_message'))[:300]}} }}
+
+          # Hooks (§5.4, phase 3): route.decided may NARROW the sources (a subset of
+          # the router's; anything else is dropped here). No block: turn.received is
+          # the place to stop a turn.
+          - task_name: note-route
+            set:
+              - progress#: "{{ {'stage': 'routed', 'route': router_result.get('route'), 'sources': list(router_result.get('sources') or [])} }}"
+
+          - task_name: send-progress-routed
+            skip_if: "{{ not (turn_ctx.get('progress') and turn_ctx.get('caller_workflow_id')) }}"
+            emit_event:
+              target_workflow_id: "{{ turn_ctx.get('caller_workflow_id') }}"
+              topic: agent-session
+              event_type: agent_answer
+              data:
+                message_id: "{{ turn_ctx.get('message_id') }}"
+                kind: progress
+                progress: "{{ {'stage': 'routed', 'route': router_result.get('route'), 'sources': list(router_result.get('sources') or [])} }}"
+            on_error: {catch: true}
+
+          - task_name: hook-route-decided
+            skip_if: "{{ not any(isinstance(h, dict) and h.get('event') == 'route.decided' for h in (config.get('hooks') or [])) }}"
+            workflow:
+              ref: agent-harness-foundation/hook-runner
+              mode: inline
+              input:
+                hook_event: route.decided
+                payload: >-
+                  {{ {'message': turn_ctx.get('message'), 'route': router_result.get('route'), 'sources': list(router_result.get('sources') or []),
+                      'tags': list(router_result.get('tags') or []), 'rewritten_query': router_result.get('rewritten_query')} }}
+                hooks: "{{ config.get('hooks') or [] }}"
+                agent_id: "{{ agent_id }}"
+                session_id: "{{ session_id }}"
+            output:
+              set:
+                - router_result: >-
+                    {{ dict(router_result, sources=[x for x in (((_ or {}).get('payload') or {}).get('sources') or [])
+                                                    if x in (router_result.get('sources') or [])],
+                            trace=dict(router_result.get('trace') or {}, hooks=(_ or {}).get('trace'))) }}
+            on_error:
+              catch: true
+
+      # ════════════════════════════════════════════════════════════════════
+      # ASSEMBLING — the context bundle within the budget (§6.6).
+      # ════════════════════════════════════════════════════════════════════
+      - name: assembling
+        on_enter:
+          tasks:
+          - task_name: recall-memory
+            skip_if: "{{ not (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) or role == 'guest' }}"
+            workflow:
+              ref: agent-harness-memory/memory
+              mode: inline
+              input:
+                mode: recall
+                agent_id: "{{ agent_id }}"
+                config: "{{ config }}"
+                query: "{{ router_result.get('rewritten_query') or turn_ctx.get('message') }}"
+                tags: "{{ list(router_result.get('tags') or []) }}"
+                agent_items: "{{ agent_mem_items }}"
+                refers_to_past: "{{ ((router_result.get('signals') or {}).get('refers_to_past') or 0) >= 0.5 }}"
+            output:
+              set:
+                - memory_recall: >-
+                    {{ (lambda d: {'profile': d.get('profile') or [], 'recalled': d.get('items') or [], 'episodes': d.get('episodes') or []})(
+                         ((_ or {}).get('data') or {})) }}
+            on_error:
+              catch: true
+              do:
+                set:
+                  - memory_recall: {}
+          - task_name: assemble-context
+            workflow:
+              ref: agent-harness-loop/context-builder
+              mode: inline
+              input:
+                mode: assemble
+                agent_id: "{{ agent_id }}"
+                question: {original: "{{ turn_ctx.get('message') }}", rewritten: "{{ router_result.get('rewritten_query') }}"}
+                conversation: {recent: "{{ recent }}", summary: "{{ summary }}"}
+                memory_recall: "{{ memory_recall }}"
+                session_id: "{{ session_id }}"
+                pending_action: "{{ {'summary': pending.get('summary'), 'kind': pending.get('kind')} if pending else None }}"
+                # Active background jobs (§6.12), one line each, so the model knows what is running.
+                jobs: >-
+                  {{ [{'summary': 'Background job ' + str(j.get('job_id')) + ' (' + str(j.get('profile') or 'job') + ') is '
+                                  + str(j.get('status')).replace('_', ' ') + (': ' + str(j.get('summary')) if j.get('summary') else '')}
+                      for j in jobs] }}
+                # The tool rules join the system prompt when the routed profile has tools.
+                tools_offered: "{{ bool(has_tools and ((profiles.get(router_result.get('route')) or {}).get('loop') or {}).get('tools')) }}"
+                config: "{{ config }}"
+                resolved_refs: "{{ resolved_refs }}"
+            output:
+              set:
+                - context_bundle: "{{ (((_ or {}).get('data') or {}).get('context_bundle')) or {} }}"
+            on_error:
+              catch: true
+              do:
+                set:
+                  - context_bundle: "{{ {'blocks': [{'id': 'question', 'items': [{'original': turn_ctx.get('message'), 'rewritten': ''}]}], 'used_memory': []} }}"
+
+          # Hooks (§5.4, phase 3): context.assembled, observe-only (block ids and sizes, not content).
+          - task_name: hook-context-assembled
+            skip_if: "{{ not any(isinstance(h, dict) and h.get('event') == 'context.assembled' for h in (config.get('hooks') or [])) }}"
+            workflow:
+              ref: agent-harness-foundation/hook-runner
+              mode: inline
+              input:
+                hook_event: context.assembled
+                payload: >-
+                  {{ {'route': router_result.get('route'), 'blocks': [{'id': b.get('id'), 'items': len(b.get('items') or [])} for b in (context_bundle.get('blocks') or []) if isinstance(b, dict)], 'used_memory': list(context_bundle.get('used_memory') or [])} }}
+                hooks: "{{ config.get('hooks') or [] }}"
+                agent_id: "{{ agent_id }}"
+                session_id: "{{ session_id }}"
+            on_error:
+              catch: true
+
+      # ════════════════════════════════════════════════════════════════════
+      # RUNNING — the routed profile, within budget_sec (§6.10.3).
+      # ════════════════════════════════════════════════════════════════════
+      - name: running
+        on_enter:
+          tasks:
+            - task_name: prepare-turn
+              set:
+                # A resume runs the profile that suspended (set in resuming).
+                - profile#: >-
+                    {{ profile if resume_input else
+                       profiles.get(router_result.get('route')) or profiles.get((config.get('router') or {}).get('default_profile')) or profile }}
+                - progress#: "{{ {'stage': 'running', 'profile': (profile or {}).get('name'), 'resume': bool(resume_input)} }}"
+                - _limits: "{{ config.get('limits') or {} }}"
+                # Timestamps are compared with tzinfo stripped (all UTC): a naive
+                # and an aware datetime cannot be subtracted, and a diagnostics
+                # mismatch must never fail a turn.
+                - _received: "{{ dt.datetime.fromisoformat(turn_ctx.get('received_at') or now().isoformat()).replace(tzinfo=None) }}"
+                - _elapsed: "{{ max(0.0, (now().replace(tzinfo=None) - _received).total_seconds()) }}"
+                # min(profile budget, turn budget left); never below 5s, so a
+                # late message still gets a (failing, persisted) attempt.
+                - budget_sec#: >-
+                    {{ int(max(5, min(profile.get('budget_sec') or 40,
+                                      (_limits.get('turn_budget_sec') or 110) - _elapsed))) }}
+
+            # Bounded by budget_sec, and unable to fail the entity (see header).
+            - task_name: send-progress-running
+              skip_if: "{{ not (turn_ctx.get('progress') and turn_ctx.get('caller_workflow_id')) }}"
+              emit_event:
+                target_workflow_id: "{{ turn_ctx.get('caller_workflow_id') }}"
+                topic: agent-session
+                event_type: agent_answer
+                data:
+                  message_id: "{{ turn_ctx.get('message_id') }}"
+                  kind: progress
+                  progress: "{{ {'stage': 'running', 'profile': (profile or {}).get('name')} }}"
+              on_error: {catch: true}
+
+            # kind: loop → agent-loop; kind: wfspec → the profile's own wfspec, same contract
+            # (§6.8.5). finalizing normalises whatever comes back.
+            - task_name: run-profile
+              workflow:
+                ref: "{{ ((profile.get('wfspec') or {}).get('name') if profile.get('kind') == 'wfspec' else None) or 'agent-harness-loop/agent-loop' }}"
+                mode: sync
+                input:
+                  agent_id: "{{ agent_id }}"
+                  profile: "{{ profile }}"
+                  query: "{{ turn_ctx.get('message') }}"
+                  rewritten_query: "{{ router_result.get('rewritten_query') }}"
+                  router: "{{ {k: router_result.get(k) for k in ['route', 'sources', 'tags', 'confidence']} }}"
+                  context_bundle: "{{ context_bundle }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  budget_sec: "{{ budget_sec }}"
+                  resume: "{{ resume_input }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn_count + 1 }}"
+                  tool_counts: "{{ tool_counts }}"
+                  # Where the loop sends its progress events (null: nobody asked).
+                  progress_to: >-
+                    {{ {'workflow_id': turn_ctx.get('caller_workflow_id'), 'message_id': turn_ctx.get('message_id')}
+                       if turn_ctx.get('progress') and turn_ctx.get('caller_workflow_id') else None }}
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ int(budget_sec) }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - result: >-
+                      {{ _ if isinstance(_, dict)
+                         else {'status': 'error',
+                               'trace': {'error': {'code': 'profile_failed',
+                                                   'message': 'agent-loop returned ' + str(_)[:480]}}} }}
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - result:
+                        status: error
+                        trace:
+                          error:
+                            code: profile_failed
+                            message: "{{ str(_.get('error_message'))[:500] }}"
+
+            # Explicit handoff (§6.8.4): once, to an available profile whose estimated_sec
+            # fits what is left of the turn; otherwise the first answer, plus a hint.
+            - task_name: plan-handoff
+              set:
+                - _h: "{{ result.get('handoff') if isinstance(result, dict) and result.get('status') == 'handoff' and isinstance(result.get('handoff'), dict) else {} }}"
+                - handoff_target#: "{{ str(_h.get('profile') or '') or None }}"
+                - _limits: "{{ config.get('limits') or {} }}"
+                - _received: "{{ dt.datetime.fromisoformat(turn_ctx.get('received_at') or now().isoformat()).replace(tzinfo=None) }}"
+                - handoff_left: "{{ int((_limits.get('turn_budget_sec') or 110) - max(0.0, (now().replace(tzinfo=None) - _received).total_seconds())) }}"
+                - handoff_fits#: >-
+                    {{ handoff_target is not None and handoff_target != profile.get('name')
+                       and handoff_target in [a.get('name') for a in available] and handoff_target in profiles
+                       and int((profiles[handoff_target] or {}).get('estimated_sec') or 999) <= handoff_left - 5 }}
+                - first_profile: "{{ profile.get('name') }}"
+
+            - task_name: run-handoff-profile
+              skip_if: "{{ not handoff_fits }}"
+              workflow:
+                ref: "{{ ((profiles[handoff_target].get('wfspec') or {}).get('name') if profiles[handoff_target].get('kind') == 'wfspec' else None) or 'agent-harness-loop/agent-loop' }}"
+                mode: sync
+                input:
+                  agent_id: "{{ agent_id }}"
+                  profile: "{{ profiles[handoff_target] }}"
+                  query: "{{ turn_ctx.get('message') }}"
+                  rewritten_query: "{{ router_result.get('rewritten_query') }}"
+                  router: "{{ {k: router_result.get(k) for k in ['route', 'sources', 'tags', 'confidence']} }}"
+                  context_bundle: "{{ context_bundle }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  budget_sec: "{{ max(5, handoff_left - 5) }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn_count + 1 }}"
+                  tool_counts: "{{ tool_counts }}"
+                  # Where the loop sends its progress events (null: nobody asked).
+                  progress_to: >-
+                    {{ {'workflow_id': turn_ctx.get('caller_workflow_id'), 'message_id': turn_ctx.get('message_id')}
+                       if turn_ctx.get('progress') and turn_ctx.get('caller_workflow_id') else None }}
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ max(5, handoff_left - 5) }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - result: >-
+                      {{ dict(_, trace=dict(_.get('trace') or {}, handoff={'from': first_profile, 'to': handoff_target, 'reason': (result.get('handoff') or {}).get('reason')}))
+                         if isinstance(_, dict) else result }}
+                  - profile: "{{ profiles[handoff_target] }}"
+              on_error:
+                catch: true
+
+            - task_name: settle-handoff
+              skip_if: "{{ handoff_target is None or handoff_fits }}"
+              set:
+                - _slash: "{{ [k for k, v in ((config.get('router') or {}).get('slash') or {}).items() if v == handoff_target] }}"
+                - result: >-
+                    {{ dict(result, status='ok',
+                            answer=(str(result.get('answer') or '').strip() + '\n\n'
+                                    + ('For this, try ' + _slash[0] + ' -- it was too long to start in this turn.' if _slash
+                                       else 'The ' + handoff_target + ' profile could answer this, but it does not fit in this turn.')).strip(),
+                            trace=dict(result.get('trace') or {}, handoff={'from': first_profile, 'to': handoff_target, 'run': False})) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # RESUMING — the reply to the pending action (§6.10.3, §6.11).
+      # ════════════════════════════════════════════════════════════════════
+      - name: resuming
+        on_enter:
+          tasks:
+            - task_name: resolve-pending
+              workflow:
+                ref: hitl
+                mode: inline
+                input:
+                  mode: resolve
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  id: "{{ pending['id'] }}"
+                  decision: "{{ (router_result.get('pending_reply') or {}).get('decision') }}"
+                  feedback: "{{ (router_result.get('pending_reply') or {}).get('feedback') }}"
+              output:
+                set:
+                  - resolve_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - resolve_result: "{{ {'ok': False, 'error': {'code': 'hitl_failed', 'message': str(_.get('error_message'))[:300]}} }}"
+
+            # "Approve for this session": record the grant first, then resume as an
+            # approve (§6.9.9). The session is the grant row's live writer.
+            - task_name: grant-for-session
+              skip_if: >-
+                {{ not (resolve_result.get('ok') == True
+                        and (router_result.get('pending_reply') or {}).get('decision') == 'approve_session'
+                        and pending.get('kind') == 'tool_call') }}
+              workflow:
+                ref: agent-harness-tools/tool-policy
+                mode: inline
+                input:
+                  mode: grant
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  session_id: "{{ session_id }}"
+                  name: "{{ ((pending.get('detail') or {}).get('call') or {}).get('name') }}"
+                  tool_version: "{{ (pending.get('detail') or {}).get('call_version') }}"
+              output:
+                set:
+                  - grant_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - grant_result: {}
+
+            # A job's question (§6.12): the answer goes to the job entity, not to a
+            # profile run. A reject cancels the job; so does an answer to a job whose
+            # entity is gone (job-manager cancel then writes the row itself).
+            - task_name: check-job-pending
+              set:
+                - job_pending_id#: "{{ str((pending.get('detail') or {}).get('job_id') or '') or None }}"
+                - job_decision: "{{ (router_result.get('pending_reply') or {}).get('decision') }}"
+                - job_forward_result: {}
+
+            - task_name: forward-to-job
+              skip_if: "{{ job_pending_id is None or resolve_result.get('ok') != True or job_decision == 'reject' }}"
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input:
+                  mode: send
+                  agent_id: "{{ agent_id }}"
+                  job_id: "{{ job_pending_id }}"
+                  decision: "{{ job_decision }}"
+                  feedback: "{{ (router_result.get('pending_reply') or {}).get('feedback') }}"
+                  pending_action: "{{ ((resolve_result.get('data') or {}).get('resume') or {}).get('pending_action') }}"
+              output:
+                set:
+                  - job_forward_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+
+            - task_name: cancel-job-on-reject
+              skip_if: >-
+                {{ job_pending_id is None or resolve_result.get('ok') != True
+                   or (job_decision != 'reject' and job_forward_result.get('ok') is True) }}
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input:
+                  mode: cancel
+                  agent_id: "{{ agent_id }}"
+                  job_id: "{{ job_pending_id }}"
+                  reason: "{{ 'rejected by the user' if job_decision == 'reject' else 'the job stopped before the answer arrived' }}"
+              on_error:
+                catch: true
+
+            - task_name: plan-resume
+              set:
+                - _ok: "{{ resolve_result.get('ok') == True }}"
+                - _code: "{{ (resolve_result.get('error') or {}).get('code') }}"
+                - resume_input#: "{{ (resolve_result.get('data') or {}).get('resume') if _ok else None }}"
+                - profile: "{{ (profiles.get(pending.get('profile')) or profile) if _ok else profile }}"
+                # Resolved, expired or gone: nothing is awaiting any more. A bad
+                # decision (invalid_input) leaves the action waiting.
+                - pending: "{{ pending if _code == 'invalid_input' or _code == 'hitl_failed' else None }}"
+                - result: >-
+                    {{ {} if _ok else
+                       {'status': 'ok', 'sources': [], 'usage': {}, 'trace': {'resume_error': resolve_result.get('error')},
+                        'answer': ('That request expired before your answer arrived, so nothing was done. '
+                                   'Ask again if you still need it.') if _code == 'expired' else
+                                  ('That choice is not available for this request. Reply yes to go ahead, or no to cancel.')
+                                    if _code == 'invalid_input' else
+                                  ('I could not record your answer just now. Please try again.') if _code == 'hitl_failed' else
+                                  'There is nothing waiting for an answer any more.'} }}
+
+            - task_name: finish-job-resume
+              skip_if: "{{ job_pending_id is None or resolve_result.get('ok') != True }}"
+              set:
+                - _sent: "{{ job_decision != 'reject' and job_forward_result.get('ok') is True }}"
+                - resume_input:
+                - jobs: >-
+                    {{ [dict(j, status='running', updated_at=now().isoformat()) if j.get('job_id') == job_pending_id else j for j in jobs]
+                       if _sent else [j for j in jobs if j.get('job_id') != job_pending_id] }}
+                - result: >-
+                    {{ {'status': 'ok', 'sources': [], 'usage': {}, 'trace': {'job_reply': {'job_id': job_pending_id, 'decision': job_decision, 'sent': _sent}},
+                        'answer': ('Thanks. I passed that on to the background job; I will post its result here when it is done.') if _sent else
+                                  ('OK, I cancelled the background job.') if job_decision == 'reject' else
+                                  ('The background job had already stopped, so your answer could not be passed on. Ask again to start it over.')} }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # CLARIFYING — the router's templated question; no model call.
+      # ════════════════════════════════════════════════════════════════════
+      - name: clarifying
+        on_enter:
+          task_name: ask-clarify
+          set:
+            - result: >-
+                {{ {'status': 'clarify', 'answer': (router_result.get('clarify') or {}).get('question') or '',
+                    'sources': [], 'usage': {}, 'trace': {'router': router_result.get('trace')}} }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # FINALIZING — normalise the result; the fixed apology on error (§11.2).
+      # ════════════════════════════════════════════════════════════════════
+      - name: finalizing
+        on_enter:
+          tasks:
+            # Hooks (§5.4): answer.ready may annotate answer and sources; never blocks.
+            - task_name: hook-answer-ready
+              skip_if: >-
+                {{ not any(isinstance(h, dict) and h.get('event') == 'answer.ready' for h in (config.get('hooks') or []))
+                   or not isinstance(result, dict) or result.get('status') not in ['ok', 'declined'] }}
+              workflow:
+                ref: agent-harness-foundation/hook-runner
+                mode: inline
+                input:
+                  hook_event: answer.ready
+                  payload: {answer: "{{ result.get('answer') }}", sources: "{{ result.get('sources') or [] }}"}
+                  hooks: "{{ config.get('hooks') or [] }}"
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+              output:
+                set:
+                  - result: >-
+                      {{ dict(result, answer=((_ or {}).get('payload') or {}).get('answer', result.get('answer')),
+                              sources=((_ or {}).get('payload') or {}).get('sources', result.get('sources'))) }}
+              on_error:
+                catch: true
+
+            # A turn that failed for a SETUP reason (F70) is answered with what to set
+            # up, not the apology: a model call reported `auth` (missing or rejected key,
+            # a worker variable not set) or `unconfigured` (no key name), or a profile or
+            # every knowledge source failed with an error text that names one. Fixed text,
+            # because the model may be what is missing.
+            - task_name: classify-setup
+              set:
+                - _err: "{{ ((result.get('trace') or {}).get('error') or {}) if isinstance(result, dict) else {} }}"
+                - _msg: "{{ str(_err.get('message') or '').lower() }}"
+                - _scfg: "{{ config.get('session') or {} }}"
+                - _matches: "{{ any(str(p).lower() in _msg for p in (_scfg.get('setup_patterns') or [])) }}"
+                - _is_setup: >-
+                    {{ _err.get('code') in ['auth', 'unconfigured']
+                       or (_err.get('code') in ['profile_failed', 'retrieval_failed', 'provider_error'] and _matches) }}
+                - _role: "{{ str(_err.get('role') or ('embedding' if _err.get('code') == 'retrieval_failed' else 'inference')) }}"
+                - _secret: "{{ (((config.get('models') or {}).get(_role) or {}).get('apikey_secret_key')) or None }}"
+                - _reason: >-
+                    {{ 'no_secret_name' if (_err.get('code') == 'unconfigured' or 'has no model configured' in _msg) else
+                       'secret_missing' if ('secret not found' in _msg or 'secretnotfound' in _msg) else
+                       'env_default' if 'environment variable not set' in _msg else 'auth_failed' }}
+                - turn_setup: >-
+                    {{ {'role': _role, 'reason': _reason, 'secret_name': _secret,
+                        'scope': (('global' if str(_secret).startswith('global/') else 'user') if _secret else None)}
+                       if _is_setup else None }}
+                - setup_answer: >-
+                    {{ str(_scfg.get('setup_text') or "I can't answer yet: my {role} model is not set up. {hint}")
+                         .replace('{role}', _role)
+                         .replace('{hint}', str((_scfg.get('setup_hints') or {}).get(_reason) or ''))
+                         .replace('{secret}', str(_secret or 'the API key secret'))
+                       if _is_setup else None }}
+              on_error:
+                catch: true
+
+            - task_name: finalize-turn
+              set:
+                - _res: "{{ result if isinstance(result, dict) else {} }}"
+                - _status: "{{ _res.get('status') if _res.get('status') in ['ok', 'declined', 'clarify', 'needs_approval', 'async_started', 'handoff', 'error'] else 'error' }}"
+                - turn_route: "{{ router_result.get('route') if router_result.get('route') in ['clarify', 'pending_reply'] else profile.get('name') }}"
+                - turn_status#: "{{ 'error' if (_status == 'ok' and not _res.get('answer')) else _status }}"
+                # A failed turn gets the fixed apology (§11.2) and is still
+                # persisted.
+                - _pa: "{{ _res.get('pending_action') if isinstance(_res.get('pending_action'), dict) else {} }}"
+                # needs_approval: the answer is the approval prompt, or the ask_user question.
+                - turn_answer: >-
+                    {{ setup_answer if setup_answer else
+                       ((config.get('session') or {}).get('apology_text') or 'Sorry, something went wrong.') if turn_status == 'error' else
+                       (str(_pa.get('summary') or '') if _pa.get('kind') == 'user_input' else
+                        'I need your approval to continue: ' + str(_pa.get('summary') or 'run a tool')
+                        + '\n\nReply **yes** to approve'
+                        + (', **yes for this session** to stop asking for this tool,' if _pa.get('offer_session_grant') else '')
+                        + ' or **no** to cancel.') if turn_status == 'needs_approval' else
+                       _res.get('answer') }}
+                - turn_sources: "{{ _res.get('sources') or [] }}"
+                - turn_no#: "{{ turn_count + 1 }}"
+                - _now: "{{ now().isoformat() }}"
+                - _message: "{{ turn_ctx.get('message') or '' }}"
+                - turn_entries:
+                    - turn: "{{ turn_no }}"
+                      message_id: "{{ turn_ctx.get('message_id') }}"
+                      role: user
+                      content: "{{ _message }}"
+                      ts: "{{ turn_ctx.get('received_at') }}"
+                    - turn: "{{ turn_no }}"
+                      message_id: "{{ turn_ctx.get('message_id') }}"
+                      role: assistant
+                      content: "{{ turn_answer }}"
+                      route: "{{ turn_route }}"
+                      sources: "{{ turn_sources }}"
+                      status: "{{ turn_status }}"
+                      setup: "{{ turn_setup }}"
+                      # what the answer drew on, for feedback (memory feedback, §6.10.5)
+                      used_memory: "{{ list(_res.get('used_memory') or []) }}"
+                      ts: "{{ _now }}"
+                      # The agent-cli run that asked, so a UI can link the trace of a
+                      # restored turn. The transcript is display-only (the model reads
+                      # context.recent), so the id never reaches a prompt.
+                      workflow_id: "{{ turn_ctx.get('caller_workflow_id') or None }}"
+                # Conversation memory only learns from answered turns: an
+                # apology in the model's context would only confuse the next
+                # turn. The transcript keeps it.
+                - _n: "{{ int(((config.get('memory') or {}).get('short_term') or {}).get('recent_turns') or 6) }}"
+                # Answered turns (and clarify questions) join the conversation; the
+                # exchanges that fall out of it go to the compactor (step 15).
+                - _full: >-
+                    {{ (recent + [{'role': 'user', 'content': _message},
+                                  {'role': 'assistant', 'content': turn_answer}])
+                       if turn_status in ['ok', 'clarify', 'needs_approval', 'async_started'] else recent }}
+                - new_recent: "{{ _full[-2 * _n:] }}"
+                - compaction_exchanges: "{{ _full[:-2 * _n] if len(_full) > 2 * _n else [] }}"
+                - title: "{{ title or (_message[:60] + ('…' if len(_message) > 60 else '')) }}"
+                - _usage: "{{ _res.get('usage') or {} }}"
+                - pa_present: "{{ bool(_pa) }}"
+                - meta_patch:
+                    title: "{{ title }}"
+                    last_route: "{{ turn_route }}"
+                    config_version: "{{ config_version }}"
+                    usage:
+                      turns: 1
+                      llm_calls: "{{ _usage.get('llm_calls') or 0 }}"
+                      classifier_calls: "{{ _usage.get('classifier_calls') or 0 }}"
+                      tool_calls: "{{ _usage.get('tool_calls') or 0 }}"
+                      tokens_in: "{{ _usage.get('tokens_in') or 0 }}"
+                      tokens_out: "{{ _usage.get('tokens_out') or 0 }}"
+                # Phase-0 measurement M4 (§12 timing table). Additive: the
+                # contract is unchanged for callers that ignore it.
+                - _sent: "{{ turn_ctx.get('sent_at') }}"
+                - _recv: "{{ turn_ctx.get('received_at') }}"
+                - timing:
+                    wait_ms: >-
+                      {{ int((dt.datetime.fromisoformat(_recv).replace(tzinfo=None) - dt.datetime.fromisoformat(_sent).replace(tzinfo=None)).total_seconds() * 1000)
+                         if _sent and _recv else None }}
+                    run_ms: >-
+                      {{ int((dt.datetime.fromisoformat(_now).replace(tzinfo=None) - dt.datetime.fromisoformat(last_turn_started_at).replace(tzinfo=None)).total_seconds() * 1000)
+                         if last_turn_started_at else None }}
+                    turn_ms: >-
+                      {{ int((dt.datetime.fromisoformat(_now).replace(tzinfo=None) - dt.datetime.fromisoformat(_recv).replace(tzinfo=None)).total_seconds() * 1000)
+                         if _recv else None }}
+                    budget_sec: "{{ budget_sec }}"
+                - answer_event:
+                    message_id: "{{ turn_ctx.get('message_id') }}"
+                    session_id: "{{ session_id }}"
+                    turn: "{{ turn_no }}"
+                    status: "{{ turn_status }}"
+                    answer: "{{ turn_answer }}"
+                    sources: "{{ turn_sources }}"
+                    route: "{{ turn_route }}"
+                    timing: "{{ timing }}"
+                    setup: "{{ turn_setup }}"
+                - turn_trace#: "{{ {'router': {k: router_result.get(k) for k in ['route', 'sources', 'decided_by', 'confidence']}, 'profile': _res.get('trace')} }}"
+                # The audit rows commit_turn appends (F33), and the per-session counts.
+                - turn_audit: "{{ [a for a in ((_res.get('trace') or {}).get('tool_audit') or []) if isinstance(a, dict)] }}"
+                - tool_counts: >-
+                    {{ dict(tool_counts, **{t: int(tool_counts.get(t) or 0)
+                                               + len([a for a in turn_audit if a.get('tool') == t and a.get('status') in ['ok', 'error']])
+                                            for t in set(a.get('tool') for a in turn_audit
+                                                         if a.get('tool') and a.get('status') in ['ok', 'error'])}) }}
+
+            - task_name: open-pending
+              skip_if: "{{ turn_status != 'needs_approval' or not pa_present }}"
+              workflow:
+                ref: hitl
+                mode: inline
+                input:
+                  mode: open
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn_no }}"
+                  kind: "{{ result['pending_action'].get('kind') }}"
+                  profile: "{{ profile.get('name') }}"
+                  summary: "{{ result['pending_action'].get('summary') }}"
+                  detail: "{{ result['pending_action'].get('detail') or {} }}"
+                  offer_session_grant: "{{ bool(result['pending_action'].get('offer_session_grant')) }}"
+                  ttl_sec: "{{ result['pending_action'].get('expires_in_sec') }}"
+              output:
+                set:
+                  - open_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - open_result: "{{ {'ok': False, 'error': {'code': 'hitl_failed', 'message': str(_.get('error_message'))[:300]}} }}"
+
+            # Implicit feedback (§6.10.5): the router heard "that was wrong" about the
+            # previous answer. Recorded as source implicit on that turn; it changes
+            # memory only when decisions.feedback.implicit_enabled.
+            - task_name: record-implicit-feedback
+              skip_if: >-
+                {{ turn_count < 1 or ((router_result.get('signals') or {}).get('negative_feedback') or 0) < 0.8 }}
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: submit_feedback
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn_count }}"
+                  rating: down
+                  feedback_source: implicit
+                  comment: "{{ 'implicit: ' + str(turn_ctx.get('message') or '')[:200] }}"
+                  config: "{{ config }}"
+              on_error:
+                catch: true
+
+            # The action could not be stored: nothing can resume it, so say so.
+            - task_name: finish-pending
+              set:
+                - _opened: "{{ ((open_result.get('data') or {}).get('pending')) if open_result.get('ok') == True else None }}"
+                - pending: "{{ _opened if turn_status == 'needs_approval' and _opened else pending }}"
+                - turn_status: "{{ 'error' if turn_status == 'needs_approval' and not _opened else turn_status }}"
+                - turn_answer: >-
+                    {{ turn_answer if turn_status != 'error' or not pa_present else
+                       'I needed your approval to continue, but could not save the request. Please ask again.' }}
+                - answer_event: >-
+                    {{ dict(answer_event, status=turn_status, answer=turn_answer,
+                            pending_action=({'id': _opened['id'], 'kind': _opened.get('kind'), 'summary': _opened.get('summary'),
+                                             'offer_session_grant': bool(_opened.get('offer_session_grant'))} if _opened else None)) }}
+                - turn_entries: "{{ turn_entries[:1] + [dict(turn_entries[1], status=turn_status, content=turn_answer)] }}"
+                # Curation (§6.4.6): answered turns queue up; every curate_every_turns, or
+                # early on the router's states_preference signal, they go to the curator.
+                - pending_exchanges: >-
+                    {{ (pending_exchanges + [{'turn': turn_no, 'user': turn_ctx.get('message'), 'assistant': turn_answer,
+                                              'grounded_p': (result or {}).get('grounded_p')}])[-20:]
+                       if turn_status == 'ok' else pending_exchanges }}
+                - curate_now#: >-
+                    {{ (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) and role != 'guest' and bool(pending_exchanges)
+                       and (len(pending_exchanges) >= int(((config.get('memory') or {}).get('long_term') or {}).get('curate_every_turns') or 4)
+                            or ((router_result.get('signals') or {}).get('states_preference') or 0) >= 0.5) }}
+                - last_curated_turn: "{{ turn_no if curate_now else last_curated_turn }}"
+                - meta_patch: >-
+                    {{ dict(meta_patch, pending_action_id=(pending['id'] if pending else None), tool_counts=tool_counts,
+                            last_curated_turn=last_curated_turn,
+                            usage=dict(meta_patch.get('usage') or {}, tool_calls=len([a for a in turn_audit if a.get('status') in ['ok', 'error']]))) }}
+
+            # Async work (§6.12, F6): the profile or tool only RETURNED a job_request; the
+            # session starts the job, so the Agent layer never calls the Orchestration layer.
+            - task_name: start-job
+              # Also on needs_approval: an async tool may have started a job in an earlier
+              # step of a turn that then suspended for another call's approval.
+              skip_if: "{{ turn_status not in ['async_started', 'needs_approval'] or not isinstance((result or {}).get('job_request'), dict) }}"
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input:
+                  mode: start
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  profile: "{{ profile.get('name') }}"
+                  wfspec: >-
+                    {{ result['job_request'].get('wfspec')
+                       or ((profile.get('wfspec') or {}).get('name') if profile.get('kind') == 'wfspec' else None) }}
+                  job_input: "{{ result['job_request'].get('input') or {} }}"
+                  summary: "{{ str(result['job_request'].get('summary') or turn_ctx.get('message') or '')[:200] }}"
+                  config: "{{ config }}"
+              output:
+                set:
+                  - job_start_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - job_start_result: "{{ {'ok': False, 'error': {'code': 'job_failed', 'message': str(_.get('error_message'))[:300]}} }}"
+
+            - task_name: finish-job
+              set:
+                - _asked: "{{ turn_status == 'async_started' }}"
+                - _side_job: "{{ turn_status == 'needs_approval' and isinstance((result or {}).get('job_request'), dict) }}"
+                - _started: "{{ (job_start_result.get('data') or {}) if job_start_result.get('ok') is True else None }}"
+                - _code: "{{ (job_start_result.get('error') or {}).get('code') }}"
+                - jobs: >-
+                    {{ jobs + [{'job_id': _started['job_id'], 'status': 'queued', 'profile': profile.get('name'),
+                                'summary': str(((_started.get('job') or {}).get('summary')) or ''), 'progress': None,
+                                'updated_at': now().isoformat()}]
+                       if _started else jobs }}
+                # A job that cannot start is not a turn failure: say why (one at a time).
+                - turn_status: "{{ turn_status if not _asked or _started else ('declined' if _code == 'limit_exceeded' else 'error') }}"
+                - turn_answer: >-
+                    {{ turn_answer if not _asked else
+                       (str(turn_answer or '').strip() or 'I started a background job for this. I will post the result here when it is done.')
+                         if _started else
+                       ('A background job is already running in this conversation. I will post its result here; '
+                        'start the next one when it is done.') if _code == 'limit_exceeded' else
+                       'I could not start that background job. Please try again.' }}
+                # Beside an approval prompt, a started job is only mentioned.
+                - turn_answer: >-
+                    {{ turn_answer + ('\n\n(I also started a background job; its result will be posted here.)' if _started else
+                                      '\n\n(A background job could not be started.)') if _side_job else turn_answer }}
+                - new_recent: >-
+                    {{ new_recent[:-1] + [{'role': 'assistant', 'content': turn_answer}] if (_asked or _side_job) and new_recent else new_recent }}
+                - answer_event: >-
+                    {{ dict(answer_event, status=turn_status, answer=turn_answer,
+                            job=({'job_id': _started['job_id'], 'status': 'queued'} if _started else None)) }}
+                - turn_entries: "{{ turn_entries[:1] + [dict(turn_entries[1], status=turn_status, content=turn_answer, job_id=(_started or {}).get('job_id'))] }}"
+                - meta_patch: "{{ dict(meta_patch, jobs=jobs) }}"
+
+      # ════════════════════════════════════════════════════════════════════
+      # DELIVERING — answer the caller first, then persist the turn.
+      # ════════════════════════════════════════════════════════════════════
+      - name: delivering
+        on_enter:
+          tasks:
+            - task_name: send-answer
+              skip_if: "{{ not turn_ctx.get('caller_workflow_id') }}"
+              emit_event:
+                target_workflow_id: "{{ turn_ctx.get('caller_workflow_id') }}"
+                topic: agent-session
+                event_type: agent_answer
+                data: "{{ answer_event }}"
+              on_error: {catch: true}
+
+            # One call, so transcript, conversation memory and meta never
+            # disagree. The answer is already out, so a failed write is retried
+            # once and then only flagged (§11.2).
+            - task_name: commit-turn
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: commit_turn
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn_entries: "{{ turn_entries }}"
+                  context: {recent: "{{ new_recent }}", summary: "{{ summary }}", summary_upto_turn: "{{ summary_upto_turn }}"}
+                  meta_patch: "{{ meta_patch }}"
+                  toolcalls: "{{ turn_audit }}"
+              output:
+                set:
+                  - commit_result: "{{ _ }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - commit_result: "{{ {'ok': False, 'error': _} }}"
+
+            - task_name: commit-turn-retry
+              skip_if: "{{ isinstance(commit_result, dict) and commit_result.get('ok') == True }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: commit_turn
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn_entries: "{{ turn_entries }}"
+                  context: {recent: "{{ new_recent }}", summary: "{{ summary }}", summary_upto_turn: "{{ summary_upto_turn }}"}
+                  meta_patch: "{{ meta_patch }}"
+                  toolcalls: "{{ turn_audit }}"
+              output:
+                set:
+                  - commit_result: "{{ _ }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - commit_result: "{{ {'ok': False, 'error': _} }}"
+
+            # Hooks (§5.4, phase 3): turn.committed, observe-only (audit, analytics).
+            - task_name: hook-turn-committed
+              skip_if: "{{ not any(isinstance(h, dict) and h.get('event') == 'turn.committed' for h in (config.get('hooks') or [])) }}"
+              workflow:
+                ref: agent-harness-foundation/hook-runner
+                mode: inline
+                input:
+                  hook_event: turn.committed
+                  payload: >-
+                    {{ {'turn': turn_no, 'status': turn_status, 'route': router_result.get('route'), 'committed': isinstance(commit_result, dict) and commit_result.get('ok') == True} }}
+                  hooks: "{{ config.get('hooks') or [] }}"
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+              on_error:
+                catch: true
+
+            # Cost limits: this turn's usage joins the user's daily row (§6.10.5).
+            - task_name: write-usage-day
+              skip_if: "{{ limit_hit is not None }}"
+              activity:
+                type: builtin.state.set_state
+                input:
+                  in_global_ns: true
+                  namespace: "agent.{{ agent_id }}.usage"
+                  key: "usage_day:{{ (usage_day or {}).get('day') or now().date().isoformat() }}:{{ __user_info__.get('user_id') }}"
+                  topic: usage
+                  value: >-
+                    {{ {'schema_version': 1, 'day': (usage_day or {}).get('day') or now().date().isoformat(),
+                        'user_id': str(__user_info__.get('user_id')),
+                        'turns': int((usage_day or {}).get('turns') or 0) + 1,
+                        'tokens_in': int((usage_day or {}).get('tokens_in') or 0) + int(((meta_patch or {}).get('usage') or {}).get('tokens_in') or 0),
+                        'tokens_out': int((usage_day or {}).get('tokens_out') or 0) + int(((meta_patch or {}).get('usage') or {}).get('tokens_out') or 0),
+                        'llm_calls': int((usage_day or {}).get('llm_calls') or 0) + int(((meta_patch or {}).get('usage') or {}).get('llm_calls') or 0),
+                        'updated_at': now().isoformat()} }}
+              on_error:
+                catch: true
+
+            # Long-term memory (§6.4): mark what the answer used, and hand the queued
+            # exchanges to the curator (detached inside `memory record`).
+            - task_name: touch-used-memory
+              skip_if: "{{ not (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) or not ((result or {}).get('used_memory') or []) }}"
+              workflow:
+                ref: agent-harness-memory/memory-store
+                mode: inline
+                input:
+                  mode: touch
+                  agent_id: "{{ agent_id }}"
+                  keys: "{{ list(result.get('used_memory') or []) }}"
+                  definition_access: "{{ config.get('access') or {} }}"
+              on_error:
+                catch: true
+
+            - task_name: record-memory
+              skip_if: "{{ not curate_now }}"
+              workflow:
+                ref: agent-harness-memory/memory
+                mode: inline
+                input:
+                  mode: record
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  session_id: "{{ session_id }}"
+                  exchanges: "{{ pending_exchanges }}"
+                  trigger: "{{ 'early' if ((router_result.get('signals') or {}).get('states_preference') or 0) >= 0.5 else 'periodic' }}"
+              output:
+                set:
+                  - pending_exchanges: []
+              on_error:
+                catch: true
+
+            # Off-path jobs (detached): fold the dropped exchanges into the summary,
+            # and title a new conversation. Both answer with an event the entity
+            # applies in `idle`; neither writes a row.
+            - task_name: spawn-compactor
+              skip_if: "{{ not compaction_exchanges }}"
+              workflow:
+                ref: conversation-compactor
+                mode: detached
+                input:
+                  mode: compact
+                  agent_id: "{{ agent_id }}"
+                  entity_id: "{{ workflow_id }}"
+                  summary: "{{ summary }}"
+                  exchanges: "{{ compaction_exchanges }}"
+                  upto_turn: "{{ turn_no }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+              on_error:
+                catch: true
+
+            - task_name: spawn-title
+              skip_if: "{{ not (turn_no == 1 and turn_status == 'ok') }}"
+              workflow:
+                ref: conversation-compactor
+                mode: detached
+                input:
+                  mode: title
+                  agent_id: "{{ agent_id }}"
+                  entity_id: "{{ workflow_id }}"
+                  message: "{{ turn_ctx.get('message') }}"
+                  answer: "{{ turn_answer }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+              on_error:
+                catch: true
+
+            - task_name: end-turn
+              set:
+                - write_failed#: "{{ not (isinstance(commit_result, dict) and commit_result.get('ok') == True) }}"
+                - progress#: "{{ {'stage': 'answered', 'turn': turn_no} }}"
+                # In memory the turn happened either way, so turn numbers stay
+                # monotonic even when a write is lost.
+                - turn_count: "{{ turn_no }}"
+                - recent: "{{ new_recent }}"
+                - last_activity_at: "{{ now().isoformat() }}"
+                - last_turn_ended_at: "{{ now().isoformat() }}"
+                - turn_ctx: {}
+                - result: {}
+                - router_result: {}
+                - context_bundle: {}
+                - compaction_exchanges: []
+                - limit_hit:
+                - turn_blocked: false
+                - resume_input:
+                - resolve_result: {}
+                - grant_result: {}
+                - open_result: {}
+                - turn_audit: []
+
+      # ════════════════════════════════════════════════════════════════════
+      # RELAYING — bring job results and questions into the conversation (§6.12).
+      #
+      # Entered from init (reconcile) and on subagent_event. The ROW is read, never
+      # the event: a finished, undelivered job becomes an assistant-only turn and is
+      # marked delivered after the commit; a job awaiting input has its question
+      # opened as this session's pending action (unless one is already held) and
+      # shown as a turn; a running job only updates meta.jobs. No client waits on a
+      # relayed turn (F12): the UI polls get_session while meta.jobs is non-empty.
+      # ════════════════════════════════════════════════════════════════════
+      - name: relaying
+        on_enter:
+          tasks:
+            - task_name: read-relay-rows
+              loop:
+                in: "{{ jobs_to_relay }}"
+                foreach: relay_job_id
+                do:
+                  task_name: read-relay-row
+                  workflow:
+                    ref: agent-harness-jobs/job-manager
+                    mode: inline
+                    input: {mode: get, agent_id: "{{ agent_id }}", job_id: "{{ relay_job_id }}"}
+                  on_error:
+                    catch: true
+              output:
+                set:
+                  - relay_rows: >-
+                      {{ [((r.get('data') or {}).get('job')) for r in (_ or [])
+                          if isinstance(r, dict) and r.get('ok') is True and isinstance((r.get('data') or {}).get('job'), dict)
+                             and r['data']['job'].get('session_id') == session_id] }}
+
+            # The decisions, as data (unit-tested): what to deliver, what to open, and
+            # the jobs list that remains.
+            - task_name: plan-relay
+              set:
+                - _terminal: ["completed", "failed", "cancelled"]
+                - relay_done#: "{{ [r for r in relay_rows if r.get('status') in _terminal and not r.get('delivered_at')] }}"
+                - _held_job: "{{ str(((pending or {}).get('detail') or {}).get('job_id') or '') }}"
+                - _waiting: >-
+                    {{ [r for r in relay_rows if r.get('status') == 'awaiting_input' and isinstance(r.get('pending_action'), dict)
+                        and pending is None and r.get('job_id') != _held_job] }}
+                - relay_open#: "{{ _waiting[0] if _waiting else None }}"
+                # The held action belongs to a job that finished meanwhile (cancelled by an
+                # admin, failed, expired): nothing can answer it any more.
+                - relay_drop_pending#: "{{ bool(_held_job) and _held_job in [r.get('job_id') for r in relay_done] }}"
+                - _pa: "{{ (relay_open or {}).get('pending_action') or {} }}"
+                - _exp: "{{ str(_pa.get('expires_at') or '') }}"
+                - relay_ttl: >-
+                    {{ max(60, int((dt.datetime.fromisoformat(_exp).replace(tzinfo=None) - now().replace(tzinfo=None)).total_seconds()))
+                       if _exp else None }}
+                - _now: "{{ now().isoformat() }}"
+                - relay_entries: >-
+                    {{ [{'turn': turn_count + 1 + i, 'role': 'assistant', 'route': 'job', 'job_id': r.get('job_id'),
+                         'status': 'ok' if r.get('status') == 'completed' else 'error',
+                         'sources': list(((r.get('result') or {}).get('sources')) or []) if r.get('status') == 'completed' else [],
+                         'content': ((str(((r.get('result') or {}).get('answer')) or '').strip() or 'The background job finished.')
+                                     if r.get('status') == 'completed' else
+                                     'The background job' + (' (' + str(r.get('summary')) + ')' if r.get('summary') else '') + ' failed: '
+                                       + str(((r.get('error') or {}).get('message')) or 'no reason given')
+                                     if r.get('status') == 'failed' else
+                                     'The background job' + (' (' + str(r.get('summary')) + ')' if r.get('summary') else '') + ' was cancelled'
+                                       + (': nobody answered its question in time.' if ((r.get('error') or {}).get('code')) == 'expired' else '.')),
+                         'ts': _now}
+                        for i, r in enumerate(relay_done)] }}
+                - relay_question: >-
+                    {{ None if relay_open is None else
+                       str(_pa.get('summary') or '') if _pa.get('kind') == 'user_input' else
+                       'The background job' + (' (' + str(relay_open.get('summary')) + ')' if relay_open.get('summary') else '')
+                       + ' needs your review:\n\n' + str(_pa.get('summary') or '')
+                       + '\n\nReply **yes** to go ahead, **no** to cancel it, or say what to change.' }}
+                - _seen: "{{ [r.get('job_id') for r in relay_rows] }}"
+                - jobs: >-
+                    {{ [j for j in jobs if j.get('job_id') not in _seen]
+                       + [{'job_id': r.get('job_id'), 'status': r.get('status'), 'profile': r.get('profile'),
+                           'summary': r.get('summary'), 'progress': r.get('progress'), 'updated_at': r.get('updated_at')}
+                          for r in relay_rows if r.get('status') not in _terminal] }}
+
+            - task_name: cancel-stale-job-pending
+              skip_if: "{{ not relay_drop_pending }}"
+              workflow:
+                ref: hitl
+                mode: inline
+                input: {mode: cancel, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - pending: "{{ None if (_ or {}).get('ok') or ((_ or {}).get('error') or {}).get('code') in ['invalid_state', 'not_found'] else pending }}"
+              on_error:
+                catch: true
+
+            - task_name: open-job-pending
+              skip_if: "{{ relay_open is None }}"
+              workflow:
+                ref: hitl
+                mode: inline
+                input:
+                  mode: open
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn_count + len(relay_entries) + 1 }}"
+                  kind: "{{ relay_open['pending_action'].get('kind') or 'plan_review' }}"
+                  profile: "{{ relay_open.get('profile') }}"
+                  summary: "{{ relay_open['pending_action'].get('summary') }}"
+                  detail: "{{ dict(relay_open['pending_action'].get('detail') or {}, job_id=relay_open.get('job_id')) }}"
+                  offer_session_grant: false
+                  ttl_sec: "{{ relay_ttl }}"
+              output:
+                set:
+                  - relay_open_result: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - relay_open_result: {}
+
+            - task_name: finish-relay
+              set:
+                - _opened: "{{ ((relay_open_result.get('data') or {}).get('pending')) if relay_open_result.get('ok') is True else None }}"
+                - pending: "{{ _opened or pending }}"
+                - relay_entries: >-
+                    {{ relay_entries + ([{'turn': turn_count + len(relay_entries) + 1, 'role': 'assistant', 'route': 'job',
+                                          'job_id': relay_open.get('job_id'), 'status': 'needs_approval', 'sources': [],
+                                          'content': relay_question, 'ts': now().isoformat()}] if _opened else []) }}
+                - relay_turn_no: "{{ turn_count + len(relay_entries) }}"
+                - _n: "{{ int(((config.get('memory') or {}).get('short_term') or {}).get('recent_turns') or 6) }}"
+                - relay_recent: "{{ (recent + [{'role': 'assistant', 'content': e['content']} for e in relay_entries])[-2 * _n:] }}"
+                - relay_meta: "{{ {'jobs': jobs, 'pending_action_id': (pending or {}).get('id')} }}"
+
+            - task_name: commit-relay
+              skip_if: "{{ not relay_entries }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: commit_turn
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  turn_entries: "{{ relay_entries }}"
+                  context: {recent: "{{ relay_recent }}", summary: "{{ summary }}", summary_upto_turn: "{{ summary_upto_turn }}"}
+                  meta_patch: "{{ relay_meta }}"
+              output:
+                set:
+                  - relay_commit: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - relay_commit: {}
+
+            # Progress only: the jobs list changed, no turn.
+            - task_name: patch-relay-meta
+              skip_if: "{{ bool(relay_entries) }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: patch_meta
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  patch: "{{ relay_meta }}"
+              on_error:
+                catch: true
+
+            # Only after the commit: a lost commit leaves the job undelivered, and the
+            # next init relays it again.
+            - task_name: mark-relayed
+              skip_if: "{{ not relay_done or relay_commit.get('ok') is not True }}"
+              loop:
+                in: "{{ [r.get('job_id') for r in relay_done] }}"
+                foreach: done_job_id
+                do:
+                  task_name: mark-one-relayed
+                  workflow:
+                    ref: agent-harness-jobs/job-manager
+                    mode: inline
+                    input: {mode: mark_delivered, agent_id: "{{ agent_id }}", job_id: "{{ done_job_id }}"}
+                  on_error:
+                    catch: true
+
+            - task_name: end-relay
+              set:
+                - _committed: "{{ relay_commit.get('ok') is True }}"
+                - turn_count: "{{ relay_turn_no if _committed else turn_count }}"
+                - recent: "{{ relay_recent if _committed else recent }}"
+                - jobs_to_relay: []
+                - relay_rows: []
+                - relay_open:
+                - relay_drop_pending: false
+                - relay_open_result: {}
+                - relay_commit: {}
+
+      # ════════════════════════════════════════════════════════════════════
+      # TICKING — the idle_tick decisions: retire? stop?
+      # ════════════════════════════════════════════════════════════════════
+      - name: ticking
+        on_enter:
+          tasks:
+            - task_name: refresh-agent-memory
+              skip_if: "{{ not (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) }}"
+              workflow:
+                ref: agent-harness-memory/memory-store
+                mode: inline
+                input: {mode: agent_scope_snapshot, agent_id: "{{ agent_id }}"}
+              output:
+                set:
+                  - agent_mem_items: "{{ (((_ or {}).get('data') or {}).get('items')) or agent_mem_items }}"
+              on_error:
+                catch: true
+
+            # The entity expires its own overdue action (§6.10.2); the janitor only
+            # touches rows of retired sessions.
+            - task_name: expire-pending-on-tick
+              skip_if: "{{ pending is None }}"
+              workflow:
+                ref: hitl
+                mode: inline
+                input: {mode: expire, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+              output:
+                set:
+                  - pending#: >-
+                      {{ None if ((_ or {}).get('data') or {}).get('expired') or not (_ or {}).get('ok') else pending }}
+              on_error:
+                catch: true
+
+            - task_name: decide-tick
+              set:
+                - _limits: "{{ config.get('limits') or {} }}"
+                - _throwaway: "{{ bool((meta or {}).get('throwaway')) }}"
+                - _retire_after: >-
+                    {{ (_limits.get('retire_throwaway_after_idle_sec') or 600) if _throwaway
+                       else (_limits.get('retire_after_idle_sec') or 86400) }}
+                - idle_for_sec#: >-
+                    {{ (now().replace(tzinfo=None) - dt.datetime.fromisoformat(last_activity_at).replace(tzinfo=None)).total_seconds()
+                       if last_activity_at else 0 }}
+                # Not while a job is active (§6.10.2): its result would wake the session
+                # anyway, but a retire mid-job only costs a reconcile for nothing.
+                - _active_jobs: "{{ [j for j in jobs if j.get('status') in ['queued', 'running', 'awaiting_input']] }}"
+                - retire_due#: "{{ idle_for_sec >= _retire_after and not _active_jobs }}"
+                # The idle stop (see header), on the same no-active-job rule: a job
+                # reports into a running entity, which relays its progress. Retiring
+                # wins when both are due -- it is an end too, and the row then says
+                # what happened.
+                - _stop_after: "{{ int((config.get('session') or {}).get('idle_stop_sec') or 600) }}"
+                - stop_due#: "{{ (not retire_due) and idle_for_sec >= _stop_after and not _active_jobs }}"
+                - tick_stop_reason: >-
+                    {{ ('throwaway_idle_timeout' if _throwaway else 'idle_timeout') if retire_due
+                       else 'idle_stop' if stop_due
+                       else '' }}
+      # ════════════════════════════════════════════════════════════════════
+      # RETIRING — mark the row retired. The next message reactivates it.
+      # With stop_only (the idle stop) the same memory steps run, but the row
+      # stays `active` and session.retired does not fire: the janitor retires it
+      # later, without either (its writes would land in the janitor's scope).
+      # ════════════════════════════════════════════════════════════════════
+      - name: retiring
+        on_enter:
+          tasks:
+            # What the curator has not seen yet goes now (§6.10.2: memory record on retire).
+            - task_name: record-memory-on-retire
+              skip_if: "{{ session_deleted or not (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True) or not pending_exchanges }}"
+              workflow:
+                ref: agent-harness-memory/memory
+                mode: inline
+                input:
+                  mode: record
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  session_id: "{{ session_id }}"
+                  exchanges: "{{ pending_exchanges }}"
+                  trigger: "{{ 'idle_stop' if stop_only else 'retire' }}"
+              on_error:
+                catch: true
+
+            # The episode (§6.4.6, phase 3): one digest of the whole conversation,
+            # detached inside `memory record_episode`. Only when turns were added since
+            # the last one (meta.episode_upto_turn), so a session woken by a job report
+            # and retired again does not pay for the same digest twice. memory decides
+            # the rest (role, episodes config, min_turns).
+            - task_name: plan-episode
+              set:
+                - episode_due#: >-
+                    {{ not session_deleted
+                       and (((config.get('memory') or {}).get('long_term') or {}).get('enabled') is True)
+                       and role != 'guest' and not bool((meta or {}).get('throwaway'))
+                       and turn_count > int((meta or {}).get('episode_upto_turn') or 0) }}
+                - episode_started: false
+
+            - task_name: record-episode
+              skip_if: "{{ not episode_due }}"
+              workflow:
+                ref: agent-harness-memory/memory
+                mode: inline
+                input:
+                  mode: record_episode
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  session_id: "{{ session_id }}"
+                  title: "{{ title }}"
+                  summary: "{{ summary }}"
+                  exchanges: "{{ recent }}"
+                  upto_turn: "{{ turn_count }}"
+              output:
+                set:
+                  - episode_started#: "{{ bool((((_ or {}).get('data') or {}).get('started'))) }}"
+              on_error:
+                catch: true
+
+            # The idle stop writes only the episode mark, and nothing without one.
+            - task_name: mark-retired
+              skip_if: "{{ stop_only and not episode_started }}"
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: patch_meta
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+                  patch: >-
+                    {{ dict(({} if stop_only else {'status': 'retired'}),
+                            **({'episode_upto_turn': turn_count} if episode_started else {})) }}
+              output:
+                set:
+                  - retire_result: "{{ _ }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - retire_result: "{{ {'ok': False, 'error': _} }}"
+
+            - task_name: note-retired
+              skip_if: "{{ stop_only }}"
+              set:
+                - retire_failed#: "{{ not (isinstance(retire_result, dict) and retire_result.get('ok') == True) }}"
+
+            # The user's own hygiene for this agent (§6.16, §8.1): reap other dead
+            # sessions, apply retention, enforce memory caps. Only this user can reach
+            # those rows (F50 closed), so it runs here, detached, as the user.
+            - task_name: spawn-housekeep
+              workflow:
+                ref: session-housekeep
+                mode: detached
+                input:
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  exclude_session_id: "{{ session_id }}"
+              on_error:
+                catch: true
+
+            # Hooks (§5.4, phase 3): session.retired, observe-only.
+            - task_name: hook-session-retired
+              skip_if: "{{ stop_only or not any(isinstance(h, dict) and h.get('event') == 'session.retired' for h in (config.get('hooks') or [])) }}"
+              workflow:
+                ref: agent-harness-foundation/hook-runner
+                mode: inline
+                input:
+                  hook_event: session.retired
+                  payload: >-
+                    {{ {'turn_count': turn_count, 'title': title, 'stop_reason': stop_reason, 'episode_started': episode_started} }}
+                  hooks: "{{ config.get('hooks') or [] }}"
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ session_id }}"
+              on_error:
+                catch: true
+
+      # ════════════════════════════════════════════════════════════════════
+      # DONE — terminal. Nothing is deleted: the rows stay, and the next
+      # message's start-or-signal starts a fresh entity that rehydrates.
+      # ════════════════════════════════════════════════════════════════════
+      - name: done
+        is_terminal: true
+
+    transitions:
+
+      - from_state: init
+        to_state: relaying
+        trigger:
+          condition: "{{ bool(jobs_to_relay) }}"
+
+      - from_state: init
+        to_state: idle
+        trigger:
+          condition: "{{ not jobs_to_relay }}"
+
+      # A job reported (§6.12): the row says what happened.
+      - from_state: idle
+        to_state: relaying
+        trigger:
+          event_type: subagent_event
+          action:
+            task_name: take-subagent-event
+            set:
+              - _jid: "{{ str((event.get('data') or {}).get('job_id') or '') }}"
+              - jobs_to_relay: "{{ [_jid] if re.match('^[A-Za-z0-9_.-]{1,64}$', _jid) else [] }}"
+
+      - from_state: relaying
+        to_state: idle
+        trigger: {}
+
+      - from_state: idle
+        to_state: receiving
+        trigger:
+          event_type: user_message
+          action:
+            task_name: take-message
+            set:
+              - inbound: "{{ event.get('data') or {} }}"
+
+      - from_state: receiving
+        to_state: preparing
+        trigger:
+          condition: "{{ accept }}"
+
+      - from_state: receiving
+        to_state: idle
+        trigger:
+          condition: "{{ not accept }}"
+
+      - from_state: preparing
+        to_state: finalizing
+        trigger:
+          condition: "{{ turn_blocked }}"
+
+      - from_state: preparing
+        to_state: routing
+        trigger:
+          condition: "{{ not turn_blocked }}"
+
+      - from_state: routing
+        to_state: assembling
+        trigger: {}
+
+      - from_state: assembling
+        to_state: clarifying
+        trigger:
+          condition: "{{ router_result.get('route') == 'clarify' }}"
+
+      - from_state: assembling
+        to_state: resuming
+        trigger:
+          condition: "{{ router_result.get('route') == 'pending_reply' and pending is not None }}"
+
+      - from_state: assembling
+        to_state: running
+        trigger:
+          condition: "{{ router_result.get('route') != 'clarify' and not (router_result.get('route') == 'pending_reply' and pending is not None) }}"
+
+      - from_state: resuming
+        to_state: running
+        trigger:
+          condition: "{{ resume_input is not None }}"
+
+      - from_state: resuming
+        to_state: finalizing
+        trigger:
+          condition: "{{ resume_input is None }}"
+
+      - from_state: running
+        to_state: finalizing
+        trigger: {}
+
+      - from_state: clarifying
+        to_state: finalizing
+        trigger: {}
+
+      - from_state: finalizing
+        to_state: delivering
+        trigger: {}
+
+      # Off-path results (internal transitions: idle is not left, its timers run on).
+      # A summary is applied only when newer than the one held (§6.10.6).
+      - from_state: idle
+        to_state:
+        trigger:
+          event_type: compacted
+          action:
+            tasks:
+              # Copied out of `event` (reserved in callbacks) so the decision is testable.
+              - task_name: take-compacted
+                set:
+                  - compacted_data: "{{ event.get('data') or {} }}"
+              - task_name: apply-compacted
+                set:
+                  - _c: "{{ compacted_data if isinstance(compacted_data, dict) else {} }}"
+                  - compaction_newer#: "{{ int(_c.get('upto_turn') or 0) > summary_upto_turn and bool(_c.get('summary')) }}"
+                  - summary: "{{ str(_c['summary']) if compaction_newer else summary }}"
+                  - summary_upto_turn: "{{ int(_c['upto_turn']) if compaction_newer else summary_upto_turn }}"
+              - task_name: persist-compacted
+                skip_if: "{{ not compaction_newer }}"
+                workflow:
+                  ref: session-store
+                  mode: inline
+                  input:
+                    mode: put_context
+                    agent_id: "{{ agent_id }}"
+                    session_id: "{{ session_id }}"
+                    context: {recent: "{{ recent }}", summary: "{{ summary }}", summary_upto_turn: "{{ summary_upto_turn }}"}
+                on_error:
+                  catch: true
+
+      - from_state: idle
+        to_state:
+        trigger:
+          event_type: titled
+          action:
+            tasks:
+              - task_name: apply-title
+                set:
+                  - title: "{{ str((event.get('data') or {}).get('title') or title)[:60] }}"
+              - task_name: persist-title
+                workflow:
+                  ref: session-store
+                  mode: inline
+                  input:
+                    mode: patch_meta
+                    agent_id: "{{ agent_id }}"
+                    session_id: "{{ session_id }}"
+                    patch: {title: "{{ title }}"}
+                on_error:
+                  catch: true
+
+      - from_state: delivering
+        to_state: idle
+        trigger: {}
+
+      # The janitor's liveness probe (agent-janitor): a signal that only proves the
+      # entity runs. Internal, so idle is not left and its timers run on.
+      - from_state: idle
+        to_state:
+        trigger:
+          event_type: ping
+          action:
+            task_name: answer-ping
+            set:
+              - _pinged: true
+
+      - from_state: idle
+        to_state: ticking
+        trigger:
+          event_type: sys.timer.idle_tick
+
+      - from_state: ticking
+        to_state: retiring
+        trigger:
+          condition: "{{ retire_due }}"
+          action:
+            task_name: stop-for-idle
+            set:
+              - stop_reason#: "{{ tick_stop_reason }}"
+
+      - from_state: ticking
+        to_state: retiring
+        trigger:
+          condition: "{{ stop_due }}"
+          action:
+            task_name: stop-for-idle-stop
+            set:
+              - stop_reason#: "{{ tick_stop_reason }}"
+              - stop_only#: true
+
+      - from_state: ticking
+        to_state: idle
+        trigger:
+          condition: "{{ not retire_due and not stop_due }}"
+
+      # Admin delete / retire (§6.10.2). Only from idle: a turn in flight
+      # finishes first, and the event waits in the buffer until then.
+      - from_state: idle
+        to_state: retiring
+        trigger:
+          event_type: retire
+          action:
+            task_name: stop-for-retire
+            set:
+              - stop_reason#: retire_requested
+              # A retire sent by session-store's delete (admin.sessions): the rows are
+              # already gone, so nothing may be learned from them afterwards (F62).
+              - session_deleted#: "{{ (event.get('data') or {}).get('deleted') is True }}"
+
+      - from_state: retiring
+        to_state: done
+        trigger: {}

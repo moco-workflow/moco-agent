@@ -1,0 +1,151 @@
+test_type: unit-test
+
+# The exact rows commit_turn writes (plan-00a §6: "commit_turn shape incl.
+# schema_version"). The integration suite pins the envelope; this pins the rows,
+# which only exist inside the step that builds them.
+
+wfspec:
+  name: session-store
+
+test_groups:
+  - step_name: build-commit
+    test_cases:
+
+      - id: the-commit-appends-turns-upgrades-rows-and-adds-usage
+        input:
+          schema_version: 1
+          protected_meta_fields: ["session_id", "schema_version", "created_at", "turn_count", "updated_at", "throwaway"]
+          context_defaults: {summary: "", summary_upto_turn: 0, summary_degraded: false, recent: []}
+          do_write: true
+          uid: u1
+          aid: skeleton
+          sid: s1
+          new_turn: 3
+          first_new_turn: 3
+          turns_row:
+            schema_version: 1
+            entries:
+              - {turn: 1, role: user, content: a}
+              - {turn: 2, role: user, content: c}
+          turn_entries:
+            - {turn: 3, message_id: m3, role: user, content: q}
+            - {turn: 3, message_id: m3, role: assistant, content: r}
+          # A context read back from `get` carries schema_version already; the
+          # commit must not choke on it.
+          context: {schema_version: 1, recent: [{role: user, content: q}]}
+          toolcalls: []
+          toolcalls_row: null
+          meta:
+            schema_version: 1
+            session_id: s1
+            status: active
+            turn_count: 2
+            title: t
+            usage: {tokens_in: 100, llm_calls: 2}
+            created_at: "2026-09-28T10:00:00"
+          meta_patch:
+            last_route: chat
+            turn_count: 999
+            session_id: evil
+            usage: {tokens_in: 10, llm_calls: 1, tokens_out: 4}
+        expect:
+          assert:
+            - "{{ new_turns_row['schema_version'] == 1 }}"
+            - "{{ [e['content'] for e in new_turns_row['entries']] == ['a', 'c', 'q', 'r'] }}"
+            - "{{ new_context_row['schema_version'] == 1 }}"
+            - "{{ new_context_row['recent'] == [{'role': 'user', 'content': 'q'}] }}"
+            # Defaults fill what the caller did not send.
+            - "{{ new_context_row['summary_degraded'] == False }}"
+            - "{{ new_meta['schema_version'] == 1 }}"
+            - "{{ new_meta['turn_count'] == 3 }}"
+            - "{{ new_meta['last_route'] == 'chat' }}"
+            # Protected fields are the store's, whatever the patch says.
+            - "{{ new_meta['session_id'] == 's1' }}"
+            - "{{ new_meta['created_at'] == '2026-09-28T10:00:00' }}"
+            # usage is additive, including a key the row did not have yet.
+            - "{{ new_meta['usage'] == {'tokens_in': 110, 'llm_calls': 3, 'tokens_out': 4} }}"
+
+      # A re-run after a crash between writes: turn 3 is already in the
+      # transcript but meta still says 2. It must be replaced, not duplicated.
+      - id: a-crash-re-run-replaces-rather-than-duplicates-the-turn
+        input:
+          schema_version: 1
+          protected_meta_fields: ["session_id", "schema_version", "created_at", "turn_count", "updated_at", "throwaway"]
+          context_defaults: {summary: "", summary_upto_turn: 0, summary_degraded: false, recent: []}
+          do_write: true
+          uid: u1
+          aid: skeleton
+          sid: s1
+          new_turn: 3
+          first_new_turn: 3
+          turns_row:
+            schema_version: 1
+            entries:
+              - {turn: 2, role: user, content: c}
+              - {turn: 3, role: user, content: q}
+              - {turn: 3, role: assistant, content: r}
+          turn_entries:
+            - {turn: 3, role: user, content: q}
+            - {turn: 3, role: assistant, content: r}
+          context: {}
+          toolcalls: []
+          toolcalls_row: null
+          meta: {schema_version: 1, session_id: s1, status: active, turn_count: 2, usage: {}}
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ [e['content'] for e in new_turns_row['entries']] == ['c', 'q', 'r'] }}"
+
+      # A v0 transcript (a bare list) is upgraded to the v1 wrapper on write.
+      - id: a-v0-transcript-is-upgraded-on-write
+        input:
+          schema_version: 1
+          protected_meta_fields: ["session_id", "schema_version", "created_at", "turn_count", "updated_at", "throwaway"]
+          context_defaults: {summary: "", summary_upto_turn: 0, summary_degraded: false, recent: []}
+          do_write: true
+          uid: u1
+          aid: skeleton
+          sid: s1
+          new_turn: 2
+          first_new_turn: 2
+          turns_row: [{turn: 1, role: user, content: a}]
+          turn_entries: [{turn: 2, role: user, content: b}]
+          context: {}
+          toolcalls: [{turn: 2, tool: t, status: ok}]
+          toolcalls_row: [{turn: 1, tool: t, status: ok}]
+          meta: {session_id: s1, status: active, turn_count: 1, usage: {}}
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ new_turns_row == {'schema_version': 1, 'entries': [{'turn': 1, 'role': 'user', 'content': 'a'}, {'turn': 2, 'role': 'user', 'content': 'b'}]} }}"
+            - "{{ new_toolcalls_row['schema_version'] == 1 }}"
+            - "{{ len(new_toolcalls_row['entries']) == 2 }}"
+            - "{{ new_meta['schema_version'] == 1 }}"
+
+      # The global slim audit copy (tool-stats-rollup reads it across users): control
+      # fields and a capped error message only, never arguments or results.
+      - id: the-global-tool-audit-row-is-slim
+        input:
+          schema_version: 1
+          protected_meta_fields: ["session_id", "schema_version", "created_at", "turn_count", "updated_at", "throwaway"]
+          context_defaults: {summary: "", summary_upto_turn: 0, summary_degraded: false, recent: []}
+          do_write: true
+          uid: u1
+          aid: skeleton
+          sid: s1
+          new_turn: 2
+          first_new_turn: 2
+          turns_row: null
+          turn_entries: [{turn: 2, role: user, content: b}]
+          context: {}
+          toolcalls:
+            - {turn: 2, tool: k8s_get, status: error, elapsed_ms: 40, ts: "2026-11-09T10:00:00", args: {name: secret-x},
+               result: {data: big}, error: {code: boom, message: "failed", detail: {trace: x}}, truncated: false}
+          toolcalls_row: {schema_version: 1, entries: [{turn: 1, tool: t, status: ok, elapsed_ms: 5, approved_by: u1, args: {a: 1}}]}
+          meta: {session_id: s1, status: active, turn_count: 1, usage: {}}
+          meta_patch: {}
+        expect:
+          assert:
+            - "{{ new_audit_row['user_id'] == 'u1' and new_audit_row['agent_id'] == 'skeleton' and new_audit_row['session_id'] == 's1' }}"
+            - "{{ new_audit_row['entries'][0] == {'turn': 1, 'tool': 't', 'status': 'ok', 'elapsed_ms': 5, 'approved_by': 'u1'} }}"
+            - "{{ new_audit_row['entries'][1] == {'turn': 2, 'tool': 'k8s_get', 'status': 'error', 'elapsed_ms': 40, 'ts': '2026-11-09T10:00:00', 'truncated': False, 'error': {'message': 'failed'}} }}"

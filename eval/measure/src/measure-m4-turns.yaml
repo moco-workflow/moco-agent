@@ -1,0 +1,102 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M4 — end-to-end turn time of the skeleton, split by state (plan-00a step 8)
+# ================================================================================
+#
+# Decides: limits.turn_budget_sec and the §12 timing table.
+#
+# Drives the DEPLOYED `agent-harness/agent-cli` for `turns` sequential turns on one
+# named session, and reads agent-session's per-turn `timing` back from each answer:
+#
+#   wait_ms   agent-cli emit -> session picked the message up   (buffer + start)
+#   run_ms    running: the profile (agent-loop + llm-invoke)
+#   turn_ms   received -> answer emitted                         (session side)
+#   cli_ms    this driver's round trip around agent-cli         (end to end)
+#
+# The first turn of a fresh session also pays `init` (config, rows, version probe):
+# it is reported separately as `first_turn`.
+#
+# Requires agent-harness and agent.skeleton published and targeted on the stage,
+# and a working model key for the skeleton's inference role.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m4-turns
+
+context:
+  prompts: ["Say hello in five words.", "Name one prime number.", "What colour is the sky?", "Give me a synonym for quick.", "Count to three."]
+  rows: []
+  m4_result: {}
+
+input:
+  agent_id: skeleton
+  turns: 50
+  # A fresh session per run, so the first turn really is a cold start.
+  session_prefix: m4
+
+output: '{{ m4_result }}'
+
+main:
+  tasks:
+    - task_name: plan
+      set:
+        - sid#: "{{ session_prefix + '-' + str(uuid4()).replace('-', '')[:10] }}"
+
+    - task_name: drive
+      loop:
+        in: "{{ list(range(int(turns))) }}"
+        foreach: item
+        do:
+          tasks:
+            - task_name: t0
+              set:
+                - started: "{{ now() }}"
+            # sync + catch: one failed turn is a data point.
+            # Package-qualified: from this package a bare `agent-cli` would be
+            # looked up as a package named agent-cli (P21).
+            - task_name: turn
+              workflow:
+                ref: agent-harness/agent-cli
+                mode: sync
+                input:
+                  agent_id: "{{ agent_id }}"
+                  session_id: "{{ sid }}"
+                  message: "{{ prompts[item % len(prompts)] }}"
+              output:
+                set:
+                  - cli: "{{ _ }}"
+                data:
+                  cli: '{{ cli }}'
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - cli: "{{ {'status': 'error', **_} }}"
+            - task_name: t1
+              set:
+                - row: >-
+                    {{ dict((cli or {}).get('timing') or {},
+                            turn=item,
+                            status=(cli or {}).get('status'),
+                            cli_ms=int((now() - started).total_seconds() * 1000)) }}
+      output:
+        as: rows
+    - task_name: summarise
+      set:
+        - _rows: >-
+            {{ [r[-1]['row'] for r in (rows or [])
+                if isinstance(r, list) and r and isinstance(r[-1], dict) and r[-1].get('row')] }}
+        - _warm: "{{ [r for r in _rows if r['turn'] > 0 and r.get('status') == 'ok'] }}"
+        - m4_result:
+            measurement: M4
+            session_id: "{{ sid }}"
+            turns: "{{ len(_rows) }}"
+            failed: "{{ len([r for r in _rows if r.get('status') != 'ok']) }}"
+            statuses: "{{ sorted(set(str(r.get('status')) for r in _rows)) }}"
+            first_turn: "{{ _rows[0] if _rows else None }}"
+            warm: >-
+              {{ {k: (lambda v: {'p50': v[len(v) // 2], 'p90': v[min(len(v) - 1, int(len(v) * 0.9))],
+                                 'max': v[-1]} if v else None)(
+                      sorted(r[k] for r in _warm if isinstance(r.get(k), (int, float))))
+                  for k in ['wait_ms', 'run_ms', 'turn_ms', 'cli_ms']} }}
+            rows: "{{ _rows }}"

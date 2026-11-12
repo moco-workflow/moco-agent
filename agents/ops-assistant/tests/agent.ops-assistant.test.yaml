@@ -1,0 +1,18 @@
+test_type: integration-test
+
+# ops-assistant, phase 2 (plan-18 step 7, design §16): chat + react over k8s-readonly,
+# no knowledge, and no logic wfspecs -- the package holds data only.
+
+wfspec:
+  name: agent.ops-assistant
+
+test_cases:
+  - id: chat-and-react-over-the-readonly-toolset
+    input: {}
+    expect:
+      assert:
+        - "{{ definition['profiles'] == ['chat', 'react'] and definition['toolsets'] == ['k8s-readonly'] }}"
+        - "{{ definition['persona_prompt'] == 'persona.ops' and 'knowledge' not in definition }}"
+        - "{{ definition['router']['slash']['/tools'] == 'react' }}"
+        # secret NAMES only in the connection (§4.3)
+        - "{{ definition['tools']['config']['*']['token_secret_key'] == 'global/K8S_TOKEN' }}"

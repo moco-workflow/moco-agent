@@ -1,0 +1,123 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M5 — llama_index.query latency on the real moco-docs table (plan-00a step 8)
+# ================================================================================
+#
+# Decides: the rag profile's budget_sec / estimated_sec and the per-source
+# retrieval timeout (§6.5, §12).
+#
+# `repeats` retrieve-only queries per top_k over a few representative questions.
+# retrieve mode = embedding + vector search, no synthesis: what `knowledge
+# retrieve` will do. The table and embedding model must be the ones moco-docs was
+# indexed with (the defaults are the old moco-agent's).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m5-llama-query
+
+context:
+  queries: ["how do retries work in moco?", "what is a state machine checkpoint?", "how do I call a child workflow?", "how are secrets resolved?", "what does wait_for match_expression do?"]
+  rows: []
+  m5_result: {}
+
+input:
+  table_name: kb_moco_docs
+  # Empty: the activity uses the worker's MOCO_PGVECTOR_CONN.
+  pgvector_secret_key: ""
+  embed_model_info:
+    # Ignored by a local Ollama, but a secret must exist (catalog: ollama-embed).
+    apikey_secret_key: MY_LLM_TOKEN
+    # Must be reachable from the WORKER. The old agent used http://mocopi-3:11434/v1.
+    base_url: "http://localhost:11434/v1"
+    model_name: nomic-embed-text
+    embed_dim: 768
+  top_ks: [5, 10]
+  repeats: 5
+
+output: '{{ m5_result }}'
+
+functions:
+  timed-query:
+    input:
+      query:
+      top_k:
+      table_name:
+      pgvector_secret_key:
+      embed_model_info:
+    output:
+      ms: "{{ ms }}"
+      nodes: "{{ nodes }}"
+    main:
+      tasks:
+        - task_name: t0
+          set:
+            - started: "{{ now() }}"
+        - task_name: retrieve
+          activity:
+            type: llama_index.query
+            input:
+              query: "{{ query }}"
+              vectordb_info:
+                connection_string_secret_key: "{{ pgvector_secret_key }}"
+                table_name: "{{ table_name }}"
+              embed_model_info: "{{ embed_model_info }}"
+              top_k: "{{ top_k }}"
+              response_mode: retrieve
+            options:
+              retry_policy:
+                timeout_sec: 90
+                max_attempts: 1
+          output:
+            set:
+              - nodes: "{{ len((_ or {}).get('nodes') or []) }}"
+        - task_name: t1
+          set:
+            - ms: "{{ int((now() - started).total_seconds() * 1000) }}"
+
+main:
+  tasks:
+    - task_name: run-all
+      loop:
+        in: "{{ [{'top_k': k, 'run': r, 'query': queries[r % len(queries)]} for k in top_ks for r in range(int(repeats))] }}"
+        foreach: item
+        do:
+          task_name: timed
+          workflow:
+            function: timed-query
+            input:
+              query: "{{ item['query'] }}"
+              top_k: "{{ item['top_k'] }}"
+              table_name: "{{ table_name }}"
+              pgvector_secret_key: "{{ pgvector_secret_key }}"
+              embed_model_info: "{{ embed_model_info }}"
+          output:
+            set:
+              - row: "{{ dict(item, ms=_.get('ms'), nodes=_.get('nodes'), ok=True, error=None) }}"
+            data:
+              row: '{{ row }}'
+          on_error:
+            catch: true
+            do:
+              set:
+                - row: >-
+                    {{ dict(item, ms=None, nodes=None, ok=False,
+                            error=(_.get('error_message') or '')[:200] or None) }}
+      output:
+        as: rows
+    - task_name: summarise
+      set:
+        - _rows: "{{ [r['row'] for r in (rows or []) if isinstance(r, dict) and r.get('row')] }}"
+        - m5_result:
+            measurement: M5
+            table_name: "{{ table_name }}"
+            by_top_k: >-
+              {{ [(lambda all_, ms: {'top_k': k, 'calls': len(all_),
+                                     'failed': len([r for r in all_ if not r['ok']]),
+                                     'cold_ms': all_[0]['ms'] if all_ and all_[0]['ok'] else None,
+                                     'p50_ms': ms[len(ms) // 2] if ms else None,
+                                     'p90_ms': ms[min(len(ms) - 1, int(len(ms) * 0.9))] if ms else None,
+                                     'max_ms': ms[-1] if ms else None})(
+                     [r for r in _rows if r['top_k'] == k],
+                     sorted(r['ms'] for r in _rows if r['top_k'] == k and r['ok'] and r['run'] > 0))
+                  for k in top_ks] }}
+            rows: "{{ _rows }}"

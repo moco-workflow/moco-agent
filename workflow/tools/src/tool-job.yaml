@@ -1,0 +1,118 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-JOB — an async tool's job body (design §6.9.9, §6.12; plan-10 step 14)
+# ================================================================================
+#
+# tool-executor answers an `execution.mode: async` call with async_started and a
+# job_request {wfspec: tool-job, input: {call, manifest, question, turn,
+# approval_token?, approved_pending_id?}}; the session starts the job, and job-entity
+# runs this wfspec under the profile contract (§6.8.1):
+#
+#   tool-executor call (run_now)   status ok          → ok: the result as the answer
+#                                  any other status   → error (trace.error: the call's code)
+#
+# The call goes through the WHOLE executor again -- validate, availability, authorise,
+# dispatch, shape, artifact, screen -- with the manifest snapshot from the turn and the
+# approval token it was approved with (the token binds the pending id to these
+# arguments, so it re-validates; tool-policy is not consulted again). Limits are not
+# re-counted: the turn counted the call. The budget is the job's.
+#
+# The answer is the tool's (screened) content; an artifact_ref says the full result was
+# stored (the conversation's read_artifact reaches it while the session lives).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-job
+
+context:
+  run: {}
+  status: error
+  answer: ""
+  sources: []
+  trace: {}
+  usage: {}
+
+input:
+  agent_id:
+  profile: {}
+  query: ""
+  job_input: {}
+  job_id:
+  session_id:
+  config: {}
+  resolved_refs: {}
+  budget_sec: 300
+  resume:
+
+output:
+  status: "{{ status }}"
+  answer: "{{ answer }}"
+  sources: "{{ sources }}"
+  artifacts: []
+  grounded: "{{ status == 'ok' }}"
+  grounded_p:
+  pending_action:
+  job_request:
+  handoff:
+  used_memory: []
+  usage: "{{ usage }}"
+  trace: "{{ trace }}"
+
+main:
+  tasks:
+    - task_name: read-job-input
+      set:
+        - _ji: "{{ job_input if isinstance(job_input, dict) else {} }}"
+        - tool_call: "{{ _ji.get('call') or {} }}"
+        - tool_manifest: "{{ _ji.get('manifest') or {} }}"
+        - tool_title: "{{ str(tool_manifest.get('title') or tool_call.get('name') or 'the tool') }}"
+        - tool_question: "{{ str(_ji.get('question') or query or '') }}"
+        - tool_turn: "{{ int(_ji.get('turn') or 0) }}"
+        - approval_token: "{{ _ji.get('approval_token') }}"
+        - approved_pending_id: "{{ _ji.get('approved_pending_id') }}"
+
+    - task_name: run-tool
+      workflow:
+        ref: tool-executor
+        mode: inline
+        input:
+          mode: call
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          resolved_refs: "{{ resolved_refs }}"
+          session_id: "{{ session_id }}"
+          turn: "{{ tool_turn }}"
+          call: "{{ tool_call }}"
+          manifest: "{{ tool_manifest }}"
+          question: "{{ tool_question }}"
+          counts: {}
+          approval_token: "{{ approval_token }}"
+          approved_pending_id: "{{ approved_pending_id }}"
+          budget_sec: "{{ int(budget_sec) }}"
+          run_now: true
+      output:
+        set:
+          - run: "{{ ((_ or {}).get('data') or {}) }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - run: "{{ {'status': 'error', 'content': 'error: tool_failed: ' + str(_.get('error_message'))[:300], 'audit': {'error': {'code': 'tool_failed', 'message': str(_.get('error_message'))[:300]}}} }}"
+
+    - task_name: shape-job-result
+      set:
+        - _st: "{{ run.get('status') }}"
+        - status: "{{ 'ok' if _st == 'ok' else 'error' }}"
+        - sources: "{{ list(run.get('sources') or []) if status == 'ok' else [] }}"
+        - answer: >-
+            {{ ('**' + tool_title + '** finished in the background:\n\n' + str(run.get('content') or '').strip()
+                + ('\n\n_The full result was longer; it is stored as ' + str(run.get('artifact_ref')) + '._' if run.get('artifact_ref') else ''))
+               if status == 'ok' else '' }}
+        - _err: "{{ ((run.get('audit') or {}).get('error')) or {} }}"
+        - trace: >-
+            {{ {'tool_job': {'tool': tool_call.get('name'), 'status': _st, 'elapsed_ms': run.get('elapsed_ms'), 'artifact_ref': run.get('artifact_ref')},
+                'tool_audit': [run.get('audit')] if run.get('audit') else [],
+                'error': None if status == 'ok' else
+                         {'code': str(_err.get('code') or _st or 'tool_failed'),
+                          'message': tool_title + ': ' + str(_err.get('message') or run.get('content') or 'the tool did not run')}} }}
+        - usage: "{{ {'llm_calls': 0, 'classifier_calls': 0, 'tool_calls': 1 if _st in ['ok', 'error'] else 0, 'tokens_in': 0, 'tokens_out': 0} }}"

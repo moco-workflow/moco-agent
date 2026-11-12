@@ -1,0 +1,627 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY — the long-term memory facade (design §6.4.2)
+# ================================================================================
+#
+#   mode               in                                         data out
+#   ────────────────── ────────────────────────────────────────── ──────────────────────────
+#   recall             query, tags?, k?, agent_items?,            {items: [{key, kind, scope, title,
+#                      refers_to_past?                              text, score}], profile, episodes,
+#                                                                   used_memory: [key]}
+#   record             session_id, exchanges, grounding?, trigger  {started}
+#   remember           session_id, statement, kind?               {key, verdict: new|duplicate}
+#   forget             key | query                                {retired: [key]}
+#   feedback           used_memory, rating: up|down, strength?    {adjusted: [key]}
+#   retire_by_session  session_id, live_session_ids?              {retired: [key]}
+#   list               scope?, kinds?, status?                    {items}
+#   edit               key, title?, text?, tags?                  {item}
+#   retire             key                                        {item}
+#   resolve_conflict   key, to: active|retired                    {item}
+#   record_episode     session_id, summary, exchanges, title?,    {key, started}
+#                      upto_turn
+#   every mode         agent_id, config (resolved: access, memory, decisions, models),
+#                      resolved_refs (record, record_episode)
+#
+# AGENT LAYER: storage is memory-store's (which authorises every write through
+# `access`); this file composes it. Management modes act on the caller's USER scope:
+# the agent scope is written only by seeding and promotion (§6.4.8).
+#
+# RECALL (§6.4.5) is a set task, no model call. User scope: memory-store list of
+# fact, lesson and profile (+ episode when refers_to_past ≥ 0.5), 50 per kind. Agent
+# scope: `agent_items`, the session's cached agent_scope_snapshot (re-fetched when
+# mem-version moves) -- no agent-namespace list per turn. A user item wins over an
+# agent item with the same kind and slug.
+#   lexical  = |query terms ∩ item terms| / |query terms|   (terms: words ≥ 3 chars +
+#              tags; item terms from title, text and tags)
+#   score    = 0.6·lexical + 0.3·weight/max weight + 0.1·recency − 0.2·conflicted
+#   recency  = 0.5 ** (days since last_used_at / 30), 0 if never used
+#   items    = fact + lesson sharing at least one term with the query (else weight
+#              alone, up to 0.3, would clear the cut), score ≥ 0.15, top k (5);
+#   VECTOR (phase 3, memory.long_term.vector.enabled): memory-vector search over the
+#              user's own items first; relevance is then max(lexical, similarity), and
+#              an item with similarity ≥ vector.min_score qualifies without a shared
+#              term. A hit outside the listed rows (50 per kind) is read by key. The
+#              index down or off → the lexical score alone, as before.
+#              profile = top 10 by weight,
+#              always;  episodes = top 3 by lexical, only when asked for
+#
+# RECORD starts memory-curator DETACHED (it may call a chat model; the turn must not
+# wait). Not for guests or denied users (access identify), nor when
+# memory.long_term.enabled is false.
+#
+# REMEMBER is explicit: no gate, pinned, user scope, evidence source `explicit`. The
+# key comes from the statement (kind fact unless `profile`); an existing active key
+# gets evidence (duplicate). A key that was forgotten (retired) is not resurrected:
+# the new item's slug gets a short suffix of the statement's hash.
+#
+# RECORD_EPISODE (phase 3) is the session's at retire: it starts memory-episode
+# DETACHED (a chat-model digest of the summary and recent exchanges) and returns the
+# key at once. Same refusals as record, plus memory.long_term.episodes.enabled false
+# and a session shorter than episodes.min_turns answered turns (a one-question
+# session is not an episode). The key is one per session, mem:episode:s-<16 hex of the
+# session id> (session ids allow characters a slug does not), so a session that
+# retires twice re-saves its one episode.
+#
+# FORGET retires and TOMBSTONES (the normalised title, and for a query the query
+# itself), so the curator does not relearn it. By query: every user item sharing at
+# least `forget_min_overlap` of the query's content words.
+#
+# FEEDBACK: a 👎 on a turn lowers support of the user-scope items it used (one
+# negative event each); a 👍 changes nothing here (the session records a curation).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory
+
+context:
+  valid_modes: ["recall", "record", "remember", "forget", "feedback", "retire_by_session", "list", "edit",
+                "retire", "resolve_conflict", "record_episode"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  recall_kinds: [fact, lesson]
+  half_life_days: 120
+  min_score: 0.15
+  max_profile: 10
+  max_episodes: 3
+  default_episode_min_turns: 2
+  forget_min_overlap: 0.6
+  hash_mod: 2305843009213693951
+  ok: false
+  data:
+  error:
+  user_rows: []
+  role: user
+  existing: {}
+  forget_rows: []
+  forget_targets: []
+  results: []
+  store_result: {}
+  start_curator: false
+  start_episode: false
+  episode_key:
+  forget_statements: []
+  vector_hits: []
+  vector_rows: []
+
+input:
+  mode: recall
+  agent_id:
+  config: {}
+  resolved_refs: {}
+  session_id:
+  # recall
+  query: ""
+  tags: []
+  k: 5
+  agent_items: []
+  refers_to_past: false
+  # record
+  exchanges: []
+  grounding: {}
+  trigger: periodic
+  # record_episode (exchanges above: the session's recent [{role, content}])
+  summary: ""
+  upto_turn: 0
+  # remember / forget / management
+  statement: ""
+  kind:
+  key:
+  scope: user
+  kinds: []
+  status:
+  title:
+  text:
+  to:
+  # retire_by_session: the user's sessions that still exist (session-store, F65)
+  live_session_ids:
+  # feedback
+  used_memory: []
+  rating:
+  strength: 1
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "memory: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - sid: '{{ str(session_id or "").strip() }}'
+        - access_lists: "{{ (config or {}).get('access') or {} }}"
+        - lt: "{{ ((config or {}).get('memory') or {}).get('long_term') or {} }}"
+        - now_dt: "{{ now().replace(tzinfo=None) }}"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'session_id must match ' + session_id_pattern
+                 if mode in ['record', 'remember', 'retire_by_session', 'record_episode'] and not re.match(session_id_pattern, sid) else
+               'statement is required' if mode == 'remember' and not str(statement or '').strip() else
+               'forget needs a key or a query' if mode == 'forget' and not key and not str(query or '').strip() else
+               'key is required' if mode in ['edit', 'retire', 'resolve_conflict'] and not key else None }}
+        - proceed: "{{ _bad is None }}"
+        - ok: false
+        - error: "{{ {'code': 'invalid_input', 'message': _bad, 'retryable': False} if _bad is not None else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # READ THE USER SCOPE (recall, forget by query, retire_by_session, list)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: list-user-memory
+      skip_if: "{{ not proceed or mode not in ['recall', 'retire_by_session', 'list'] and not (mode == 'forget' and not key) }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: list
+          agent_id: "{{ aid }}"
+          scope: "{{ scope if mode == 'list' else 'user' }}"
+          kinds: >-
+            {{ list(kinds) if mode == 'list' and kinds else
+               (recall_kinds + ['profile'] + (['episode'] if (refers_to_past is True or (isinstance(refers_to_past, (int, float)) and not isinstance(refers_to_past, bool) and refers_to_past >= 0.5)) else []))
+                 if mode == 'recall' else [] }}
+          status: "{{ status if mode == 'list' else None }}"
+      output:
+        set:
+          - user_rows: "{{ (((_ or {}).get('data') or {}).get('items')) or [] }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RECALL — fixed strategy, no model call
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: search-vectors
+      skip_if: "{{ not proceed or mode != 'recall' or (lt.get('vector') or {}).get('enabled') is not True or not str(query or '').strip() }}"
+      workflow:
+        ref: memory-vector
+        mode: inline
+        input: {mode: search, agent_id: "{{ aid }}", config: "{{ config }}", query: "{{ query }}"}
+      output:
+        set:
+          - vector_hits: "{{ (((_ or {}).get('data') or {}).get('hits')) or [] }}"
+      on_error:
+        catch: true
+
+    # A strong hit that the per-kind listing did not bring back is read by key.
+    - task_name: read-vector-misses
+      skip_if: >-
+        {{ not proceed or mode != 'recall' or not [h for h in vector_hits
+                                                   if h['key'] not in [r.get('key') for r in user_rows]
+                                                   and h['score'] >= float((lt.get('vector') or {}).get('min_score') or 0.45)] }}
+      loop:
+        in: >-
+          {{ [h['key'] for h in vector_hits if h['key'] not in [r.get('key') for r in user_rows]
+              and h['score'] >= float((lt.get('vector') or {}).get('min_score') or 0.45)] }}
+        foreach: missing_key
+        execute_mode: parallel
+        do:
+          task_name: read-vector-item
+          workflow:
+            ref: memory-store
+            mode: inline
+            input: {mode: get, agent_id: "{{ aid }}", scope: user, key: "{{ missing_key }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - vector_rows: "{{ [((r or {}).get('data') or {}).get('item') for r in (_ or []) if isinstance(r, dict) and r.get('ok')] }}"
+
+    - task_name: score-recall
+      skip_if: "{{ not proceed or mode != 'recall' }}"
+      set:
+        # A user item wins over an agent item with the same kind and slug.
+        - _merged: >-
+            {{ list(dict([((r.get('kind'), r.get('slug')), dict(r, scope='agent')) for r in (agent_items or []) if isinstance(r, dict)]
+                         + [((r.get('kind'), r.get('slug')), dict(r, scope='user')) for r in user_rows + [v for v in vector_rows if isinstance(v, dict)]]).values()) }}
+        - _live: "{{ [r for r in _merged if r.get('status') in ['active', 'conflicted']] }}"
+        - _q: "{{ set(re.findall(r'[a-z0-9]{3,}', str(query or '').lower())) | set(str(t).lower() for t in (tags or [])) }}"
+        - _w: >-
+            {{ [max(0, len(set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict) and e.get('session_id')))
+                       + (2 if r.get('pinned') else 0) - int(r.get('negative_feedback') or 0))
+                * 0.5 ** (max(0.0, (now_dt - dt.datetime.fromisoformat(str(r.get('updated_at') or r.get('created_at') or now().isoformat())).replace(tzinfo=None)).total_seconds()) / 86400.0 / half_life_days)
+                for r in _live] }}
+        - _maxw: "{{ max(_w) if _w and max(_w) > 0 else 1.0 }}"
+        - _sim: "{{ {h['key']: float(h['score']) for h in vector_hits} }}"
+        - _vmin: "{{ float((lt.get('vector') or {}).get('min_score') or 0.45) }}"
+        - _lex_only: >-
+            {{ [len(_q & (set(re.findall(r'[a-z0-9]{3,}', (str(r.get('title') or '') + ' ' + str(r.get('text') or '')).lower()))
+                          | set(str(t).lower() for t in (r.get('tags') or [])))) / max(1, len(_q)) for r in _live] }}
+        # Relevance: the lexical overlap, or the vector similarity once it clears min_score
+        # (user-scope items only; the agent scope is not indexed).
+        - _lex: >-
+            {{ [max(lx, _sim.get(r.get('key'), 0.0) if r.get('scope') == 'user' and _sim.get(r.get('key'), 0.0) >= _vmin else 0.0)
+                for r, lx in zip(_live, _lex_only)] }}
+        - _rec: >-
+            {{ [0.5 ** (max(0.0, (now_dt - dt.datetime.fromisoformat(str(r['last_used_at'])).replace(tzinfo=None)).total_seconds()) / 86400.0 / 30)
+                if r.get('last_used_at') else 0.0 for r in _live] }}
+        - _scored: >-
+            {{ [dict(key=r.get('key'), kind=r.get('kind'), scope=r.get('scope'), title=r.get('title'), text=r.get('text'),
+                     score=round(0.6 * lx + 0.3 * w / _maxw + 0.1 * rc - (0.2 if r.get('status') == 'conflicted' else 0.0), 3),
+                     weight=round(w, 3), lexical=lx)
+                for r, w, lx, rc in zip(_live, _w, _lex, _rec)] }}
+        - _items: >-
+            {{ sorted([s for s in _scored if s['kind'] in recall_kinds and s['lexical'] > 0 and s['score'] >= min_score],
+                      key=lambda s: (-s['score'], str(s['key'])))[:int(k or 5)] }}
+        - _profile: "{{ sorted([s for s in _scored if s['kind'] == 'profile'], key=lambda s: (-s['weight'], str(s['key'])))[:max_profile] }}"
+        - _episodes: >-
+            {{ sorted([s for s in _scored if s['kind'] == 'episode' and s['lexical'] > 0], key=lambda s: (-s['lexical'], str(s['key'])))[:max_episodes] }}
+        - ok: true
+        - error:
+        - data: >-
+            {{ {'items': [{x: s[x] for x in ['key', 'kind', 'scope', 'title', 'text', 'score']} for s in _items],
+                'profile': [{x: s[x] for x in ['key', 'kind', 'scope', 'title', 'text', 'score']} for s in _profile],
+                'episodes': [{x: s[x] for x in ['key', 'kind', 'scope', 'title', 'text', 'score']} for s in _episodes],
+                'used_memory': [s['key'] for s in _items + _profile + _episodes]} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RECORD — start the curator, detached
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: identify-caller
+      skip_if: "{{ not proceed or mode not in ['record', 'record_episode'] }}"
+      workflow:
+        ref: agent-harness-foundation/access
+        mode: inline
+        input: {mode: identify, agent_id: "{{ aid }}", definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - role: "{{ (((_ or {}).get('data') or {}).get('role')) or 'denied' }}"
+
+    - task_name: plan-record
+      skip_if: "{{ not proceed or mode != 'record' }}"
+      set:
+        - start_curator#: "{{ role in ['user', 'admin'] and lt.get('enabled') is True and bool(exchanges) }}"
+
+    - task_name: spawn-curator
+      skip_if: "{{ not proceed or mode != 'record' or not start_curator }}"
+      workflow:
+        ref: memory-curator
+        mode: detached
+        input:
+          agent_id: "{{ aid }}"
+          session_id: "{{ sid }}"
+          exchanges: "{{ exchanges }}"
+          grounding: "{{ grounding or {} }}"
+          trigger: "{{ trigger }}"
+          config: "{{ config }}"
+          resolved_refs: "{{ resolved_refs }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - start_curator: false
+
+    - task_name: shape-record
+      skip_if: "{{ not proceed or mode != 'record' }}"
+      set:
+        - ok: true
+        - data: "{{ {'started': bool(start_curator)} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RECORD_EPISODE — start memory-episode, detached (at retire)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-episode
+      skip_if: "{{ not proceed or mode != 'record_episode' }}"
+      set:
+        - _ep: "{{ lt.get('episodes') if isinstance(lt.get('episodes'), dict) else {} }}"
+        - _min: "{{ int(_ep.get('min_turns') if isinstance(_ep.get('min_turns'), int) else default_episode_min_turns) }}"
+        - episode_key: >-
+            {{ 'mem:episode:s-' + '%016x' % (sum(ord(c) * pow(31, i, hash_mod) for i, c in enumerate(sid)) % hash_mod) }}
+        - start_episode#: >-
+            {{ role in ['user', 'admin'] and lt.get('enabled') is True and _ep.get('enabled', True) is not False
+               and isinstance(upto_turn, int) and upto_turn >= _min
+               and bool(str(summary or '').strip() or exchanges) }}
+
+    - task_name: spawn-episode
+      skip_if: "{{ not proceed or mode != 'record_episode' or not start_episode }}"
+      workflow:
+        ref: memory-episode
+        mode: detached
+        input:
+          agent_id: "{{ aid }}"
+          session_id: "{{ sid }}"
+          key: "{{ episode_key }}"
+          title: "{{ title or '' }}"
+          summary: "{{ summary or '' }}"
+          exchanges: "{{ exchanges }}"
+          upto_turn: "{{ upto_turn }}"
+          config: "{{ config }}"
+          resolved_refs: "{{ resolved_refs }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - start_episode: false
+
+    - task_name: shape-episode
+      skip_if: "{{ not proceed or mode != 'record_episode' }}"
+      set:
+        - ok: true
+        - data: "{{ {'key': episode_key if start_episode else None, 'started': bool(start_episode)} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # REMEMBER — explicit, pinned, user scope
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-remember
+      skip_if: "{{ not proceed or mode != 'remember' }}"
+      set:
+        - _st: "{{ ' '.join(str(statement).split()) }}"
+        - rem_kind: "{{ 'profile' if kind == 'profile' else 'fact' }}"
+        - _norm: "{{ ' '.join(re.findall(r'[a-z0-9]+', _st.lower())) }}"
+        - rem_hash: >-
+            {{ '%016x%016x' % (sum(ord(c) * pow(31, i, hash_mod) for i, c in enumerate(_norm)) % hash_mod,
+                               sum(ord(c) * pow(37, i, hash_mod) for i, c in enumerate(_norm)) % hash_mod) }}
+        - rem_slug: "{{ re.sub(r'-+', '-', re.sub(r'[^a-z0-9-]+', '-', _st.lower())).strip('-')[:40].strip('-') or 'note' }}"
+        - rem_title: "{{ _st[:120] }}"
+        - rem_text: "{{ _st[:600] }}"
+        - rem_tags: "{{ sorted(set(re.findall(r'[a-z0-9]{4,}', _st.lower())), key=lambda w: (-len(w), w))[:5] }}"
+
+    - task_name: read-existing
+      skip_if: "{{ not proceed or mode not in ['remember', 'forget', 'edit'] or (mode == 'forget' and not key) }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: get
+          agent_id: "{{ aid }}"
+          scope: user
+          key: "{{ key if mode in ['forget', 'edit'] else 'mem:' + rem_kind + ':' + rem_slug }}"
+      output:
+        set:
+          - existing: "{{ (((_ or {}).get('data') or {}).get('item')) or {} }}"
+
+    - task_name: remember-write
+      skip_if: "{{ not proceed or mode != 'remember' }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: "{{ 'add_evidence' if existing.get('status') in ['active', 'conflicted'] else 'save' }}"
+          agent_id: "{{ aid }}"
+          scope: user
+          key: >-
+            {{ existing['key'] if existing.get('status') in ['active', 'conflicted'] else
+               'mem:' + rem_kind + ':' + (rem_slug + '-' + rem_hash[:6] if existing.get('status') == 'retired' else rem_slug) }}
+          item:
+            kind: "{{ rem_kind }}"
+            title: "{{ rem_title }}"
+            text: "{{ rem_text }}"
+            tags: "{{ rem_tags }}"
+            pinned: true
+            evidence: [{session_id: "{{ sid }}", source: explicit}]
+          evidence: [{session_id: "{{ sid }}", source: explicit}]
+          definition_access: "{{ access_lists }}"
+          promotion_pool: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('promotion')) is True }}"
+      output:
+        set:
+          - store_result: "{{ _ or {} }}"
+
+    - task_name: shape-remember
+      skip_if: "{{ not proceed or mode != 'remember' }}"
+      set:
+        - ok: "{{ store_result.get('ok') == True }}"
+        - error: "{{ None if store_result.get('ok') else store_result.get('error') }}"
+        - data: >-
+            {{ {'key': ((store_result.get('data') or {}).get('item') or {}).get('key'),
+                'verdict': 'duplicate' if existing.get('status') in ['active', 'conflicted'] else 'new'}
+               if store_result.get('ok') else None }}
+
+    # The derived vector index follows the row (phase 3); detached, never in the turn's way.
+    - task_name: index-remembered
+      skip_if: "{{ not proceed or mode != 'remember' or not ((lt.get('vector') or {}).get('enabled') is True) or not store_result.get('ok') }}"
+      workflow:
+        ref: memory-vector
+        mode: detached
+        input: {mode: upsert, agent_id: "{{ aid }}", config: "{{ config }}", items: "{{ [(store_result.get('data') or {}).get('item')] }}"}
+      on_error:
+        catch: true
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FORGET — retire + tombstone
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-forget
+      skip_if: "{{ not proceed or mode != 'forget' }}"
+      set:
+        - _qw: "{{ set(re.findall(r'[a-z0-9]{3,}', str(query or '').lower())) }}"
+        - forget_targets#: >-
+            {{ ([existing] if existing.get('status') in ['active', 'conflicted'] else []) if key else
+               [r for r in user_rows if r.get('status') in ['active', 'conflicted'] and _qw
+                and len(_qw & (set(re.findall(r'[a-z0-9]{3,}', (str(r.get('title') or '') + ' ' + str(r.get('text') or '')).lower()))
+                               | set(str(t).lower() for t in (r.get('tags') or [])))) >= max(1, forget_min_overlap * len(_qw))] }}
+        - forget_statements: "{{ [str(r.get('title') or '') for r in forget_targets] + ([str(query)] if not key and str(query or '').strip() else []) }}"
+
+    - task_name: retire-forgotten
+      skip_if: "{{ not proceed or mode != 'forget' or not forget_targets }}"
+      loop:
+        in: "{{ forget_targets }}"
+        foreach: forget_row
+        do:
+          task_name: retire-forgotten-item
+          workflow:
+            ref: memory-store
+            mode: inline
+            input: {mode: retire, agent_id: "{{ aid }}", scope: user, key: "{{ forget_row['key'] }}", reason: forget, definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - results: "{{ [((r or {}).get('data') or {}).get('item', {}).get('key') for r in (_ or []) if (r or {}).get('ok')] }}"
+
+    - task_name: tombstone-forgotten
+      skip_if: "{{ not proceed or mode != 'forget' or not forget_statements }}"
+      loop:
+        in: "{{ forget_statements }}"
+        foreach: forget_statement
+        do:
+          task_name: write-forget-tombstone
+          workflow:
+            ref: memory-store
+            mode: inline
+            input: {mode: tombstone, agent_id: "{{ aid }}", statement: "{{ forget_statement }}", definition_access: "{{ access_lists }}"}
+
+    - task_name: unindex-forgotten
+      skip_if: "{{ not proceed or mode != 'forget' or not ((lt.get('vector') or {}).get('enabled') is True) or not results }}"
+      workflow:
+        ref: memory-vector
+        mode: detached
+        input: {mode: delete, agent_id: "{{ aid }}", config: "{{ config }}", keys: "{{ results }}"}
+      on_error:
+        catch: true
+
+    - task_name: shape-forget
+      skip_if: "{{ not proceed or mode != 'forget' }}"
+      set:
+        - ok: true
+        - data: "{{ {'retired': results} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FEEDBACK — 👎 lowers the support of the user items the turn used
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: feedback-items
+      skip_if: "{{ not proceed or mode != 'feedback' or rating != 'down' or not used_memory }}"
+      loop:
+        in: "{{ sorted(set(str(x) for x in (used_memory or []))) }}"
+        foreach: used_key
+        do:
+          task_name: lower-support
+          workflow:
+            ref: memory-store
+            mode: inline
+            input: {mode: feedback, agent_id: "{{ aid }}", scope: user, key: "{{ used_key }}", delta: "{{ max(1, int(strength or 1)) }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - results: "{{ [((r or {}).get('data') or {}).get('item', {}).get('key') for r in (_ or []) if (r or {}).get('ok')] }}"
+
+    - task_name: shape-feedback
+      skip_if: "{{ not proceed or mode != 'feedback' }}"
+      set:
+        - ok: true
+        - data: "{{ {'adjusted': results} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RETIRE_BY_SESSION — items the deleted session is evidence for, and no
+    # session that still exists is. Given live_session_ids (session-store, which
+    # owns the list), an item whose other sessions were deleted earlier goes too
+    # (F65); without it, only items whose ONLY evidence is this session.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-retire-by-session
+      skip_if: "{{ not proceed or mode != 'retire_by_session' }}"
+      set:
+        - forget_targets: >-
+            {{ [r for r in user_rows if r.get('status') in ['active', 'conflicted']
+                and sid in set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict))
+                and (set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict))
+                     .isdisjoint(set(str(x) for x in live_session_ids) - {sid})
+                     if isinstance(live_session_ids, list) else
+                     set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict)) == {sid})] }}
+
+    - task_name: retire-session-items
+      skip_if: "{{ not proceed or mode != 'retire_by_session' or not forget_targets }}"
+      loop:
+        in: "{{ forget_targets }}"
+        foreach: session_row
+        do:
+          task_name: retire-session-item
+          workflow:
+            ref: memory-store
+            mode: inline
+            input: {mode: retire, agent_id: "{{ aid }}", scope: user, key: "{{ session_row['key'] }}", reason: session_deleted, definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - results: "{{ [((r or {}).get('data') or {}).get('item', {}).get('key') for r in (_ or []) if (r or {}).get('ok')] }}"
+
+    - task_name: unindex-session-items
+      skip_if: "{{ not proceed or mode != 'retire_by_session' or not ((lt.get('vector') or {}).get('enabled') is True) or not results }}"
+      workflow:
+        ref: memory-vector
+        mode: detached
+        input: {mode: delete, agent_id: "{{ aid }}", config: "{{ config }}", keys: "{{ results }}"}
+      on_error:
+        catch: true
+
+    - task_name: shape-retire-by-session
+      skip_if: "{{ not proceed or mode != 'retire_by_session' }}"
+      set:
+        - ok: true
+        - data: "{{ {'retired': results} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MANAGEMENT — list, edit, retire, resolve_conflict (the caller's user scope)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: shape-list
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      set:
+        - ok: true
+        - data: "{{ {'items': user_rows} }}"
+
+    - task_name: manage-item
+      skip_if: "{{ not proceed or mode not in ['edit', 'retire', 'resolve_conflict'] }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: "{{ 'save' if mode == 'edit' else mode }}"
+          agent_id: "{{ aid }}"
+          scope: user
+          key: "{{ key }}"
+          reason: admin
+          to: "{{ to }}"
+          item:
+            kind: "{{ existing.get('kind') }}"
+            title: "{{ title or existing.get('title') }}"
+            text: "{{ text or existing.get('text') }}"
+            tags: "{{ tags or existing.get('tags') or [] }}"
+            status: "{{ existing.get('status') or 'active' }}"
+          definition_access: "{{ access_lists }}"
+          promotion_pool: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('promotion')) is True }}"
+      output:
+        set:
+          - store_result: "{{ _ or {} }}"
+
+    # edit re-indexes the new text; retire (or a conflict resolved to retired) drops it.
+    - task_name: reindex-managed
+      skip_if: "{{ not proceed or mode not in ['edit', 'retire', 'resolve_conflict'] or not ((lt.get('vector') or {}).get('enabled') is True) or not store_result.get('ok') }}"
+      workflow:
+        ref: memory-vector
+        mode: detached
+        input:
+          mode: "{{ 'delete' if ((store_result.get('data') or {}).get('item') or {}).get('status') == 'retired' else 'upsert' }}"
+          agent_id: "{{ aid }}"
+          config: "{{ config }}"
+          keys: "{{ [key] }}"
+          items: "{{ [(store_result.get('data') or {}).get('item')] }}"
+      on_error:
+        catch: true
+
+    - task_name: shape-manage
+      skip_if: "{{ not proceed or mode not in ['edit', 'retire', 'resolve_conflict'] }}"
+      set:
+        - ok: "{{ store_result.get('ok') == True }}"
+        - error: "{{ None if store_result.get('ok') else store_result.get('error') }}"
+        - data: "{{ {'item': (store_result.get('data') or {}).get('item')} if store_result.get('ok') else None }}"

@@ -1,0 +1,29 @@
+test_type: integration-test
+
+# namespace-admin, whole wfspec (F48). `moco test` runs on the dev stage (tier
+# "dev") as whoever runs it, so the lookup really runs: the two reads are mocked.
+# The guard's rules (no stage, guests, excluded ids) are in the unit suite.
+
+wfspec:
+  name: namespace-admin
+
+test_cases:
+  - id: the-reads-decide-and-the-namespace-is-reported
+    input: {package_name: agent-skeleton, exclude_user_ids: []}
+    mocks:
+      - {step_name: read-owning-namespace, _: {name: agent-skeleton, namespace_id: team-a}}
+      - {step_name: check-namespace-admin, _: {has_privilege: true}}
+    expect:
+      output:
+        - namespace_id: team-a
+        - is_admin: true
+
+  - id: a-failing-read-fails-closed
+    input: {package_name: agent-skeleton, exclude_user_ids: []}
+    mocks:
+      - {step_name: read-owning-namespace, _: "{{ 1 / 0 }}"}
+      - {step_name: check-namespace-admin, _: {has_privilege: true}}
+    expect:
+      output:
+        - namespace_id: null
+        - is_admin: false

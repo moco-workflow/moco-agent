@@ -1,0 +1,67 @@
+test_type: integration-test
+
+# profile-availability (plan-09 step 2, design §6.7.1). The caller's role is mocked
+# (`identify-caller`, access identify's envelope).
+
+wfspec:
+  name: profile-availability
+
+test_data:
+  profiles: &profiles
+    chat: {name: chat, route_description: "chit-chat", requires: {}}
+    rag: {name: rag, route_description: "docs", requires: {sources: true}, needs_rewrite: true}
+    react: {name: react, requires: {tools: true}}
+    claude: {name: claude, requires: {worker: agent, not_guest: true}}
+    memory: {name: memory, requires: {config: memory.long_term.enabled}}
+  config: &config
+    profiles: [chat, rag, react, claude, memory]
+    access: {guest_profiles: [chat, rag, claude]}
+    memory: {long_term: {enabled: false}}
+
+test_cases:
+  - id: each-requires-rule-drops-its-profile
+    input: {config: *config, profiles: *profiles, catalog: [{name: moco-docs}], agent_worker: false}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+    expect:
+      output:
+        - unavailable: {react: no_tools, claude: no_worker, memory: config_off}
+      assert:
+        - "{{ [p['name'] for p in available] == ['chat', 'rag'] }}"
+        - "{{ available[1] == {'name': 'rag', 'route_description': 'docs', 'examples': [], 'needs_rewrite': True, 'requires': {'sources': True}} }}"
+
+  - id: an-empty-catalog-drops-sources-profiles
+    input: {config: *config, profiles: *profiles, catalog: []}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+    expect:
+      assert:
+        - "{{ unavailable['rag'] == 'no_sources' }}"
+
+  - id: a-config-flag-and-the-worker-make-profiles-available
+    input:
+      config: {profiles: [claude, memory], access: {guest_profiles: []}, memory: {long_term: {enabled: true}}}
+      profiles: *profiles
+      agent_worker: true
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+    expect:
+      assert:
+        - "{{ [p['name'] for p in available] == ['claude', 'memory'] }}"
+
+  - id: a-guest-gets-only-guest-profiles-and-never-not-guest-ones
+    input: {config: *config, profiles: *profiles, catalog: [{name: moco-docs}], agent_worker: true}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: guest}}}
+    expect:
+      assert:
+        - "{{ [p['name'] for p in available] == ['chat', 'rag'] }}"
+        - "{{ unavailable['claude'] == 'guest' and unavailable['react'] == 'guest' }}"
+
+  - id: a-denied-caller-gets-nothing
+    input: {config: *config, profiles: *profiles, catalog: [{name: moco-docs}]}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: denied}}}
+    expect:
+      output:
+        - available: []

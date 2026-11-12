@@ -1,0 +1,13 @@
+test_type: integration-test
+
+wfspec:
+  name: qset.memory.command
+
+test_cases:
+  - id: one-choice-about-the-message
+    input: {message: "please forget what I said about staging"}
+    expect:
+      output:
+        - state: "Message: please forget what I said about staging"
+      assert:
+        - "{{ sorted(questions['command']['criteria']) == ['forget', 'list', 'none', 'remember'] and questions['command']['type'] == 'choice' }}"

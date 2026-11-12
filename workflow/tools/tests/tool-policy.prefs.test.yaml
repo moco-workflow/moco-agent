@@ -1,0 +1,121 @@
+test_type: integration-test
+
+# tool-policy, phase 3: per-user preferences (plan-10 step 14, design §6.9.7). Split from
+# tool-policy.test.yaml (one suite is one MCP request; the merged file hit nginx's 413).
+# A user tightens any tool; `auto` loosens only a read-only tool whose manifest asks
+# approve, allows session grants and has no agent override. Membership, access and the
+# pref rows are mocked by task name.
+
+wfspec:
+  name: tool-policy
+
+test_data:
+  allow: &allow {ok: true, data: {allow: true, reason: ok}}
+  user: &user {ok: true, data: {role: user}}
+  config: &config {access: {admin_user_ids: [], guest_user_ids: [guest]}}
+
+test_cases:
+  # ── user preferences (phase 3) ──────────────────────────────────────────
+  - id: a-user-may-tighten-any-tool
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true}}, tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: auto}},
+                                                                      {name: logs, status: enabled, policy: {side_effects: read, permission: auto}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+      - {step_name: list-pref-keys, _: [{key: "tool_pref:pods"}, {key: "tool_pref:logs"}]}
+      - {step_name: read-pref, _: "{{ {'name': pref_key.split(':')[1], 'permission': 'approve' if pref_key.endswith('pods') else 'deny'} }}"}
+    expect:
+      assert:
+        - "{{ [(t['name'], t['effective_permission'], t['pref_used']) for t in data['offerable']] == [('pods', 'approve', True)] }}"
+        - "{{ data['hidden'] == [{'name': 'logs', 'reason': 'denied'}] }}"
+
+  - id: auto-loosens-a-read-tool-whose-manifest-allows-session-grants
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true}}, tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: approve, allow_session_grant: true}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+      - {step_name: list-pref-keys, _: [{key: "tool_pref:pods"}]}
+      - {step_name: read-pref, _: {name: pods, permission: auto}}
+    expect:
+      assert:
+        - "{{ [(t['effective_permission'], t['pref_used']) for t in data['offerable']] == [('auto', True)] }}"
+
+  - id: auto-never-loosens-a-write-tool
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true}}, tools: [{name: scale, status: enabled, policy: {side_effects: write, permission: approve, allow_session_grant: true}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+      - {step_name: list-pref-keys, _: [{key: "tool_pref:scale"}]}
+      - {step_name: read-pref, _: {name: scale, permission: auto}}
+    expect:
+      assert:
+        - "{{ [(t['effective_permission'], t['pref_used']) for t in data['offerable']] == [('approve', False)] }}"
+
+  - id: auto-does-not-override-the-agents-own-tightening
+    input: {mode: resolve, agent_id: ops, config: {access: {}, tools: {overrides: {pods: approve}}}, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true}}, tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: approve, allow_session_grant: true}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+      - {step_name: list-pref-keys, _: [{key: "tool_pref:pods"}]}
+      - {step_name: read-pref, _: {name: pods, permission: auto}}
+    expect:
+      assert:
+        - "{{ [t['effective_permission'] for t in data['offerable']] == ['approve'] }}"
+
+  - id: auto-needs-the-manifests-consent
+    input: {mode: resolve, agent_id: ops, config: *config, toolsets: [k8s]}
+    mocks:
+      - step_name: read-members
+        _: {ok: true, data: {toolsets: {k8s: {found: true}}, tools: [{name: pods, status: enabled, policy: {side_effects: read, permission: approve}}]}}
+      - {step_name: authorize-effect, _: *allow}
+      - {step_name: identify-caller, _: *user}
+      - {step_name: list-pref-keys, _: [{key: "tool_pref:pods"}]}
+      - {step_name: read-pref, _: {name: pods, permission: auto}}
+    expect:
+      assert:
+        - "{{ [t['effective_permission'] for t in data['offerable']] == ['approve'] }}"
+
+  - id: set-pref-writes-the-users-row
+    input: {mode: set_pref, agent_id: ops, config: *config, name: pods, permission: deny}
+    mocks:
+      - {step_name: authorize-pref, _: *allow}
+      - {step_name: write-pref, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['pref']['name'] == 'pods' and data['pref']['permission'] == 'deny' }}"
+
+  - id: set-pref-rejects-an-unknown-word
+    input: {mode: set_pref, agent_id: ops, config: *config, name: pods, permission: maybe}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: a-guest-cannot-set-prefs
+    input: {mode: set_pref, agent_id: ops, config: *config, name: pods, permission: deny}
+    mocks:
+      - {step_name: authorize-pref, _: {ok: true, data: {allow: false, reason: guest}}}
+      - {step_name: write-pref, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: list-and-clear-prefs
+    input: {mode: list_prefs, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: authorize-pref, _: *allow}
+      - {step_name: list-own-pref-keys, _: [{key: "tool_pref:pods"}]}
+      - {step_name: read-own-pref, _: {name: pods, permission: deny, set_at: "2026-10-16T00:00:00"}}
+    expect:
+      output:
+        - ok: true
+        - data: {prefs: [{name: pods, permission: deny, set_at: "2026-10-16T00:00:00"}]}
+
+

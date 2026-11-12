@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# HOOK.MOCO.TRACE — observe the deferred hook events (design §5.4, plan-03 phase 3)
+# ================================================================================
+#
+# Declared `mode: async` on route.decided, context.assembled, tool.after,
+# turn.committed and session.retired: hook-runner starts it detached and never
+# reads its result, so it costs the turn nothing. It logs the event and the
+# payload's keys (never values: tool results and messages stay out of the log),
+# which is how these events are checked live -- each run is a Temporal workflow
+# whose id ends in `hook.moco.trace-<n>`, with the payload in its input.
+#
+# Contract: in {hook_event, payload, agent_id, session_id}, out {action: continue}.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: hook.moco.trace
+
+input:
+  hook_event:
+  payload: {}
+  agent_id:
+  session_id:
+
+output:
+  action: continue
+  hook_event: "{{ hook_event }}"
+  payload_keys: "{{ payload_keys }}"
+
+main:
+  task_name: trace
+  set:
+    - hook_event#: "{{ hook_event }}"
+    - payload_keys#: "{{ sorted((payload or {}).keys()) if isinstance(payload, dict) else [] }}"

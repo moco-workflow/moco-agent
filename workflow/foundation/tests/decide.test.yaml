@@ -1,0 +1,251 @@
+test_type: integration-test
+
+# decide (plan-02 steps 7-12, design §6.2.3). The qset render is mocked by task name
+# (`render-qset`), System One by `classify`, and the LLM
+# fallback's model call by `call-model` (inside llm-invoke). The fallback prompt
+# itself (prompt.decide.fallback) runs for real.
+
+wfspec:
+  name: decide
+
+test_data:
+  request: &request
+    ok: true
+    data:
+      kind: system_one
+      state: "Current message: how do retries work?"
+      keymap: {profile_0: chat, profile_1: rag, source_0: moco-docs}
+      questions:
+        ambiguity: {type: score, instructions: "How clear?", criteria: [clear, somewhat, too ambiguous]}
+        needs_context: {type: noul, instructions: "Needs history?"}
+        route: {type: choice, instructions: "Which?", criteria: {profile_0: "Chit-chat.", profile_1: "Docs."}}
+        source_0: {type: noul, instructions: "moco-docs?"}
+  s1: &s1
+    model: typed-decisions
+    usage: {input_tokens: 50, output_tokens: 5}
+    nouls: {needs_context: 0.9, source_0: 0.3}
+    choices: {route: profile_1}
+    scores: {ambiguity: 0.6}
+    answers:
+      route: {type: choice, choice: profile_1, probabilities: {profile_0: 0.2, profile_1: 0.8}}
+      ambiguity: {type: score, score: 0.6, probabilities: {"0": 0.5, "1": 0.4, "2": 0.1}}
+  models: &models
+    inference: {model: deepseek-v4-pro, apikey_secret_key: "global/DEMO_DEEPSEEK_APIKEY", max_tokens: 1200}
+    decision: null
+    decision_default_max_tokens: 600
+    classifier: {provider: typesafe, model: typed-decisions, worker_default: true, enabled: true, timeout_sec: 10}
+  models_off: &models_off
+    inference: {model: deepseek-v4-pro, apikey_secret_key: "global/DEMO_DEEPSEEK_APIKEY", max_tokens: 1200}
+    decision: null
+    classifier: {enabled: false}
+  default: &default {route: chat, needs_context: 0.0, moco-docs: 0.0, ambiguity: 0}
+
+test_cases:
+
+  # ── System One answers ──────────────────────────────────────────────────
+  - id: keys-and-labels-come-back-mapped-with-confidence
+    input: {qset: route, models: *models, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - {step_name: classify, _: *s1}
+    expect:
+      output:
+        - ok: true
+        - error: null
+      assert:
+        - "{{ data['choices'] == {'route': 'rag'} }}"
+        - "{{ data['nouls'] == {'needs_context': 0.9, 'moco-docs': 0.3} }}"
+        - "{{ data['scores'] == {'ambiguity': 0.6} }}"
+        # choice: chosen label's p; noul: |p - 0.5| * 2; score: modal level's p.
+        - "{{ data['confidence'] == {'route': 0.8, 'needs_context': 0.8, 'moco-docs': 0.4, 'ambiguity': 0.5} }}"
+        - "{{ data['decided_by'] == 'system_one' and data['model'] == 'typed-decisions' and data['replaced'] == [] }}"
+        - "{{ data['probabilities'] == {'route': {'chat': 0.2, 'rag': 0.8}} }}"
+        - "{{ data['usage'] == {'classifier_calls': 1, 'llm_calls': 0, 'tokens_in': 50, 'tokens_out': 5} }}"
+        - "{{ data['keymap']['source_0'] == 'moco-docs' }}"
+
+  - id: an-answer-outside-the-offered-labels-takes-its-default
+    input: {qset: route, models: *models, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {model: m, usage: {}, nouls: {}, scores: {}, choices: {route: profile_7}, answers: {route: {probabilities: {profile_7: 0.9}}}}
+    expect:
+      assert:
+        - "{{ data['choices'] == {'route': 'chat'} and data['replaced'] == ['route'] }}"
+        - "{{ data['confidence']['route'] is None }}"
+
+  # The budget reaches the activity: the mock answers only when the task sees it.
+  - id: a-call-budget-reaches-the-activity
+    input: {qset: route, models: *models, timeout_sec: 30, attempts: 2}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: "{{ {'model': 'typed-decisions', 'usage': {'input_tokens': 50, 'output_tokens': 5}, 'nouls': {'needs_context': 0.9, 'source_0': 0.3}, 'choices': {'route': 'profile_1'}, 'scores': {'ambiguity': 0.6}, 'answers': {'route': {'type': 'choice', 'choice': 'profile_1', 'probabilities': {'profile_0': 0.2, 'profile_1': 0.8}}, 'ambiguity': {'type': 'score', 'score': 0.6, 'probabilities': {'0': 0.5, '1': 0.4, '2': 0.1}}}} if (call_timeout, call_attempts) == (30, 2) else {'result': 'error', 'error_type': 'WorkflowRuntimeError', 'error_message': 'wrong budget ' + str(call_timeout) + 'x' + str(call_attempts)} }}"
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'system_one' }}"
+
+  - id: models-classifier-timeout-is-the-default-budget
+    input: {qset: route, models: {classifier: {worker_default: true, enabled: true, timeout_sec: 20}}}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: "{{ {'model': 'typed-decisions', 'usage': {'input_tokens': 50, 'output_tokens': 5}, 'nouls': {'needs_context': 0.9, 'source_0': 0.3}, 'choices': {'route': 'profile_1'}, 'scores': {'ambiguity': 0.6}, 'answers': {'route': {'type': 'choice', 'choice': 'profile_1', 'probabilities': {'profile_0': 0.2, 'profile_1': 0.8}}, 'ambiguity': {'type': 'score', 'score': 0.6, 'probabilities': {'0': 0.5, '1': 0.4, '2': 0.1}}}} if (call_timeout, call_attempts) == (20, 1) else {'result': 'error', 'error_type': 'WorkflowRuntimeError', 'error_message': 'wrong budget ' + str(call_timeout) + 'x' + str(call_attempts)} }}"
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'system_one' }}"
+
+  # ── The fallback table (§6.2.3) ─────────────────────────────────────────
+  - id: disabled-with-fallback-default-answers-the-defaults
+    input: {qset: route, models: *models_off, fallback: default, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'default' }}"
+        - "{{ data['choices'] == {'route': 'chat'} and data['scores'] == {'ambiguity': 0} }}"
+        - "{{ data['nouls'] == {'needs_context': 0.0, 'moco-docs': 0.0} }}"
+        - "{{ data['usage']['classifier_calls'] == 0 }}"
+
+  - id: disabled-with-fallback-none-is-unavailable
+    input: {qset: route, models: *models_off, fallback: none}
+    mocks:
+      - {step_name: render-qset, _: *request}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error == {'code': 'unavailable', 'message': 'classifier disabled', 'retryable': True} }}"
+
+  - id: a-connection-error-falls-back-to-the-decision-model
+    input: {qset: route, models: *models, fallback: llm, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: Connection error: All connection attempts failed"}
+      - step_name: call-model
+        _: {content: "{\"nouls\": {\"needs_context\": 0.75, \"source_0\": 0.1}, \"choices\": {\"route\": \"profile_1\"}, \"scores\": {\"ambiguity\": 1}}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'llm' }}"
+        - "{{ data['choices'] == {'route': 'rag'} and data['nouls'] == {'needs_context': 0.75, 'moco-docs': 0.1} }}"
+        # No probabilities from a chat model: only nouls get a confidence.
+        - "{{ data['confidence'] == {'needs_context': 0.5, 'moco-docs': 0.8, 'route': None, 'ambiguity': None} }}"
+        - "{{ data['usage']['llm_calls'] == 1 and data['usage']['classifier_calls'] == 0 }}"
+        - "{{ data['probabilities'] == {} }}"
+
+  - id: a-5xx-with-fallback-default-answers-the-defaults
+    input: {qset: route, models: *models, fallback: default, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: POST http://localhost:8001/v1/systemone: 503 overloaded"}
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'default' }}"
+
+  - id: a-timeout-with-fallback-none-is-unavailable
+    input: {qset: route, models: *models, fallback: none}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "activity StartToClose timeout"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'unavailable' and 'timeout' in error['message'] }}"
+
+  - id: a-failing-decision-model-is-unavailable-too
+    input: {qset: route, models: *models, fallback: llm}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Connection error"}
+      - step_name: call-model
+        _: {result: error, error_type: AuthenticationError, error_message: "Error code: 401"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'unavailable' and 'the decision model failed: Error code: 401' in error['message'] }}"
+
+  # A malformed qset is a bug: it raises whatever the fallback says.
+  - id: a-4xx-raises-even-with-a-fallback
+    input: {qset: route, models: *models, fallback: default, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: POST http://localhost:8001/v1/systemone: 422 question 'q': a choice question needs at least one criterion"}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: a-request-the-activity-refuses-to-send-raises
+    input: {qset: route, models: *models, fallback: llm}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: 2 validation errors for SystemOneInput"}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: a-429-is-not-a-bug
+    input: {qset: route, models: *models, fallback: default, default: *default}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - step_name: classify
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: POST /v1/systemone: 429 rate limited"}
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'default' }}"
+
+  # ── decide_many, guards ─────────────────────────────────────────────────
+  - id: decide-many-returns-one-result-per-item
+    input: {mode: decide_many, qset: route, models: *models, items: [{message: a}, {message: b}, {message: c}]}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - {step_name: classify, _: *s1}
+    expect:
+      assert:
+        - "{{ ok == True and len(data['results']) == 3 }}"
+        - "{{ all(r['ok'] and r['data']['choices'] == {'route': 'rag'} for r in data['results']) }}"
+
+  - id: a-chat-prompt-is-not-a-question-set
+    input: {qset: rewrite, models: *models}
+    mocks:
+      - step_name: render-qset
+        _: {ok: true, data: {kind: chat, messages: []}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "decide: 'rewrite' is not a question set (kind chat)"
+
+  - id: an-unknown-fallback-raises
+    input: {qset: route, models: *models, fallback: guess}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "decide: invalid fallback 'guess'. Must be one of: llm, default, none"
+
+  # ── Off unless an endpoint is stated (F70) ──────────────────────────────
+  # No base_url and no worker_default: the activity would fall back to the hosted
+  # TypeSafe API, so decide never calls it (the classify mock is a sentinel).
+  - id: an-unstated-classifier-is-not-called
+    input: {qset: route, models: {classifier: {enabled: true}}, fallback: none}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - {step_name: classify, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error == {'code': 'unavailable', 'message': 'classifier not configured', 'retryable': True} }}"
+
+  - id: a-base-url-states-the-classifier
+    input: {qset: route, models: {classifier: {enabled: true, base_url: "http://localhost:8002"}}}
+    mocks:
+      - {step_name: render-qset, _: *request}
+      - {step_name: classify, _: *s1}
+    expect:
+      assert:
+        - "{{ ok == True and data['decided_by'] == 'system_one' }}"
+

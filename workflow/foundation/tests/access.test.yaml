@@ -1,0 +1,97 @@
+test_type: integration-test
+
+# access authorize, phase 1 (plan-04 step 1): the guards around the decision, and
+# the authority rule. The rules themselves are in access.unit.test.yaml.
+#
+# These run as whoever runs `moco test`. The fixture lists never name that user,
+# so the caller is a plain user here.
+
+wfspec:
+  name: access
+
+test_data:
+  acc: &acc
+    denied_user_ids: []
+    guest_user_ids: [guest, "None", ""]
+    admin_user_ids: [root]
+    guest_profiles: [chat]
+
+test_cases:
+
+  - id: a-plain-user-may-chat
+    input: {mode: authorize, action: chat, definition_access: *acc}
+    expect:
+      output:
+        - ok: true
+        - error: null
+        - data: {allow: true, reason: ok}
+
+  # Authority comes from __user_info__, never from an input (§4.3).
+  - id: a-caller-cannot-claim-to-be-an-admin
+    input: {mode: authorize, action: admin, uid: root, user_id: root, definition_access: *acc}
+    expect:
+      output:
+        - data: {allow: false, reason: not_admin}
+
+  # Fail closed: a half-resolved config is invalid input, never an allow.
+  - id: a-missing-access-list-is-invalid-input
+    input:
+      mode: authorize
+      action: chat
+      definition_access: {guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat]}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+        - "{{ 'denied_user_ids' in error['message'] }}"
+
+  - id: no-access-section-at-all-is-invalid-input
+    input: {mode: authorize, action: chat, definition_access: null}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  # Bugs in the caller raise.
+  - id: an-unknown-action-raises
+    input: {mode: authorize, action: delete_everything, definition_access: *acc}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "access: invalid action 'delete_everything'. Must be one of: chat, use_profile, read, write, feedback, call_tool, admin"
+
+  - id: a-write-without-a-scope-raises
+    input: {mode: authorize, action: write, definition_access: *acc}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: a-scope-on-an-unscoped-action-raises
+    input: {mode: authorize, action: chat, scope: user, definition_access: *acc}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: an-unknown-scope-raises
+    input: {mode: authorize, action: read, scope: everyone, definition_access: *acc}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  - id: an-unknown-mode-raises
+    input: {mode: grant, action: chat, definition_access: *acc}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "access: invalid mode 'grant'. Must be one of: authorize, identify"
+
+  - id: identify-reports-the-callers-role
+    input: {mode: identify, definition_access: *acc}
+    expect:
+      output:
+        - ok: true
+        - data: {role: user}

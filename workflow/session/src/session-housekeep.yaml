@@ -1,0 +1,236 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SESSION-HOUSEKEEP — the caller's own session hygiene for one agent (§6.16, §8.1)
+# ================================================================================
+#
+#   in                                             out
+#   ────────────────────────────────────────────── ─────────────────────────────────
+#   agent_id, config, exclude_session_id?,          {ok, data: {examined, reaped, expired_pending,
+#   max_sessions?, max_deletes?, idle_after_sec?     deleted, skipped_live, memory_evicted,
+#                                                    memory_decayed, errors}, error}
+#
+# Spawned DETACHED by agent-session at every idle stop and retire, so it runs as the
+# session's user: session rows live in `<uid>:agent.<id>.sessions`, reachable only by
+# that user (F50 closed), so no admin job can do this. It is lazy by design: a user who
+# never returns keeps their rows until they do.
+#
+# Over the user's sessions of this agent, OLDEST-updated first (≤ max_sessions):
+#   REAP     status active AND idle past limits.retire_after_idle_sec
+#            (retire_throwaway_after_idle_sec for a throwaway session), not the caller's
+#            own session, and its entity is DEAD (session-probe; an erroring probe
+#            counts as alive -- never reap on doubt) →
+#              session-store patch_meta {status: retired}
+#              hitl expire (NOT forced): an awaiting action expires only when due
+#            A session idle-stopped normally is reaped here too: its row stays active
+#            (F66). Its memory was handed over at its own idle stop.
+#   RETAIN   status retired AND updated longer ago than retention.session_days →
+#            session-store delete (every session row, its grants, the global tool
+#            audit row, and memory whose only evidence it was), ≤ max_deletes
+#   MEMORY   with memory.long_term.enabled: memory-store enforce_caps on the user scope
+#            (over-cap items by lowest effective weight, and decayed ones)
+#
+# Every step is best effort: failures are reported in errors, never raised.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: session-housekeep
+
+context:
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  default_retire_after_sec: 86400
+  default_throwaway_after_sec: 600
+  default_session_days: 180
+  metas: []
+  candidates: []
+  probes: []
+  probe_alive: false
+  reaped: []
+  expired_pending: []
+  expired_sessions: []
+  deleted: []
+  memory_evicted: []
+  memory_decayed: []
+  errors: []
+  ok: false
+  data:
+  error:
+
+input:
+  agent_id:
+  config: {}
+  # The calling session: alive by definition, never reaped.
+  exclude_session_id:
+  max_sessions: 100
+  max_deletes: 20
+  # Overrides both idle thresholds (null = the agent's own).
+  idle_after_sec:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - cfg: "{{ config if isinstance(config, dict) else {} }}"
+        - access_lists: "{{ cfg.get('access') or {} }}"
+        - proceed: "{{ bool(re.match(agent_id_pattern, aid)) }}"
+        - error: "{{ None if proceed else {'code': 'invalid_input', 'message': 'agent_id must match ' + agent_id_pattern, 'retryable': False} }}"
+
+    - task_name: list-sessions
+      skip_if: "{{ not proceed }}"
+      workflow:
+        ref: session-store
+        mode: inline
+        input: {mode: list, agent_id: "{{ aid }}", limit: "{{ int(max_sessions) }}", oldest_first: true}
+      output:
+        set:
+          - metas: "{{ [m for m in ((((_ or {}).get('data') or {}).get('sessions')) or []) if isinstance(m, dict) and m.get('session_id')] }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - errors: "{{ errors + [{'step': 'list', 'error': str(_.get('error_message'))[:300]}] }}"
+
+    # ── reap ──────────────────────────────────────────────────────────────────
+    - task_name: pick-candidates
+      skip_if: "{{ not proceed }}"
+      set:
+        - _now: "{{ now().replace(tzinfo=None) }}"
+        - _limits: "{{ cfg.get('limits') or {} }}"
+        - _active: >-
+            {{ [m for m in metas if m.get('status') == 'active' and m.get('session_id') != exclude_session_id
+                and (m.get('updated_at') or m.get('created_at'))] }}
+        - _idle: >-
+            {{ [int((_now - dt.datetime.fromisoformat(str(m.get('updated_at') or m.get('created_at'))).replace(tzinfo=None)).total_seconds())
+                for m in _active] }}
+        - _limit: >-
+            {{ [int(idle_after_sec) if idle_after_sec is not None else
+                int(_limits.get('retire_throwaway_after_idle_sec' if m.get('throwaway') else 'retire_after_idle_sec')
+                    or (default_throwaway_after_sec if m.get('throwaway') else default_retire_after_sec))
+                for m in _active] }}
+        - candidates#: "{{ [dict(m, idle_sec=i) for m, i, l in zip(_active, _idle, _limit) if i >= l] }}"
+
+    - task_name: probe-entities
+      skip_if: "{{ not candidates }}"
+      loop:
+        in: "{{ candidates }}"
+        foreach: candidate
+        do:
+          tasks:
+            - task_name: probe-entity
+              workflow:
+                ref: session-probe
+                mode: inline
+                input: {agent_id: "{{ aid }}", owner_user_id: "{{ uid }}", session_id: "{{ candidate['session_id'] }}"}
+              output:
+                set:
+                  - probe_alive: "{{ bool((_ or {}).get('alive')) }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - probe_alive: true
+            - task_name: record-probe
+              set:
+                - probes: "{{ probes + [dict(candidate, alive=probe_alive)] }}"
+
+    - task_name: reap-dead
+      skip_if: "{{ not [p for p in probes if not p['alive']] }}"
+      loop:
+        in: "{{ [p for p in probes if not p['alive']] }}"
+        foreach: dead
+        do:
+          tasks:
+            - task_name: retire-row
+              workflow:
+                ref: session-store
+                mode: inline
+                input:
+                  mode: patch_meta
+                  agent_id: "{{ aid }}"
+                  session_id: "{{ dead['session_id'] }}"
+                  patch: {status: retired}
+              output:
+                set:
+                  - reaped: "{{ reaped + [dead['session_id']] if (_ or {}).get('ok') else reaped }}"
+                  - errors: "{{ errors if (_ or {}).get('ok') else errors + [{'step': 'reap', 'session_id': dead['session_id'], 'error': (_ or {}).get('error')}] }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - errors: "{{ errors + [{'step': 'reap', 'session_id': dead['session_id'], 'error': str(_.get('error_message'))[:300]}] }}"
+
+            # Only when due: a retired session can still be approved and resumed.
+            - task_name: expire-due-pending
+              workflow:
+                ref: hitl
+                mode: inline
+                input: {mode: expire, agent_id: "{{ aid }}", session_id: "{{ dead['session_id'] }}"}
+              output:
+                set:
+                  - expired_pending: >-
+                      {{ expired_pending + [dead['session_id']]
+                         if ((_ or {}).get('data') or {}).get('expired') else expired_pending }}
+              on_error:
+                catch: true
+
+    # ── retention ─────────────────────────────────────────────────────────────
+    - task_name: pick-expired
+      skip_if: "{{ not proceed }}"
+      set:
+        - _now2: "{{ now().replace(tzinfo=None) }}"
+        - _days: "{{ int(((cfg.get('retention') or {}).get('session_days')) or default_session_days) }}"
+        - expired_sessions#: >-
+            {{ [m['session_id'] for m in metas if m.get('status') == 'retired' and (m.get('updated_at') or m.get('created_at'))
+                and m.get('session_id') != exclude_session_id
+                and (_now2 - dt.datetime.fromisoformat(str(m.get('updated_at') or m.get('created_at'))).replace(tzinfo=None)).days >= _days][:int(max_deletes)] }}
+
+    - task_name: delete-expired
+      skip_if: "{{ not expired_sessions }}"
+      loop:
+        in: "{{ expired_sessions }}"
+        foreach: old_sid
+        do:
+          task_name: delete-expired-session
+          workflow:
+            ref: session-store
+            mode: inline
+            input: {mode: delete, agent_id: "{{ aid }}", session_id: "{{ old_sid }}", config: "{{ cfg }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - deleted: "{{ [s for s, r in zip(expired_sessions, _ or []) if (r or {}).get('ok')] }}"
+
+    # ── memory caps and lazy decay (§6.4.4) ───────────────────────────────────
+    - task_name: enforce-memory
+      skip_if: "{{ not proceed or (((cfg.get('memory') or {}).get('long_term') or {}).get('enabled')) is not True }}"
+      workflow:
+        ref: agent-harness-memory/memory-store
+        mode: inline
+        input: {mode: enforce_caps, agent_id: "{{ aid }}", scope: user, definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - memory_evicted: "{{ (((_ or {}).get('data') or {}).get('evicted')) or [] }}"
+          - memory_decayed: "{{ (((_ or {}).get('data') or {}).get('decayed')) or [] }}"
+      on_error:
+        catch: true
+
+    - task_name: shape-report
+      set:
+        - ok: "{{ proceed and not errors }}"
+        - error: >-
+            {{ error if not proceed else
+               None if not errors else {'code': 'partial', 'message': str(len(errors)) + ' step(s) failed', 'retryable': True} }}
+        - data: >-
+            {{ {'examined': len(metas), 'candidates': len(candidates),
+                'skipped_live': len([p for p in probes if p['alive']]),
+                'reaped': reaped, 'expired_pending': expired_pending, 'deleted': deleted,
+                'memory_evicted': memory_evicted, 'memory_decayed': memory_decayed, 'errors': errors} }}

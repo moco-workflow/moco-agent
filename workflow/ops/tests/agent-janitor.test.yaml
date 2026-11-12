@@ -1,0 +1,92 @@
+test_type: integration-test
+
+# agent-janitor (design §6.10.5): the agent-wide cost rollup over the GLOBAL usage rows
+# (`usage_day:<day>:<uid>` in `agent.<aid>.usage`). Session reaping, retention, stuck
+# jobs and memory caps moved to the user's own session when F50 closed
+# (session-housekeep, job-manager reconcile; tested there). Every read and write is
+# mocked by task name.
+
+wfspec:
+  name: agent-janitor
+
+test_cases:
+  - id: an-agent-over-its-daily-tokens-is-paused
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {limits: {cost: {agent_daily_tokens: 1000}, paused: false}, access: {}}}}}
+      - step_name: list-usage-day
+        _: "{{ [{'key': 'usage_day:' + now().date().isoformat() + ':u1'}, {'key': 'usage_day:' + now().date().isoformat() + ':u2'}] if usage_aid == 'ops' else 1 / 0 }}"
+      - {step_name: read-usage-row, _: {tokens_in: 400, tokens_out: 200}}
+      - {step_name: save-pause, _: {ok: true, data: {config_version: v2}}}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['usage_tokens'] == {'ops': 1200} and data['paused_changed'] == [{'agent': 'ops', 'paused': True, 'ok': True}] }}"
+
+  - id: the-usage-rows-are-read-from-the-global-usage-namespace
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {limits: {cost: {agent_daily_tokens: 1000}}, access: {}}}}}
+      - {step_name: list-usage-day, _: [{key: "usage_day:x:u1"}]}
+      - {step_name: read-usage-row, _: "{{ {'tokens_in': 1} if usage_ref == {'aid': 'ops', 'key': 'usage_day:x:u1'} else 1 / 0 }}"}
+      - {step_name: save-pause, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['usage_tokens'] == {'ops': 1} }}"
+
+  - id: a-paused-agent-without-usage-today-is-unpaused
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {limits: {cost: {agent_daily_tokens: 1000}, paused: true}, access: {}}}}}
+      - {step_name: list-usage-day, _: []}
+      - {step_name: read-usage-row, _: "{{ 1 / 0 }}"}
+      - {step_name: save-pause, _: {ok: true, data: {}}}
+    expect:
+      assert:
+        - "{{ data['paused_changed'] == [{'agent': 'ops', 'paused': False, 'ok': True}] }}"
+
+  - id: an-agent-without-a-cap-is-not-rolled-up
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {limits: {}, access: {}}}}}
+      - {step_name: list-usage-day, _: "{{ 1 / 0 }}"}
+      - {step_name: save-pause, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['agents'] == [] and data['usage_tokens'] == {} and data['paused_changed'] == [] }}"
+
+  - id: an-agent-whose-config-fails-is-skipped
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: false, error: {code: not_found}}}
+      - {step_name: list-usage-day, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['agents'] == [] }}"
+
+  - id: a-failed-pause-save-is-reported
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {limits: {cost: {agent_daily_tokens: 10}}, access: {}}}}}
+      - {step_name: list-usage-day, _: [{key: "usage_day:x:u1"}]}
+      - {step_name: read-usage-row, _: {tokens_in: 50}}
+      - {step_name: save-pause, _: {ok: false, error: {code: forbidden}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'partial' and data['paused_changed'] == [{'agent': 'ops', 'paused': True, 'ok': False}] }}"
+
+  - id: a-failed-agent-list-is-reported
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: "{{ 1 / 0 }}"}
+      - {step_name: resolve-agent-config, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'agent_list_failed' }}"

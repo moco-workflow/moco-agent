@@ -1,0 +1,468 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-REGISTRY — load, validate and list agent definitions (design §5.2, plan-03)
+# ================================================================================
+#
+#   mode      in            data out
+#   ───────── ───────────── ──────────────────────────────────────────────────────
+#   load      agent_id      {definition, profiles: {name: profile}, profile_refs,
+#                            resolved_refs, versions: {agent, harness}}
+#   validate  definition    {valid, errors: [{path, message}]}
+#   list      —             {agents: [{agent_id, package, display_name, version}]}
+#
+# LOAD is what a session caches (plan-14) and re-runs only when config_version
+# changes. It fails LOUDLY (raises) on anything a definition references that is not
+# deployed -- silently dropping a profile would look like a routing bug (§5.2):
+#   1. the package catalogs (package-catalog, as `sync` children: their payload
+#      stays out of this history): `agent-<agent_id>`, the harness library
+#      `agent-harness-prompts` (profiles, prompts, qsets) and `agent-harness`
+#      (its version is the harness version)
+#   2. the definition `agent-<id>/agent.<id>` (P21, F40), checked by `validate`
+#   3. `harness` range against the deployed harness version
+#   4. each profile: agent-local `profile.<id>.<name>` wins over the library
+#      `profile.<name>`; the definition's profile_overrides[name] is merged over it
+#      field by field; then the profile rules of §6.8.2
+#   5. resolved_refs: every prompt/qset name in use (harness library, persona,
+#      profiles' loop.prompt) → prompt-render resolve_names
+#   6. existence of the other extensions named: router.custom, hooks, custom
+#      context providers, kind: wfspec profiles' wfspecs. A name qualified with a
+#      harness package (`agent-harness-memory/profile-memory`) is the harness's
+#      own and is checked statically (scripts/check-packages.py), not here.
+#
+# VALIDATION SUBSET (definition): agent_id pattern; harness a semver range of
+# `op version` tokens; profiles a non-empty list of unique names; router.default_profile
+# and router.slash targets among them; router.custom null or `router.<name>`;
+# persona_text ≤ 2000 chars; hooks only on the hook events (§5.4: three in v1, five more in phase 3) with mode
+# sync|async; profile_overrides only for listed profiles; access lists are lists,
+# access.namespace_admins a bool, and the computed access keys absent (F48).
+# PROFILE RULES (§6.8.2): kind loop|wfspec; loop needs loop.prompt; max_steps > 1 needs
+# tools; retrieval.when before needs requires.sources; kind wfspec needs wfspec.name;
+# mode async only for kind wfspec; estimated_sec ≤ budget_sec.
+# `loop.model_role` is checked against the RESOLVED config by agent-config (plan-04).
+#
+# Text in profiles uses `{name}` placeholders, never `{{ }}`: data wfspecs evaluate
+# their context, so `{{ sources }}` would be evaluated at load time.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-registry
+
+context:
+  valid_modes: ["load", "validate", "list"]
+  # The harness is split into packages that all start with harness_prefix
+  # (plan-00 §4): `list` must not mistake one for an agent.
+  harness_prefix: agent-harness
+  harness_package: agent-harness
+  library_package: agent-harness-prompts
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  hook_events: ["turn.received", "tool.before", "answer.ready", "route.decided", "context.assembled", "tool.after",
+                "turn.committed", "session.retired"]
+  builtin_providers: ["system", "pending", "jobs", "profile_memory", "question", "recent",
+                      "recalled_memory", "episodes", "summary"]
+  ok: false
+  data:
+  error:
+
+input:
+  mode: load
+  agent_id:
+  definition: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+functions:
+
+  validate-definition:
+    input:
+      definition: {}
+      agent_id_pattern:
+      hook_events: []
+    output:
+      errors: "{{ errors }}"
+    main:
+      task_name: check-definition
+      set:
+        - _d: "{{ definition if isinstance(definition, dict) else {} }}"
+        - _profiles: "{{ _d.get('profiles') if isinstance(_d.get('profiles'), list) else [] }}"
+        - _router: "{{ _d.get('router') if isinstance(_d.get('router'), dict) else {} }}"
+        - _range_ok: >-
+            {{ isinstance(_d.get('harness'), str) and bool(_d['harness'].split()) and all(
+                 re.fullmatch(r'(>=|<=|>|<|=)?[0-9]+(\.[0-9]+){0,2}', t) for t in _d['harness'].split()) }}
+        - errors: >-
+            {{ ([] if isinstance(definition, dict) else [{'path': '$', 'message': 'definition must be a mapping'}])
+               + ([] if re.fullmatch(agent_id_pattern, str(_d.get('agent_id') or ''))
+                  else [{'path': '$.agent_id', 'message': 'must match ' + agent_id_pattern}])
+               + ([] if _range_ok
+                  else [{'path': '$.harness', 'message': 'must be a semver range like ">=0.2 <1.0"'}])
+               + ([] if _profiles and all(isinstance(p, str) and p for p in _profiles)
+                  else [{'path': '$.profiles', 'message': 'must be a non-empty list of profile names'}])
+               + [{'path': '$.profiles', 'message': 'duplicate profile ' + p}
+                  for p in sorted(set(p for p in _profiles if _profiles.count(p) > 1))]
+               + ([{'path': '$.router.default_profile', 'message': 'not one of the profiles: ' + str(_router.get('default_profile'))}]
+                  if _router.get('default_profile') and _router.get('default_profile') not in _profiles else [])
+               + [{'path': '$.router.slash.' + str(k), 'message': 'not one of the profiles: ' + str(v)}
+                  for k, v in (_router.get('slash') or {}).items() if v not in _profiles]
+               + ([{'path': '$.router.custom', 'message': 'must be null or router.<name>'}]
+                  if _router.get('custom') and not str(_router['custom']).startswith('router.') else [])
+               + ([{'path': '$.persona_text', 'message': 'longer than 2000 characters'}]
+                  if len(str(_d.get('persona_text') or '')) > 2000 else [])
+               + [{'path': '$.hooks[' + str(i) + ']',
+                   'message': 'event must be one of ' + ', '.join(hook_events) + ', mode sync|async, and a wfspec'}
+                  for i, h in enumerate(_d.get('hooks') or [])
+                  if not (isinstance(h, dict) and h.get('event') in hook_events
+                          and h.get('mode', 'sync') in ['sync', 'async'] and h.get('wfspec'))]
+               + [{'path': '$.profile_overrides.' + str(k), 'message': 'not one of the profiles'}
+                  for k in (_d.get('profile_overrides') or {}) if k not in _profiles]
+               + [{'path': '$.access.' + k,
+                   'message': ('computed by agent-config resolve, never set' if k in ['caller_is_namespace_admin', 'namespace_id']
+                               else 'must be true or false' if k == 'namespace_admins' else 'must be a list')}
+                  for k, v in ((_d.get('access') or {}).items() if isinstance(_d.get('access'), dict) else [])
+                  if (not isinstance(v, bool) if k == 'namespace_admins'
+                      else k in ['caller_is_namespace_admin', 'namespace_id'] or not isinstance(v, list))] }}
+
+  validate-profile:
+    input:
+      profile: {}
+    output:
+      errors: "{{ errors }}"
+    main:
+      task_name: check-profile
+      set:
+        - _p: "{{ profile if isinstance(profile, dict) else {} }}"
+        - _n: "{{ '$.profiles.' + str(_p.get('name')) }}"
+        - _loop: "{{ _p.get('loop') or {} }}"
+        - errors: >-
+            {{ ([{'path': _n + '.kind', 'message': 'must be loop or wfspec'}]
+                if _p.get('kind') not in ['loop', 'wfspec'] else [])
+               + ([{'path': _n + '.loop.prompt', 'message': 'a loop profile needs a prompt'}]
+                  if _p.get('kind') == 'loop' and not _loop.get('prompt') else [])
+               + ([{'path': _n + '.loop.max_steps', 'message': 'more than one step needs tools'}]
+                  if int(_loop.get('max_steps') or 1) > 1 and not _loop.get('tools') else [])
+               + ([{'path': _n + '.loop.retrieval', 'message': 'retrieval before the call needs requires.sources'}]
+                  if (_loop.get('retrieval') or {}).get('when') == 'before'
+                     and not (_p.get('requires') or {}).get('sources') else [])
+               + ([{'path': _n + '.wfspec', 'message': 'a wfspec profile names its wfspec'}]
+                  if _p.get('kind') == 'wfspec' and not (_p.get('wfspec') or {}).get('name') else [])
+               + ([{'path': _n + '.mode', 'message': 'async is only for kind wfspec'}]
+                  if _p.get('mode') == 'async' and _p.get('kind') != 'wfspec' else [])
+               + ([{'path': _n + '.estimated_sec', 'message': 'exceeds budget_sec'}]
+                  if (_p.get('estimated_sec') or 0) > (_p.get('budget_sec') or 0) else []) }}
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "agent-registry: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # VALIDATE — pure; for CI and agent-admin save_config.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-validate
+      skip_if: "{{ mode != 'validate' }}"
+      workflow:
+        function: validate-definition
+        input:
+          definition: "{{ definition }}"
+          agent_id_pattern: "{{ agent_id_pattern }}"
+          hook_events: "{{ hook_events }}"
+      output:
+        set:
+          - ok: true
+          - data: "{{ {'valid': not _['errors'], 'errors': _['errors']} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST — deployed agent packages in this namespace.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-list
+      skip_if: "{{ mode != 'list' }}"
+      tasks:
+        - task_name: list-packages
+          activity:
+            type: builtin.deploy.wfspec.list
+            input: {}
+            options:
+              retry_policy: {timeout_sec: 20, max_attempts: 2}
+          output:
+            set:
+              - agent_ids: >-
+                  {{ sorted(str(p['name'])[len('agent-'):] for p in (_ or [])
+                            if isinstance(p, dict) and str(p.get('name', '')).startswith('agent-')
+                               and not str(p['name']).startswith(harness_prefix)) }}
+        - task_name: describe-agents
+          loop:
+            in: "{{ agent_ids }}"
+            foreach: aid
+            execute_mode: parallel
+            do:
+              task_name: describe-agent
+              workflow:
+                ref: "agent-{{ aid }}/agent.{{ aid }}"
+                mode: inline
+              output:
+                data:
+                  agent_id: "{{ aid }}"
+                  package: "agent-{{ aid }}"
+                  display_name: "{{ ((_ or {}).get('definition') or {}).get('display_name') }}"
+                  version: "{{ (_ or {}).get('version') }}"
+              # One broken agent package must not hide the others.
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - _broken: true
+                  output:
+                    data: {agent_id: "{{ aid }}", package: "agent-{{ aid }}", display_name: null, version: null}
+          output:
+            set:
+              - ok: true
+              - data: "{{ {'agents': list(_ or [])} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LOAD
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-load
+      skip_if: "{{ mode != 'load' }}"
+      tasks:
+        - task_name: check-agent-id
+          set:
+            - aid: '{{ str(agent_id or "").strip() }}'
+            - valid#: "{{ bool(re.fullmatch(agent_id_pattern, aid)) }}"
+            - error: >-
+                {{ None if valid else
+                   {'code': 'invalid_input', 'message': 'agent_id must match ' + agent_id_pattern, 'retryable': False} }}
+
+        - task_name: load-agent
+          skip_if: "{{ not valid }}"
+          tasks:
+            - task_name: catalog-agent
+              workflow:
+                ref: package-catalog
+                mode: sync
+                input: {package_name: "agent-{{ aid }}"}
+                options:
+                  retry_policy: {timeout_sec: 60, max_attempts: 1}
+              output:
+                set:
+                  - cat_agent: "{{ _ or {} }}"
+
+            - task_name: catalog-harness
+              workflow:
+                ref: package-catalog
+                mode: sync
+                input: {package_name: "{{ harness_package }}"}
+                options:
+                  retry_policy: {timeout_sec: 60, max_attempts: 1}
+              output:
+                set:
+                  - cat_harness: "{{ _ or {} }}"
+
+            - task_name: catalog-library
+              workflow:
+                ref: package-catalog
+                mode: sync
+                input: {package_name: "{{ library_package }}"}
+                options:
+                  retry_policy: {timeout_sec: 60, max_attempts: 1}
+              output:
+                set:
+                  - cat_library: "{{ _ or {} }}"
+
+            - task_name: reject-undeployed-agent
+              raise:
+                if: "{{ ('agent.' + aid) not in (cat_agent.get('wfspecs') or []) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent '{{ aid }}' is not deployed for this user (no agent.{{ aid }} in package agent-{{ aid }})"
+
+            - task_name: load-definition
+              workflow:
+                ref: "agent-{{ aid }}/agent.{{ aid }}"
+                mode: inline
+              output:
+                set:
+                  - definition: "{{ (_ or {}).get('definition') or {} }}"
+
+            - task_name: validate-loaded
+              workflow:
+                function: validate-definition
+                input:
+                  definition: "{{ definition }}"
+                  agent_id_pattern: "{{ agent_id_pattern }}"
+                  hook_events: "{{ hook_events }}"
+              output:
+                set:
+                  - def_errors: "{{ _['errors'] + ([] if definition.get('agent_id') == aid else [{'path': '$.agent_id', 'message': 'agent.' + aid + ' declares ' + str(definition.get('agent_id'))}]) }}"
+
+            - task_name: reject-invalid-definition
+              raise:
+                if: "{{ bool(def_errors) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} is invalid: {{ '; '.join(e['path'] + ' ' + e['message'] for e in def_errors) }}"
+
+            # `harness` is a range of `op version` tokens, every one must hold.
+            - task_name: check-harness
+              set:
+                # Not __sys_info__.wfspec_version: that is this package's (foundation's).
+                - harness_version#: "{{ cat_harness.get('version') }}"
+                - _v: "{{ tuple(int(x) for x in str(harness_version).split('.')[:3]) if harness_version else None }}"
+                - harness_ok: >-
+                    {{ _v is None or all(
+                         (lambda op, w: {'>=': _v >= w, '<=': _v <= w, '>': _v > w, '<': _v < w,
+                                         '=': _v[:len(w)] == w, '': _v[:len(w)] == w}[op])(
+                           re.match(r'(>=|<=|>|<|=)?', t).group(1) or '',
+                           tuple(int(x) for x in re.sub(r'^(>=|<=|>|<|=)', '', t).split('.')))
+                         for t in definition['harness'].split()) }}
+
+            - task_name: reject-incompatible-harness
+              raise:
+                if: "{{ not harness_ok }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} needs harness {{ definition['harness'] }}, deployed is {{ harness_version }}"
+
+            # Agent-local first, then the library.
+            - task_name: locate-profiles
+              set:
+                - profile_refs: >-
+                    {{ {p: ('agent-' + aid + '/profile.' + aid + '.' + p)
+                              if ('profile.' + aid + '.' + p) in (cat_agent.get('wfspecs') or [])
+                           else (library_package + '/profile.' + p)
+                              if ('profile.' + p) in (cat_library.get('wfspecs') or [])
+                           else None
+                        for p in definition['profiles']} }}
+                - missing_profiles: "{{ [p for p, r in profile_refs.items() if r is None] }}"
+
+            - task_name: reject-missing-profiles
+              raise:
+                if: "{{ bool(missing_profiles) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} enables profile(s) that are not deployed: {{ ', '.join(missing_profiles) }}"
+
+            - task_name: load-profiles
+              loop:
+                in: "{{ sorted(profile_refs.items()) }}"
+                foreach: entry
+                execute_mode: parallel
+                do:
+                  task_name: load-profile
+                  workflow:
+                    ref: "{{ entry[1] }}"
+                    mode: inline
+                  output:
+                    data: "{{ [entry[0], (_ or {}).get('profile') or {}] }}"
+              output:
+                set:
+                  - loaded_profiles: "{{ dict(_ or []) }}"
+
+            # Field by field for dicts, replace otherwise (the same rule as config,
+            # §6.1.1). A self-applied lambda, applied in place, never bound.
+            - task_name: merge-profiles
+              set:
+                - profiles: >-
+                    {{ (lambda m: {p: dict(m(loaded_profiles.get(p) or {},
+                                             (definition.get('profile_overrides') or {}).get(p) or {}), name=p)
+                                   for p in definition['profiles']})(
+                         (lambda f: (lambda a, b: f(f, a, b)))(
+                           lambda self, a, b: dict(a, **{
+                             k: (self(self, a[k], v) if isinstance(a.get(k), dict) and isinstance(v, dict) else v)
+                             for k, v in b.items()}))) }}
+
+            - task_name: validate-profiles
+              loop:
+                in: "{{ [profiles[p] for p in definition['profiles']] }}"
+                foreach: prof
+                do:
+                  task_name: validate-one-profile
+                  workflow:
+                    function: validate-profile
+                    input: {profile: "{{ prof }}"}
+                  output:
+                    data: "{{ _['errors'] }}"
+              output:
+                set:
+                  - profile_errors: "{{ [e for errs in (_ or []) for e in (errs or [])] }}"
+
+            - task_name: reject-invalid-profiles
+              raise:
+                if: "{{ bool(profile_errors) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} has invalid profile(s): {{ '; '.join(e['path'] + ' ' + e['message'] for e in profile_errors) }}"
+
+            - task_name: harness-prompt-catalog
+              workflow:
+                ref: prompt-render
+                mode: inline
+                input: {mode: list}
+              output:
+                set:
+                  - harness_prompts: "{{ [e['name'] for e in ((_ or {}).get('data') or [])] }}"
+
+            - task_name: resolve-names
+              workflow:
+                ref: prompt-render
+                mode: inline
+                input:
+                  mode: resolve_names
+                  agent_id: "{{ aid }}"
+                  names: >-
+                    {{ sorted(set(harness_prompts
+                                  + ([definition['persona_prompt']] if definition.get('persona_prompt') else [])
+                                  + [((p.get('loop') or {}).get('prompt')) for p in profiles.values()
+                                     if (p.get('loop') or {}).get('prompt')])) }}
+                  overrides: "{{ (definition.get('prompts') or {}).get('overrides') or {} }}"
+                  catalogs: {agent: "{{ cat_agent }}", harness: "{{ cat_library }}"}
+              output:
+                set:
+                  - resolved: "{{ (_ or {}).get('data') or {} }}"
+
+            - task_name: reject-missing-prompts
+              raise:
+                if: "{{ bool(resolved.get('missing')) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} uses prompt(s) that are not deployed: {{ ', '.join(resolved['missing']) }}"
+
+            # The other extensions a definition names, wherever they live.
+            - task_name: check-extensions
+              set:
+                - _known: "{{ set((cat_agent.get('wfspecs') or []) + (cat_library.get('wfspecs') or [])) }}"
+                - _named: >-
+                    {{ ([('router.custom', (definition.get('router') or {}).get('custom'))]
+                        if (definition.get('router') or {}).get('custom') else [])
+                       + [('hooks', h.get('wfspec')) for h in (definition.get('hooks') or [])]
+                       + [('context.providers', 'context.' + str(c))
+                          for c in ((definition.get('context') or {}).get('providers') or [])
+                          if c not in builtin_providers]
+                       + [('profiles.' + n + '.wfspec', (p.get('wfspec') or {}).get('name'))
+                          for n, p in profiles.items() if p.get('kind') == 'wfspec'] }}
+                - missing_extensions: >-
+                    {{ [where + ': ' + str(name) for where, name in _named
+                        if name not in _known and not ('/' in str(name) and str(name).startswith(harness_prefix))] }}
+
+            - task_name: reject-missing-extensions
+              raise:
+                if: "{{ bool(missing_extensions) }}"
+                type: error
+                error_type: AbortError
+                message: "agent-registry: agent.{{ aid }} references wfspec(s) that are not deployed: {{ ', '.join(missing_extensions) }}"
+
+            - task_name: shape-load
+              set:
+                - ok: true
+                - data:
+                    definition: "{{ definition }}"
+                    profiles: "{{ profiles }}"
+                    profile_refs: "{{ profile_refs }}"
+                    resolved_refs: "{{ resolved['resolved_refs'] }}"
+                    versions: {agent: "{{ cat_agent.get('version') }}", harness: "{{ harness_version }}"}

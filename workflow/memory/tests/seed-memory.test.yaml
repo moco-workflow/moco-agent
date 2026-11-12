@@ -1,0 +1,61 @@
+test_type: integration-test
+
+# seed-memory (plan-17 step 11, design §6.16): curated agent-scope items from an agent
+# package, pinned; an unchanged item is left alone (no mem-version bump); no data → nothing.
+
+wfspec:
+  name: seed-memory
+
+test_data:
+  cfg: &cfg {ok: true, data: {config: {access: {admin_user_ids: [u1]}}}}
+  catalog: &catalog {package: agent-moco, version: "1.0.0", wfspecs: [agent.moco, memory.moco]}
+  seed: &seed {items: [{kind: fact, title: "Clusters are in eu-west", text: "All clusters run in eu-west-1.", tags: [Clusters, region]}]}
+
+test_cases:
+  - id: a-new-item-is-saved-pinned-to-the-agent-scope
+    input: {agent_id: moco}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: read-stored-item, _: {ok: false, error: {code: not_found}}}
+      - {step_name: save-item, _: {ok: true, data: {item: {key: "mem:fact:clusters-are-in-eu-west"}, created: true}}}
+    expect:
+      output:
+        - ok: true
+        - data: {source: agent-moco/memory.moco, items: [{key: "mem:fact:clusters-are-in-eu-west", action: saved, error: null}]}
+
+  - id: an-unchanged-item-is-left-alone
+    input: {agent_id: moco}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: read-stored-item, _: {ok: true, data: {item: {status: active, title: "Clusters are in eu-west", text: "All clusters run in eu-west-1.", tags: [clusters, region]}}}}
+      - {step_name: save-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['items'][0]['action'] == 'unchanged' }}"
+
+  - id: an-agent-without-memory-data-has-nothing-to-seed
+    input: {agent_id: moco}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: {package: agent-moco, version: "1.0.0", wfspecs: [agent.moco]}}
+      - {step_name: load-seed, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {source: null, items: []}
+
+  - id: a-failed-save-is-reported
+    input: {agent_id: moco}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: read-stored-item, _: {ok: false}}
+      - {step_name: save-item, _: {ok: false, error: {code: forbidden, message: "not admin"}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'seed_failed' and data['items'][0]['action'] == 'failed' }}"

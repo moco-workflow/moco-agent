@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# DEMO-WORD-COUNT — count the words of a text; a workflow tool (header.metadata.tool)
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: demo-word-count
+  metadata:
+    tool:
+      name: count_words
+      description: "Count the words and characters of a text exactly. Use when the user asks how long a text is."
+      parameters:
+        type: object
+        properties:
+          text: {type: string, description: "The text to count."}
+        required: [text]
+      side_effects: none
+      timeout_sec: 30
+
+input:
+  text: ""
+
+output:
+  words: "{{ words }}"
+  characters: "{{ characters }}"
+
+main:
+  task_name: count
+  set:
+    - words: "{{ len(str(text).split()) }}"
+    - characters: "{{ len(str(text)) }}"

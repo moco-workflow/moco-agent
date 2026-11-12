@@ -1,0 +1,41 @@
+test_type: integration-test
+
+# admin.pending (plan-16 phase 2, plan-12 step 8): list via hitl; resolve through
+# agent-cli's action payload, so the UI and chat share one path in the entity.
+
+wfspec:
+  name: admin.pending
+
+test_cases:
+  - id: list-pending-reads-hitl
+    input: {op: list_pending, agent_id: ops}
+    mocks:
+      - {step_name: list-pending, _: {ok: true, data: {pending: [{id: pa-s1-2}]}}}
+    expect:
+      output:
+        - ok: true
+        - data: {pending: [{id: pa-s1-2}]}
+
+  - id: resolve-pending-sends-the-decision-through-agent-cli
+    input: {op: resolve_pending, agent_id: ops, session_id: s1, decision: approve}
+    mocks:
+      - {step_name: send-decision, _: {status: ok, answer: "Done.", turn: 3}}
+    expect:
+      assert:
+        - "{{ ok == True and data['answer'] == 'Done.' }}"
+
+  - id: a-busy-session-is-an-error
+    input: {op: resolve_pending, agent_id: ops, session_id: s1, decision: reject}
+    mocks:
+      - {step_name: send-decision, _: {status: busy, answer: "still working"}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'busy' }}"
+
+  - id: an-unknown-decision-is-invalid-input
+    input: {op: resolve_pending, agent_id: ops, session_id: s1, decision: maybe}
+    mocks:
+      - {step_name: send-decision, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"

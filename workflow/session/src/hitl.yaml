@@ -1,0 +1,234 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# HITL — the pending-action row and its lifecycle (design §6.11, plan-12)
+# ================================================================================
+#
+#   mode     in                                             data out
+#   ──────── ────────────────────────────────────────────── ───────────────────────────
+#   open     session_id, turn, kind, profile, summary,       {pending}  (id, expires_at)
+#            detail, offer_session_grant?, ttl_sec
+#   get      session_id                                     {pending}  (null when none)
+#   resolve  session_id, id, decision, feedback?            {resume: {pending_action, decision,
+#                                                             feedback, approval_token}, pending}
+#   expire   session_id, force?                             {expired: bool, pending}
+#   cancel   session_id                                     {cancelled: bool, pending}
+#   list     —                                              {pending: [row, ...]}  (awaiting only)
+#
+# ONE OWNER (§4.3): only this wfspec touches `session:<sid>:pending`, topic
+# session-pending, in `<uid>:agent.<id>.sessions` -- one row per session, so at most
+# one action is open. Its live writer is the session entity (open in finalizing,
+# resolve in resuming, expire on idle_tick, cancel on delete); session-housekeep
+# (run as the same user) expires rows of sessions it retires, and agent-admin only lists.
+#
+# ROW  {schema_version: 1, id: pa-<sid>-<turn>[-<n>], session_id, turn, kind, profile,
+#       status, summary, detail (opaque: returned to the profile on resume),
+#       offer_session_grant, decision: null | {decision, feedback, by, ts},
+#       created_at, expires_at, updated_at}
+#
+# LIFECYCLE (row state machine; anything else is ok: false, invalid_state):
+#   open ─▶ awaiting ──resolve──▶ resolved
+#              ├──expire (now > expires_at, or force)──▶ expired
+#              └──cancel──▶ cancelled
+# The decision is a field, not a status. `open` fails with already_open while a row
+# is awaiting. A revision is a new row: `revise` resolves this one, and if the
+# profile suspends again in the same turn the new id gets a `-<n>` suffix.
+#
+# DECISIONS by kind:
+#   tool_call   approve | approve_session (only when offer_session_grant) | reject | revise
+#   user_input  reply | reject
+# `resolve` on an overdue row writes `expired` and returns code expired: an answer
+# that came too late never runs the call. approval_token = id + ':' + the held
+# call's args_hash, only for approve / approve_session -- tool-executor recomputes
+# the hash from the call it runs, so an approval cannot be replayed for changed
+# arguments.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: hitl
+
+context:
+  valid_modes: ["open", "get", "resolve", "expire", "cancel", "list"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  decisions_by_kind:
+    tool_call: ["approve", "approve_session", "reject", "revise"]
+    user_input: ["reply", "reject"]
+  default_decisions: ["approve", "reject", "revise"]
+  default_ttl_sec: 86400
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  ok: false
+  data:
+  error:
+  current:
+  rows: []
+
+input:
+  mode: get
+  agent_id:
+  session_id:
+  turn: 0
+  kind:
+  profile:
+  summary: ""
+  detail: {}
+  offer_session_grant: false
+  ttl_sec:
+  id:
+  decision:
+  feedback:
+  force: false
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "hitl: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - sid: '{{ str(session_id or "").strip() }}'
+        - sessions_ns: "{{ 'agent.' + aid + '.sessions' }}"
+        - key: "session:{{ sid }}:pending"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'session_id must match ' + session_id_pattern if mode != 'list' and not re.match(session_id_pattern, sid) else
+               'open needs a kind' if mode == 'open' and not kind else None }}
+        - proceed: "{{ _bad is None }}"
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+        - now_dt: "{{ now() }}"
+        - now_iso: "{{ now_dt.isoformat() }}"
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+
+    # ── list ────────────────────────────────────────────────────────────────
+
+    - task_name: mode-list
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      tasks:
+        - task_name: list-pending-keys
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key_pattern: "session:*:pending", topic_pattern: session-pending}
+          output:
+            set:
+              - pending_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: read-pending-rows
+          loop:
+            in: "{{ pending_keys }}"
+            foreach: pending_key
+            execute_mode: parallel
+            do:
+              task_name: read-pending-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ pending_key }}"}
+          output:
+            set:
+              - rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('status') == 'awaiting'] }}"
+        - task_name: shape-list
+          set:
+            - ok: true
+            - data: "{{ {'pending': sorted(rows, key=lambda r: str(r.get('created_at')))} }}"
+
+    # ── one row ─────────────────────────────────────────────────────────────
+    - task_name: mode-row
+      skip_if: "{{ not proceed or mode == 'list' }}"
+      tasks:
+        - task_name: read-current
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ key }}"}
+          output:
+            set:
+              - current: >-
+                  {{ _ if isinstance(_, dict) and _.get('schema_version', 0) in supported_schema_versions else None }}
+
+        - task_name: plan-row
+          set:
+            - _status: "{{ (current or {}).get('status') }}"
+            - _overdue: >-
+                {{ _status == 'awaiting' and bool((current or {}).get('expires_at'))
+                   and now_dt.replace(tzinfo=None) > dt.datetime.fromisoformat(str(current['expires_at'])).replace(tzinfo=None) }}
+            - _base: "pa-{{ sid }}-{{ turn }}"
+            - _prev: "{{ str((current or {}).get('id') or '') }}"
+            - _n: >-
+                {{ (int(_prev.rsplit('-', 1)[1]) + 1 if re.fullmatch(re.escape(_base) + r'-\d+', _prev) else 2)
+                   if _prev == _base or re.fullmatch(re.escape(_base) + r'-\d+', _prev) else None }}
+            - _allowed: >-
+                {{ decisions_by_kind.get((current or {}).get('kind'), default_decisions) }}
+            - dec: '{{ str(decision or "") }}'
+            - problem#: >-
+                {{ None if mode == 'get' else
+                   ('already_open', 'an action is already waiting in this session: ' + _prev)
+                     if mode == 'open' and _status == 'awaiting' and not _overdue else
+                   ('not_found', 'no pending action in session ' + sid)
+                     if mode in ['resolve', 'expire', 'cancel'] and current is None else
+                   ('invalid_state', 'the pending action ' + _prev + ' is ' + str(_status))
+                     if mode in ['resolve', 'cancel'] and _status != 'awaiting' else
+                   ('invalid_state', 'the pending action is ' + _prev + ', not ' + str(id))
+                     if mode == 'resolve' and str(id or '') != _prev else
+                   ('expired', 'the pending action ' + _prev + ' expired before the answer came')
+                     if mode == 'resolve' and _overdue else
+                   ('invalid_input', 'decision must be one of ' + ', '.join(_allowed))
+                     if mode == 'resolve' and (dec not in _allowed
+                        or (dec == 'approve_session' and not (current or {}).get('offer_session_grant'))) else
+                   ('invalid_state', 'the pending action ' + _prev + ' is ' + str(_status))
+                     if mode == 'expire' and _status != 'awaiting' else None }}
+            # expire: only when due (or forced); otherwise nothing changes.
+            - expire_now: "{{ mode == 'expire' and problem is None and (_overdue or force is True) }}"
+            - _ttl: "{{ int(ttl_sec) if ttl_sec else default_ttl_sec }}"
+            - new_row: >-
+                {{ None if problem is not None and not (mode == 'resolve' and problem[0] == 'expired') else
+                   {'schema_version': schema_version,
+                    'id': _base if _n is None else _base + '-' + str(_n),
+                    'session_id': sid, 'turn': turn, 'kind': kind, 'profile': profile, 'status': 'awaiting',
+                    'summary': str(summary or ''), 'detail': detail or {},
+                    'offer_session_grant': offer_session_grant is True, 'decision': None,
+                    'created_at': now_iso,
+                    'expires_at': (now_dt + dt.timedelta(seconds=_ttl)).isoformat(), 'updated_at': now_iso}
+                     if mode == 'open' else
+                   dict(current, status='expired', updated_at=now_iso)
+                     if (mode == 'resolve' and problem is not None) or expire_now else
+                   dict(current, status='resolved', updated_at=now_iso,
+                        decision={'decision': dec, 'feedback': feedback, 'by': uid, 'ts': now_iso})
+                     if mode == 'resolve' else
+                   dict(current, status='cancelled', updated_at=now_iso)
+                     if mode == 'cancel' else None }}
+
+        - task_name: write-row
+          skip_if: "{{ new_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ sessions_ns }}"
+              key: "{{ key }}"
+              value: "{{ new_row }}"
+              topic: session-pending
+
+        - task_name: shape-row
+          set:
+            - ok: "{{ problem is None }}"
+            - error: "{{ None if problem is None else {'code': problem[0], 'message': problem[1], 'retryable': False} }}"
+            - _row: "{{ new_row if new_row is not None else current }}"
+            - data: >-
+                {{ None if problem is not None else
+                   {'pending': current} if mode == 'get' else
+                   {'pending': new_row} if mode == 'open' else
+                   {'resume': {'pending_action': new_row, 'decision': dec, 'feedback': feedback,
+                               'approval_token': (new_row['id'] + ':' + str(((new_row.get('detail') or {}).get('args_hash')) or ''))
+                                                 if dec in ['approve', 'approve_session'] else None},
+                    'pending': new_row} if mode == 'resolve' else
+                   {'expired': expire_now, 'pending': _row} if mode == 'expire' else
+                   {'cancelled': True, 'pending': new_row} }}

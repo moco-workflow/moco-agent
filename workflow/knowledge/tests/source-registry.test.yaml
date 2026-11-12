@@ -1,0 +1,293 @@
+test_type: integration-test
+
+# source-registry (plan-06 steps 1-2, design §6.5.2): the row lifecycle, every legal
+# and illegal transition, table naming, the access check on writes, and patch (refresh
+# settings and the shadow-table swap, phase 3). State reads
+# and writes and the access check are mocked by task name.
+
+wfspec:
+  name: source-registry
+
+test_data:
+  allow: &allow {ok: true, data: {allow: true, reason: ok}}
+  deny: &deny {ok: true, data: {allow: false, reason: not_admin}}
+  row_indexing: &row_indexing
+    {schema_version: 1, name: moco-docs, kind: pgvector, scope: shared, status: indexing, table_name: kb_moco_docs, node_count: 0}
+  row_ready: &row_ready
+    {schema_version: 1, name: moco-docs, kind: pgvector, scope: shared, status: ready, table_name: kb_moco_docs, node_count: 120}
+  row_refreshing: &row_refreshing
+    {schema_version: 1, name: moco-docs, kind: pgvector, scope: shared, status: ready, table_name: kb_moco_docs, node_count: 120,
+     refreshing: {table_name: kbr_moco_docs, started_at: "2026-10-16T10:00:00"}}
+  row_failed: &row_failed
+    {schema_version: 1, name: moco-docs, kind: pgvector, scope: shared, status: failed, table_name: kb_moco_docs, refresh: {sources: [{kind: site}]}}
+  row_deleting: &row_deleting
+    {schema_version: 1, name: moco-docs, kind: pgvector, scope: shared, status: deleting, table_name: kb_moco_docs}
+
+test_cases:
+
+  # ── register ────────────────────────────────────────────────────────────
+  - id: register-creates-an-indexing-row-with-a-shared-table-name
+    input: {mode: register, name: moco-docs, scope: shared, description: "Moco docs", keywords: [workflow], embed_model_info: {model_name: nomic-embed-text}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['source']['status'] == 'indexing' and data['source']['table_name'] == 'kb_moco_docs' }}"
+        - "{{ data['source']['schema_version'] == 1 and data['source']['keywords'] == ['workflow'] }}"
+
+  - id: a-private-table-name-carries-a-user-checksum-not-the-user-id
+    input: {mode: register, name: my-notes, scope: private}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ bool(re.fullmatch(r'kb_u_[0-9a-f]{8}_my_notes', data['source']['table_name'])) }}"
+
+  - id: registering-an-existing-source-is-invalid-state
+    input: {mode: register, name: moco-docs, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' }}"
+
+  - id: a-non-admin-cannot-write-a-shared-source
+    input: {mode: register, name: moco-docs, scope: shared}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *deny}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: forbidden, message: "not allowed to write shared sources (not_admin)", retryable: false}
+
+  # ── transitions: legal ──────────────────────────────────────────────────
+  - id: indexing-to-ready-with-a-patch
+    input: {mode: transition, name: moco-docs, scope: shared, to: ready, patch: {node_count: 120, indexed_at: "2026-10-06T10:00:00"}}
+    mocks:
+      - {step_name: read-current, _: *row_indexing}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['source']['status'] == 'ready' and data['source']['node_count'] == 120 and data['source']['table_name'] == 'kb_moco_docs' }}"
+
+  - id: indexing-to-failed-records-the-error
+    input: {mode: transition, name: moco-docs, scope: shared, to: failed, patch: {error: "embedding endpoint down"}}
+    mocks:
+      - {step_name: read-current, _: *row_indexing}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['source']['status'] == 'failed' and data['source']['error'] == 'embedding endpoint down' }}"
+
+  - id: ready-to-indexing-is-a-reindex
+    input: {mode: transition, name: moco-docs, scope: shared, to: indexing}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['source']['status'] == 'indexing' }}"
+
+  - id: deleting-to-removed-deletes-the-row
+    input: {mode: transition, name: moco-docs, scope: shared, to: removed}
+    mocks:
+      - {step_name: read-current, _: *row_deleting}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-row, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {source: null}
+
+  # ── transitions: illegal ────────────────────────────────────────────────
+  - id: ready-cannot-jump-to-removed
+    input: {mode: transition, name: moco-docs, scope: shared, to: removed}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: delete-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "source moco-docs: ready -> removed is not a legal transition", retryable: false}
+
+  - id: indexing-cannot-be-deleted-mid-index
+    input: {mode: transition, name: moco-docs, scope: shared, to: deleting}
+    mocks:
+      - {step_name: read-current, _: *row_indexing}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-patch-cannot-change-protected-fields
+    input: {mode: transition, name: moco-docs, scope: shared, to: ready, patch: {table_name: kb_other}}
+    mocks:
+      - {step_name: read-current, _: *row_indexing}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: transitioning-an-unknown-source-is-not-found
+    input: {mode: transition, name: nope, scope: shared, to: ready}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  # ── get / list / guards ─────────────────────────────────────────────────
+  - id: get-returns-the-row-or-not-found
+    input: {mode: get, name: moco-docs, scope: shared}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      output:
+        - ok: false
+        - error: {code: not_found, message: "no shared source moco-docs", retryable: false}
+
+  - id: list-reads-both-scopes-and-filters-by-status
+    input: {mode: list, scope: both, status: ready}
+    mocks:
+      - {step_name: list-shared-keys, _: [{key: "source:moco-docs", topic: source}]}
+      - {step_name: list-private-keys, _: [{key: "source:my-notes", topic: source}]}
+      - {step_name: read-row, _: *row_ready}
+    expect:
+      assert:
+        - "{{ ok == True and len(data['sources']) == 2 and all(s['status'] == 'ready' for s in data['sources']) }}"
+
+  - id: a-bad-name-is-invalid-input
+    input: {mode: get, name: "../x", scope: shared}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  # ── kind: wfspec (phase 2) ──────────────────────────────────────────────
+  - id: a-wfspec-source-row-names-its-retriever-and-has-no-table
+    input: {mode: register, name: jira-kb, scope: shared, kind: wfspec, wfspec_name: source.jira-kb, source_config: {project: MOCO}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: true, reason: ok}}}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['source']['kind'] == 'wfspec' and data['source']['wfspec'] == {'name': 'source.jira-kb'} and data['source']['table_name'] is None }}"
+        - "{{ data['source']['config'] == {'project': 'MOCO'} }}"
+
+  - id: a-wfspec-source-must-name-a-source-retriever
+    input: {mode: register, name: jira-kb, scope: shared, kind: wfspec, wfspec_name: agent-session}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: true, reason: ok}}}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  # ── patch (phase 3): no transition ──────────────────────────────────────
+  - id: patch-starts-a-refresh-on-a-ready-row-without-changing-status
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {refreshing: {table_name: kbr_moco_docs, started_at: "2026-10-16T10:00:00"}}}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['source']['status'] == 'ready' and data['source']['refreshing']['table_name'] == 'kbr_moco_docs' }}"
+
+  - id: the-swap-applies-while-still-refreshing-into-that-table
+    input: {mode: patch, name: moco-docs, scope: shared, if_refreshing: kbr_moco_docs, patch: {table_name: kbr_moco_docs, node_count: 140, refreshing: null}}
+    mocks:
+      - {step_name: read-current, _: *row_refreshing}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['table_name'] == 'kbr_moco_docs' and data['source']['refreshing'] is None and data['source']['node_count'] == 140 }}"
+
+  - id: a-stale-swap-is-invalid-state
+    input: {mode: patch, name: moco-docs, scope: shared, if_refreshing: kbr_moco_docs, patch: {table_name: kbr_moco_docs}}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' }}"
+
+  - id: table-name-only-moves-within-its-pair
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {table_name: kb_someone_else}}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' and 'kbr_moco_docs' in error['message'] }}"
+
+  - id: refresh-settings-patch-a-failed-row-but-a-swap-needs-ready
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {refresh: {sources: [{kind: site}], every_hours: 24}}}
+    mocks:
+      - {step_name: read-current, _: *row_failed}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['status'] == 'failed' and data['source']['refresh']['every_hours'] == 24 }}"
+
+  - id: a-failed-row-cannot-start-a-refresh
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {refreshing: {table_name: kbr_moco_docs}}}
+    mocks:
+      - {step_name: read-current, _: *row_failed}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' }}"
+
+  - id: patch-refuses-other-fields-and-an-indexing-row
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {status: ready}}
+    mocks:
+      - {step_name: read-current, _: *row_indexing}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: patch-needs-an-admin-for-a-shared-source
+    input: {mode: patch, name: moco-docs, scope: shared, patch: {refresh: {sources: []}}}
+    mocks:
+      - {step_name: read-current, _: *row_ready}
+      - {step_name: authorize-write, _: *deny}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: a-reindex-clears-an-in-flight-refresh
+    input: {mode: transition, name: moco-docs, scope: shared, to: indexing}
+    mocks:
+      - {step_name: read-current, _: *row_refreshing}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['status'] == 'indexing' and data['source']['refreshing'] is None }}"
+

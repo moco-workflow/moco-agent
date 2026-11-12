@@ -1,0 +1,769 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-PROVIDER — sources of tools, kept in sync (design §6.9.4)
+# ================================================================================
+#
+# Three KINDS, one pipeline (listing → include allowlist → manifests → drift):
+#   mcp       an MCP server's tools (mcp.list_tools)
+#   activity  moco activities (builtin.activity.list_manifests), held to tool-registry's
+#             activity allowlist and per-type minimum side effects (activity_rules)
+#   workflow  deployed wfspecs that opted in with header.metadata.tool, collected by
+#             `moco publish` into their package manifest (`manifest.tools`); listed with
+#             builtin.deploy.query.get_user_deployments as the calling admin
+# Each kind's listing is normalised to the MCP shape {hash, server, tools: [{name,
+# title, description, input_schema, hash}]}, so drift and the row work the same.
+#
+#   mode          in                                          data out
+#   ───────────── ─────────────────────────────────────────── ──────────────────────────
+#   preview       kind?, endpoint, credential?                {server, tools: [{name, description,
+#                                                               hash, ...}]}  (nothing stored)
+#   register      name, scope, kind?, endpoint, credential?,   {provider, imported, import_errors}
+#                 import_spec (the row's `import`), sync?
+#                                                               (then a first sync)
+#   update        name, scope, kind, endpoint, credential?,    {provider, imported, deleted,
+#                 import_spec, sync?                            import_errors}
+#   sync          name, scope                                 {provider, imported, disabled,
+#                                                               import_errors, drift}
+#   accept_drift  name, scope                                 {provider, imported, import_errors}
+#   reject_drift  name, scope                                 {provider}
+#   disable       name, scope                                 {provider, disabled}
+#   enable        name, scope                                 {provider, imported, import_errors}
+#   delete        name, scope                                 {provider: null, deleted}
+#   list          scope: shared|agent|both                    {providers}
+#   get           name, scope                                 {provider}
+#   every mode    agent_id, config (resolved: access)
+#
+# ONE OWNER (§4.3): only this wfspec reads or writes `tool_provider:<name>` (topic
+# tool-provider): shared in agent-harness, agent scope in agent.<id> (both global, as
+# tool-registry's scopes). The imported TOOLS are tool-registry's rows, written only
+# through its modes (save → validate, disable). Writes and preview need an admin
+# (access write, scope shared|agent).
+#
+# ROW {schema_version: 2, name, kind: mcp|activity|workflow, scope, endpoint (mcp),
+#      credential: {mode: none|service|user, secret_key, connect_hint},
+#      import: {include: [mcp tool name], defaults: {side_effects, permission?,
+#               allow_session_grant?, toolsets?, timeout_sec?}, overrides: {<mcp name>: {...}}},
+#      sync: {every_hours}, status, snapshot: {hash, tools: [{name, description,
+#      input_schema, hash}], server, synced_at}, pending: {hash, tools, added, changed,
+#      removed, detected_at}?, rejected_hash?, tools: [tool name], import_errors,
+#      error, created_at, updated_at, updated_by}
+# schema_version 1 rows (registered before tool names lost their prefix) keep naming
+# their tools <provider>_<tool>, so sync, drift and disable still find them.
+#
+# IMPORT: `import.include` is an allowlist and is required -- nothing a server offers
+# appears unreviewed (preview shows what it offers). `import.defaults.toolsets` is
+# required: every imported tool belongs to a toolset. Each listed tool becomes manifest
+#   <tool>   (lower-cased, [^a-z0-9_] → _; not prefixed: the toolset says where a tool
+#            comes from, and tool-registry refuses to save over a tool of another
+#            origin, so two providers cannot silently collide -- the second one's
+#            tool is an import error)
+#   description, title, parameters = the server's input schema; origin provider:<name>;
+#   policy = import.defaults ∪ import.overrides[<tool>]; defaults.side_effects is
+#   required (a server's own read-only hints are not trusted); tags [<provider>]
+#   binding  credential none     → mcp {endpoint, tool_name, provider}
+#            service | user      → wfspec tool.mcp-call {mcp: {endpoint, tool_name,
+#                                  provider, secret_key, credential_mode}} (F49: an mcp
+#                                  binding takes no secret)
+# saved and validated one by one (sequential, F52). A tool tool-registry refuses (most
+# often a parameter without a JSON type) is listed in import_errors, not enabled.
+#
+# KIND activity: include names activity TYPES (exact; preview lists the allowlisted
+#   ones). Manifest <type with . → _>, binding activity {type,
+#   input_template: overrides[<type>].fixed_input, merge_args: true}: the model's
+#   arguments are the activity input and the admin's fixed values win (connection
+#   secret NAMES, base URLs). side_effects is the provider's (defaults ∪ overrides) or the
+#   type's minimum from tool-registry, whichever is stricter (defaults.side_effects is
+#   optional: the minimum alone is a safe default); preview shows the minimum.
+#   Parameters = the activity's input schema without the fixed
+#   keys, normalised to what tool-registry accepts: a property keeps a plain JSON type;
+#   an anyOf/oneOf whose non-null branches share one type becomes that type; anything
+#   else (Any, a mixed union) is dropped. An oversized schema, or a required parameter
+#   that was dropped and is not fixed, is an import error. No credential.
+# KIND workflow: include names `<package>/<workflow_name>`. Manifest
+#   <tool name>, description and parameters from metadata.tool, binding
+#   wfspec tool.run-workflow {workflow: {ref}, timeout_sec}, execution.mode from the
+#   declaration. side_effects is the declaration's, or the provider's if stricter
+#   (defaults/overrides only tighten). It runs as the calling user (targeting applies).
+#   The hash is the declaration's canonical JSON, so a redeploy that does not change
+#   the declaration is not drift.
+#
+# SYNC (and the hourly tool-provider-sync): the kind's listing with the allowlist. A
+# failed listing → status failed, tools untouched: unreachable is never "all removed".
+#   no snapshot yet (register, enable)   import everything listed → ready
+#   hash == snapshot.hash or == rejected_hash   nothing changed → ready
+#   otherwise DRIFT: per-tool hashes name the added, changed and removed tools; the
+#     changed and removed ones are DISABLED, pending holds the new listing → drifted.
+#     A changed description is what a compromised server would use to inject
+#     instructions, so nothing is updated silently
+# ACCEPT_DRIFT: import pending's added + changed tools, snapshot = pending → ready
+# (removed tools stay disabled). REJECT_DRIFT: → ready, the old snapshot kept, the
+# affected tools stay disabled, and that listing hash is remembered as rejected.
+# DISABLE: → disabled, every imported tool disabled. ENABLE: disabled → a fresh import.
+# UPDATE (ready | failed): replaces endpoint, credential, import and sync, checked as for
+# register (name, scope and kind are the row's identity and do not change), then a fresh
+# import under the new config, as enable does: the snapshot and any rejected hash are
+# dropped, and every listed tool is saved again (so a changed policy or fixed input
+# reaches the manifests). A tool the provider imported before and no longer imports is
+# disabled, then deleted; one the registry will not delete stays listed, disabled. A
+# failed listing keeps the new config, marks the provider failed and touches no tool.
+# DELETE (any status): every imported tool disabled, then deleted from tool-registry, then
+# the row. A tool the registry will not delete (deprecated by hand) keeps the row, as
+# disabled and listing only the tools left, and the call returns invalid_state.
+#
+# LIFECYCLE: register → connecting ─list ok→ ready | ─error→ failed;
+#   ready|failed ─sync→ ready | drifted | failed;  drifted ─accept|reject→ ready;
+#   ready|failed|drifted ─disable→ disabled ─enable→ (import) ready | failed;
+#   ready|failed ─update→ (import) ready | failed;
+#   any ─delete→ (row deleted).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-provider
+
+context:
+  valid_modes: ["preview", "register", "update", "sync", "accept_drift", "reject_drift", "disable", "enable", "delete", "list", "get"]
+  write_modes: ["preview", "register", "update", "sync", "accept_drift", "reject_drift", "disable", "enable", "delete"]
+  list_modes: ["preview", "register", "update", "sync", "enable"]
+  # the modes that take a provider's config (endpoint, credential, import_spec, sync)
+  config_modes: ["register", "update"]
+  valid_scopes: ["shared", "agent"]
+  name_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  toolset_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  secret_pattern: "^(global/)?[A-Za-z0-9_.-]{1,128}$"
+  side_effect_values: ["none", "read", "write", "external"]
+  valid_kinds: ["mcp", "activity", "workflow"]
+  # activity kind: tool-registry's activity_rules (allowlist, minimum side effects per
+  # type), read when needed -- the registry is the authority, so nothing is copied here.
+  act_rules: {}
+  activity_type_pattern: "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+  workflow_ref_pattern: "^[a-z0-9][a-z0-9_.-]{0,63}/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+  json_types: ["string", "number", "integer", "boolean", "array", "object"]
+  from_states:
+    sync: [ready, failed, drifted]
+    accept_drift: [drifted]
+    reject_drift: [drifted]
+    disable: [connecting, ready, failed, drifted]
+    enable: [disabled]
+    update: [ready, failed]
+  schema_version: 2
+  ok: false
+  data:
+  error:
+  row:
+  rows: []
+  provider_keys: []
+  token:
+  listing: {}
+  list_error:
+  to_import: []
+  to_disable: []
+  saved: []
+  validated: []
+  disabled_results: []
+  deleted: []
+  remaining: []
+  import_errors: []
+  plan_errors: []
+  new_row:
+  drift:
+
+input:
+  mode: get
+  agent_id:
+  config: {}
+  name:
+  scope: shared
+  kind: mcp
+  endpoint:
+  credential: {}
+  # `import` is a Python keyword, so the input is import_spec; the row keeps `import`.
+  import_spec: {}
+  sync: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "tool-provider: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - pname: '{{ str(name or "").strip() }}'
+        - sc: "{{ str(scope or 'shared') }}"
+        - ns: "{{ 'agent-harness' if sc == 'shared' else 'agent.' + aid }}"
+        - pkey: "tool_provider:{{ pname }}"
+        - access_lists: "{{ (config or {}).get('access') or {} }}"
+        - cred_in: "{{ credential if isinstance(credential, dict) else {} }}"
+        - imp_in: "{{ import_spec if isinstance(import_spec, dict) else {} }}"
+        # The kind of a new provider (preview, register) or the one update names, checked
+        # against the row's; other modes take the row's.
+        - pk: "{{ str(kind or 'mcp') }}"
+        - _incl: "{{ [str(x) for x in (imp_in.get('include') or [])] if isinstance(imp_in.get('include'), list) else [] }}"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'scope must be one of ' + ', '.join(valid_scopes) + (' or both' if mode == 'list' else '')
+                 if sc not in valid_scopes + (['both'] if mode == 'list' else []) else
+               'name must match ' + name_pattern if mode not in ['preview', 'list'] and not re.match(name_pattern, pname) else
+               'kind must be one of ' + ', '.join(valid_kinds) if mode in ['preview'] + config_modes and pk not in valid_kinds else
+               'endpoint must be an http(s) URL'
+                 if mode in ['preview'] + config_modes and pk == 'mcp' and not re.match(r'^https?://', str(endpoint or '')) else
+               'credential.mode must be none, service or user'
+                 if mode in ['preview'] + config_modes and cred_in.get('mode', 'none') not in ['none', 'service', 'user'] else
+               'a ' + pk + ' provider takes no credential (activity tools take secret NAMES as fixed_input)'
+                 if mode in ['preview'] + config_modes and pk != 'mcp' and cred_in.get('mode', 'none') != 'none' else
+               'credential.secret_key must match ' + secret_pattern + ' (service: global/<NAME>)'
+                 if mode in ['preview'] + config_modes and cred_in.get('mode', 'none') != 'none'
+                    and not (re.match(secret_pattern, str(cred_in.get('secret_key') or ''))
+                             and (str(cred_in.get('secret_key')).startswith('global/')) == (cred_in.get('mode') == 'service')) else
+               'import_spec.include must list the tools to import (see preview)'
+                 if mode in config_modes and not _incl else
+               ('import_spec.include: not an activity type: ' + ', '.join(x for x in _incl if not re.match(activity_type_pattern, x)))
+                 if mode in config_modes and pk == 'activity' and not all(re.match(activity_type_pattern, x) for x in _incl) else
+               'import_spec.include: workflows are named <package>/<workflow_name>'
+                 if mode in config_modes and pk == 'workflow' and not all(re.match(workflow_ref_pattern, x) for x in _incl) else
+               'import_spec.defaults.side_effects must be one of ' + ', '.join(side_effect_values)
+                 if mode in config_modes and ((imp_in.get('defaults') or {}).get('side_effects')) not in side_effect_values
+                    and not (pk in ['workflow', 'activity'] and ((imp_in.get('defaults') or {}).get('side_effects')) is None) else
+               'import_spec.defaults.toolsets must name at least one toolset, each matching ' + toolset_pattern
+                 if mode in config_modes and not (isinstance((imp_in.get('defaults') or {}).get('toolsets'), list)
+                    and (imp_in.get('defaults') or {}).get('toolsets')
+                    and all(isinstance(t, str) and re.match(toolset_pattern, t) for t in (imp_in.get('defaults') or {}).get('toolsets'))) else None }}
+        - proceed: "{{ _bad is None }}"
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+
+    - task_name: authorize-write
+      skip_if: "{{ not proceed or mode not in write_modes }}"
+      workflow:
+        ref: agent-harness-foundation/access
+        mode: inline
+        input: {mode: authorize, agent_id: "{{ aid }}", action: write, scope: "{{ sc }}", definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - proceed: "{{ bool((((_ or {}).get('data') or {}).get('allow'))) }}"
+          - error: >-
+              {{ None if (((_ or {}).get('data') or {}).get('allow')) else
+                 {'code': 'forbidden', 'message': 'tool providers are for admins (' + str((((_ or {}).get('data') or {}).get('reason'))) + ')', 'retryable': False} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: list-provider-keys
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      loop:
+        in: "{{ (['agent-harness'] if sc in ['shared', 'both'] else []) + (['agent.' + aid] if sc in ['agent', 'both'] else []) }}"
+        foreach: list_ns
+        do:
+          task_name: list-keys-in
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ list_ns }}", key_pattern: "tool_provider:*", topic_pattern: tool-provider}
+      output:
+        set:
+          - provider_keys: >-
+              {{ [[n, r.get('key')] for n, rs in zip((['agent-harness'] if sc in ['shared', 'both'] else []) + (['agent.' + aid] if sc in ['agent', 'both'] else []), _ or [])
+                  for r in (rs or []) if isinstance(r, dict)] }}
+
+    - task_name: read-providers
+      skip_if: "{{ not proceed or mode != 'list' or not provider_keys }}"
+      loop:
+        in: "{{ provider_keys }}"
+        foreach: provider_ref
+        execute_mode: parallel
+        do:
+          task_name: read-provider
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "{{ provider_ref[0] }}", key: "{{ provider_ref[1] }}"}
+      output:
+        set:
+          - rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('name')] }}"
+
+    - task_name: shape-list
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      set:
+        - ok: true
+        - data: "{{ {'providers': sorted(rows, key=lambda r: (str(r.get('scope')), str(r.get('name'))))} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ONE ROW — read, check the transition
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: read-row
+      skip_if: "{{ not proceed or mode in ['preview', 'list'] }}"
+      activity:
+        type: builtin.state.get_state
+        input: {in_global_ns: true, namespace: "{{ ns }}", key: "{{ pkey }}"}
+      output:
+        set:
+          - row: "{{ _ if isinstance(_, dict) and _.get('name') else None }}"
+
+    - task_name: check-row
+      skip_if: "{{ not proceed or mode in ['preview', 'list'] }}"
+      set:
+        - _st: "{{ (row or {}).get('status') }}"
+        - _problem: >-
+            {{ ('invalid_state', 'provider ' + pname + ' already exists (' + str(_st) + ')') if mode == 'register' and row is not None else
+               ('not_found', 'no ' + sc + ' provider ' + pname) if mode != 'register' and row is None else
+               ('invalid_input', 'provider ' + pname + ' is a ' + str(row.get('kind') or 'mcp') + ' provider; its kind cannot change')
+                 if mode == 'update' and str(row.get('kind') or 'mcp') != pk else
+               ('invalid_state', 'provider ' + pname + ' is ' + str(_st) + '; ' + mode + ' needs ' + ' or '.join(from_states[mode]))
+                 if mode in from_states and _st not in from_states[mode] else None }}
+        - proceed: "{{ _problem is None }}"
+        - error: "{{ None if _problem is None else {'code': _problem[0], 'message': _problem[1], 'retryable': False} }}"
+        # The row this call works on: a new one for register; enable starts afresh, and
+        # update with the new config (its old tools stay listed until the import replaces them).
+        - row: >-
+            {{ {'schema_version': schema_version, 'name': pname, 'kind': pk, 'scope': sc,
+                'endpoint': str(endpoint) if pk == 'mcp' else None,
+                'credential': dict({'mode': 'none', 'secret_key': None, 'connect_hint': None}, **cred_in),
+                'import': {'include': list(imp_in.get('include') or []), 'defaults': dict(imp_in.get('defaults') or {}),
+                           'overrides': dict(imp_in.get('overrides') or {})},
+                'sync': dict({'every_hours': 24}, **(sync if isinstance(sync, dict) else {})),
+                'status': 'connecting', 'snapshot': None, 'pending': None, 'rejected_hash': None, 'tools': [],
+                'import_errors': [], 'error': None, 'created_at': now().isoformat()}
+               if mode == 'register' and _problem is None else
+               dict(row, status='connecting', snapshot=None, pending=None, rejected_hash=None)
+               if mode == 'enable' and _problem is None else
+               dict(row, endpoint=str(endpoint) if pk == 'mcp' else None,
+                    credential=dict({'mode': 'none', 'secret_key': None, 'connect_hint': None}, **cred_in),
+                    sync=dict(row.get('sync') or {'every_hours': 24}, **(sync if isinstance(sync, dict) else {})),
+                    status='connecting', snapshot=None, pending=None, rejected_hash=None, import_errors=[], error=None,
+                    **{'import': {'include': list(imp_in.get('include') or []), 'defaults': dict(imp_in.get('defaults') or {}),
+                                  'overrides': dict(imp_in.get('overrides') or {})}})
+               if mode == 'update' and _problem is None else row }}
+        - pk: "{{ pk if mode == 'register' else str((row or {}).get('kind') or 'mcp') }}"
+
+    # activity kind: the registry's allowlist and minimum side effects.
+    - task_name: read-activity-rules
+      skip_if: "{{ not proceed or pk != 'activity' or mode not in list_modes + ['accept_drift'] }}"
+      workflow:
+        ref: tool-registry
+        mode: inline
+        input: {mode: activity_rules, agent_id: "{{ aid }}"}
+      output:
+        set:
+          - act_rules: "{{ ((_ or {}).get('data')) or {} }}"
+
+    - task_name: check-activity-include
+      skip_if: "{{ not proceed or pk != 'activity' or mode not in config_modes }}"
+      set:
+        - _off: >-
+            {{ [x for x in (row.get('import') or {}).get('include') or []
+                if not any(x.startswith(a) if a.endswith('.') else x == a for a in (act_rules.get('allowlist') or []))] }}
+        - proceed: "{{ not _off }}"
+        - error: >-
+            {{ None if not _off else
+               {'code': 'invalid_input', 'message': 'import_spec.include: not an allowlisted activity type: ' + ', '.join(_off), 'retryable': False} }}
+
+    - task_name: shape-get
+      skip_if: "{{ not proceed or mode != 'get' }}"
+      set:
+        - ok: true
+        - data: "{{ {'provider': row} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST THE SOURCE'S TOOLS (preview, register, sync, enable), by kind
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-listing
+      skip_if: "{{ not proceed or mode not in list_modes }}"
+      set:
+        - list_cred: "{{ cred_in if mode == 'preview' else (row.get('credential') or {}) }}"
+        - list_skey: "{{ str(list_cred.get('secret_key') or '') if list_cred.get('mode') in ['service', 'user'] else '' }}"
+        - list_endpoint: "{{ (str(endpoint) if mode == 'preview' else row.get('endpoint')) if pk == 'mcp' else None }}"
+        - list_include: "{{ None if mode == 'preview' else list((row.get('import') or {}).get('include') or []) }}"
+
+    - task_name: get-credential
+      skip_if: "{{ not proceed or mode not in list_modes or pk != 'mcp' or not list_skey }}"
+      activity:
+        type: builtin.secret.get
+        input:
+          secret_name: "{{ list_skey[len('global/'):] if list_skey.startswith('global/') else list_skey }}"
+          in_global_ns: "{{ list_skey.startswith('global/') }}"
+          expiration_seconds: 120
+      output:
+        set:
+          - token: "{{ _ }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - list_error: "{{ 'credential ' + list_skey + ': ' + str(_.get('error_message'))[:300] }}"
+
+    - task_name: list-tools
+      skip_if: "{{ not proceed or mode not in list_modes or pk != 'mcp' or list_error is not None }}"
+      activity:
+        type: mcp.list_tools
+        input:
+          endpoint: "{{ list_endpoint }}"
+          include: "{{ list_include }}"
+          encrypted_auth_token: "{{ token }}"
+        options:
+          retry_policy: {timeout_sec: 60, max_attempts: 2}
+      output:
+        set:
+          - listing: "{{ _ if isinstance(_, dict) else {} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - list_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:400] }}"
+
+    # Activities: the allowlisted ones (preview), or exactly the included types.
+    - task_name: list-activities
+      skip_if: "{{ not proceed or mode not in list_modes or pk != 'activity' }}"
+      activity:
+        type: builtin.activity.list_manifests
+        input:
+          include: "{{ list_include if list_include is not None else (act_rules.get('allowlist') or []) }}"
+        options:
+          retry_policy: {timeout_sec: 30, max_attempts: 2}
+      output:
+        set:
+          - listing: >-
+              {{ {'hash': (_ or {}).get('hash'), 'server': {'name': 'moco activities'},
+                  'tools': [{'name': a.get('type'), 'title': a.get('type'), 'description': a.get('description'),
+                             'input_schema': a.get('input_schema'), 'hash': a.get('hash'),
+                             'schema_too_large': bool(a.get('schema_too_large')),
+                             'min_side_effects': (act_rules.get('min_side_effects') or {}).get(a.get('type'), act_rules.get('default_min_side_effects') or 'external')}
+                            for a in ((_ or {}).get('activities') or []) if isinstance(a, dict)
+                            and any(str(a.get('type')).startswith(x) if x.endswith('.') else str(a.get('type')) == x
+                                    for x in (act_rules.get('allowlist') or []))]} }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - list_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:400] }}"
+
+    # Workflows: what the calling admin can run on this stage, newest version per
+    # package; each package manifest's `tools` (moco publish) is one entry per tool.
+    - task_name: list-deployments
+      skip_if: "{{ not proceed or mode not in list_modes or pk != 'workflow' }}"
+      activity:
+        type: builtin.deploy.query.get_user_deployments
+        input:
+          user_id: '{{ str(__user_info__.get("user_id")) }}'
+          stage_id: "{{ str(__sys_info__.get('tier') or '') }}"
+        options:
+          retry_policy: {timeout_sec: 30, max_attempts: 2}
+      output:
+        set:
+          - _latest: >-
+              {{ {d.get('wfspec_name'): d for d in sorted(
+                    [d for d in (_ if isinstance(_, list) else []) if isinstance(d, dict) and d.get('wfspec_name')],
+                    key=lambda d: [int(d.get(k) or 0) for k in ['version_major', 'version_minor', 'version_patch']])} }}
+          - _wf_tools: >-
+              {{ sorted([dict(t, ref=pkg + '/' + str(t.get('workflow_name')), package=pkg,
+                              version='.'.join(str(d.get(k)) for k in ['version_major', 'version_minor', 'version_patch']))
+                         for pkg, d in _latest.items()
+                         for t in ((d.get('manifest') or {}).get('tools') or [])
+                         if isinstance(t, dict) and t.get('workflow_name') and t.get('name')],
+                        key=lambda t: t['ref']) }}
+          - listing: >-
+              {{ {'hash': json.dumps([[t['ref'], json.dumps({k: v for k, v in t.items() if k not in ['package', 'version', 'ref']}, sort_keys=True)]
+                                      for t in _wf_tools if list_include is None or t['ref'] in list_include]),
+                  'server': {'name': 'moco workflows', 'stage': __sys_info__.get('tier')},
+                  'tools': [{'name': t['ref'], 'title': t.get('name'), 'description': t.get('description'),
+                             'input_schema': t.get('parameters'), 'side_effects': t.get('side_effects'),
+                             'mode': t.get('mode') or 'sync', 'timeout_sec': t.get('timeout_sec'),
+                             'tool_name': t.get('name'), 'package': t['package'], 'version': t['version'],
+                             'hash': json.dumps({k: v for k, v in t.items() if k not in ['package', 'version', 'ref']}, sort_keys=True)}
+                            for t in _wf_tools if list_include is None or t['ref'] in list_include]} }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - list_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:400] }}"
+
+    - task_name: shape-preview
+      skip_if: "{{ not proceed or mode != 'preview' }}"
+      set:
+        - ok: "{{ list_error is None }}"
+        - error: "{{ None if list_error is None else {'code': 'list_failed', 'message': list_error, 'retryable': True} }}"
+        # mcp: name, description, hash. activity and workflow add their schema (the UI's
+        # fixed-input editor) and what the import needs to show.
+        - data: >-
+            {{ None if list_error is not None else
+               {'server': listing.get('server'), 'kind': pk,
+                'tools': [dict({'name': t.get('name'), 'description': t.get('description'), 'hash': t.get('hash')},
+                               **({k: t.get(k) for k in ['input_schema', 'schema_too_large', 'min_side_effects']} if pk == 'activity' else
+                                  {k: t.get(k) for k in ['input_schema', 'side_effects', 'mode', 'tool_name', 'package', 'version']}
+                                  if pk == 'workflow' else {}))
+                          for t in (listing.get('tools') or [])]} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PLAN — what to import, what to disable, the new row
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-sync
+      skip_if: "{{ not proceed or mode in ['preview', 'list', 'get', 'delete'] }}"
+      set:
+        - _now: "{{ now().isoformat() }}"
+        - _listed: "{{ [t for t in (listing.get('tools') or []) if isinstance(t, dict) and t.get('name')] }}"
+        - _snap: "{{ ((row.get('snapshot') or {}).get('tools')) or [] }}"
+        - _snap_h: "{{ {t['name']: t.get('hash') for t in _snap} }}"
+        - _list_h: "{{ {t['name']: t.get('hash') for t in _listed} }}"
+        - _first: "{{ mode in ['register', 'enable', 'update'] or (mode == 'sync' and row.get('snapshot') is None) }}"
+        - _same: "{{ listing.get('hash') in [(row.get('snapshot') or {}).get('hash'), row.get('rejected_hash')] }}"
+        - _pend: "{{ row.get('pending') or {} }}"
+        # DRIFT (sync on a snapshot whose hash moved and was not rejected).
+        - drift#: >-
+            {{ {'hash': listing.get('hash'),
+                'added': sorted(n for n in _list_h if n not in _snap_h),
+                'changed': sorted(n for n in _list_h if n in _snap_h and _list_h[n] != _snap_h[n]),
+                'removed': sorted(n for n in _snap_h if n not in _list_h), 'detected_at': _now}
+               if mode == 'sync' and list_error is None and not _first and not _same else None }}
+        # Tool names are bare; a schema_version 1 row keeps its <provider>_ prefix.
+        - _prefix: "{{ re.sub(r'[^a-z0-9]', '_', pname) + '_' if int(row.get('schema_version') or 1) < 2 else '' }}"
+        - _src: >-
+            {{ _listed if (_first and list_error is None) else
+               [t for t in (_pend.get('tools') or []) if t.get('name') in (_pend.get('added') or []) + (_pend.get('changed') or [])]
+                 if mode == 'accept_drift' else [] }}
+        - _imp_cfg: "{{ row.get('import') or {} }}"
+        - _d: "{{ _imp_cfg.get('defaults') or {} }}"
+        - _over: "{{ _imp_cfg.get('overrides') or {} }}"
+        - _cred: "{{ row.get('credential') or {} }}"
+        # The manifest name of a listed tool: <tool> (legacy rows: <provider>_<tool>). A
+        # workflow's tool name is its declaration's (the listing's title), the listing name
+        # being its ref.
+        - _titles: "{{ {t['name']: t.get('title') for t in _snap + _listed + (_pend.get('tools') or []) if isinstance(t, dict) and t.get('name')} }}"
+        - _mname: "{{ {n: (_prefix + re.sub(r'[^a-z0-9_]', '_', str(_titles.get(n) if pk == 'workflow' else n).lower()))[:49] for n in _titles} }}"
+        # activity: the admin's fixed input per tool (its keys leave the parameters).
+        - _fixed: "{{ {t['name']: dict(((_over.get(t['name']) or {}).get('fixed_input')) or {}) for t in _src} if pk == 'activity' else {} }}"
+        # activity, workflow: parameters normalised to what tool-registry accepts -- a
+        # plain JSON type, or an anyOf/oneOf whose non-null branches share one; else None
+        # (dropped).
+        - _np: >-
+            {{ {t['name']: {pn: (pv if pv.get('type') in json_types else
+                                 dict([b for b in (pv.get('anyOf') or pv.get('oneOf') or []) if isinstance(b, dict) and b.get('type') != 'null'][0],
+                                      **{k: v for k, v in pv.items() if k not in ['anyOf', 'oneOf']})
+                                 if len(set(str(b.get('type')) for b in (pv.get('anyOf') or pv.get('oneOf') or []) if isinstance(b, dict) and b.get('type') != 'null')) == 1
+                                    and [b for b in (pv.get('anyOf') or pv.get('oneOf') or []) if isinstance(b, dict) and b.get('type') != 'null'][0].get('type') in json_types
+                                 else None)
+                            for pn, pv in (((t.get('input_schema') if isinstance(t.get('input_schema'), dict) else {}).get('properties')) or {}).items()
+                            if isinstance(pv, dict) and pn not in _fixed.get(t['name'], {})}
+                for t in _src} if pk != 'mcp' else {} }}
+        - _req: >-
+            {{ {t['name']: [r for r in (((t.get('input_schema') if isinstance(t.get('input_schema'), dict) else {}).get('required')) or [])
+                            if r not in _fixed.get(t['name'], {})]
+                for t in _src} if pk != 'mcp' else {} }}
+        - plan_errors: >-
+            {{ [{'tool': _mname.get(t['name'], t['name']),
+                 'error': {'code': 'not_importable',
+                           'message': 'input schema too large for a tool' if t.get('schema_too_large') else
+                                      'required parameter ' + ', '.join(r for r in _req[t['name']] if _np[t['name']].get(r) is None)
+                                      + ' has no plain JSON type: set it with overrides.' + t['name'] + '.fixed_input'}}
+                for t in _src if pk == 'activity'
+                and (t.get('schema_too_large') or any(_np[t['name']].get(r) is None for r in _req[t['name']]))] }}
+        - _ok_src: "{{ [t for t in _src if _mname.get(t['name'], t['name']) not in [e['tool'] for e in plan_errors]] }}"
+        # policy: import.defaults ∪ overrides[<tool>]; a workflow keeps its declaration's
+        # side effects, an activity its type's minimum, unless the provider's are stricter.
+        - to_import: >-
+            {{ [{'name': _mname[t['name']],
+                 'title': str((t.get('title') if pk != 'workflow' else t.get('tool_name')) or t['name'])[:120],
+                 'description': str(t.get('description') or t['name']).strip()[:1500],
+                 'parameters': ((dict(t['input_schema'], properties=t['input_schema'].get('properties') or {})
+                                 if isinstance(t.get('input_schema'), dict) else {'type': 'object', 'properties': {}})
+                                if pk == 'mcp' else
+                                {'type': 'object', 'properties': {k: v for k, v in _np[t['name']].items() if v is not None},
+                                 'required': [r for r in _req[t['name']] if _np[t['name']].get(r) is not None]}),
+                 'binding': ({'mcp': {'endpoint': row['endpoint'], 'tool_name': t['name'], 'provider': pname}}
+                             if pk == 'mcp' and _cred.get('mode', 'none') == 'none' else
+                             {'wfspec': {'name': 'tool.mcp-call',
+                                         'mcp': {'endpoint': row['endpoint'], 'tool_name': t['name'], 'provider': pname,
+                                                 'secret_key': _cred.get('secret_key'), 'credential_mode': _cred.get('mode')}}}
+                             if pk == 'mcp' else
+                             {'activity': {'type': t['name'], 'input_template': _fixed[t['name']], 'merge_args': True}}
+                             if pk == 'activity' else
+                             {'wfspec': {'name': 'tool.run-workflow', 'workflow': {'ref': t['name']},
+                                         'timeout_sec': int(t.get('timeout_sec') or (600 if t.get('mode') == 'async' else 60))}}),
+                 'credential': ({'mode': 'none'} if _cred.get('mode', 'none') == 'none' else
+                                {'mode': _cred.get('mode'), 'secret_key': _cred.get('secret_key'), 'connect_hint': _cred.get('connect_hint')}),
+                 'policy': dict({k: v for k, v in dict(
+                              {'side_effects': _d.get('side_effects'), 'permission': _d.get('permission'),
+                               'allow_session_grant': _d.get('allow_session_grant')},
+                              **{k2: v2 for k2, v2 in ((_over.get(t['name']) or {})).items()
+                                 if k2 in ['side_effects', 'permission', 'allow_session_grant', 'idempotent', 'approval_template']}).items()
+                            if v is not None},
+                            **({'side_effects': max([t.get('side_effects'), ((_over.get(t['name']) or {}).get('side_effects')) or _d.get('side_effects')],
+                                                   key=lambda x: side_effect_values.index(x) if x in side_effect_values else -1)}
+                               if pk == 'workflow' else
+                               {'side_effects': max([(act_rules.get('min_side_effects') or {}).get(t['name'], act_rules.get('default_min_side_effects') or 'external'),
+                                                     ((_over.get(t['name']) or {}).get('side_effects')) or _d.get('side_effects')],
+                                                   key=lambda x: side_effect_values.index(x) if x in side_effect_values else -1)}
+                               if pk == 'activity' else {})),
+                 'execution': ({'timeout_sec': int(t.get('timeout_sec') or (600 if t.get('mode') == 'async' else 60)),
+                                'mode': 'async' if t.get('mode') == 'async' else 'sync', 'retry': {'max_attempts': 1}}
+                               if pk == 'workflow' else
+                               {'timeout_sec': int(_d.get('timeout_sec') or 60), 'mode': 'sync', 'retry': {'max_attempts': 1}}),
+                 'result': {'max_chars': 8000},
+                 'tags': [pname] + ([pk] if pk != 'mcp' else []),
+                 'toolsets': list(((_over.get(t['name']) or {})).get('toolsets') or _d.get('toolsets') or []),
+                 'origin': 'provider:' + pname}
+                for t in _ok_src] }}
+        - to_disable: >-
+            {{ [_mname.get(n) or (_prefix + re.sub(r'[^a-z0-9_]', '_', str(n).lower()))[:49] for n in (drift['changed'] + drift['removed'])] if drift else
+               list(row.get('tools') or []) if mode == 'disable' else
+               [n for n in row.get('tools') or [] if n not in [m['name'] for m in to_import]]
+                 if mode == 'update' and list_error is None else [] }}
+        - import_errors: "{{ plan_errors }}"
+
+    - task_name: plan-delete
+      skip_if: "{{ not proceed or mode != 'delete' }}"
+      set:
+        - to_disable: "{{ list(row.get('tools') or []) }}"
+
+    # ── tools: disable, then save → validate, one at a time (F52) ────────────
+    - task_name: disable-tools
+      skip_if: "{{ not proceed or not to_disable }}"
+      loop:
+        in: "{{ to_disable }}"
+        foreach: off_tool
+        execute_mode: sequential
+        do:
+          task_name: disable-tool
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input: {mode: disable, agent_id: "{{ aid }}", name: "{{ off_tool }}", scope: "{{ sc }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - disabled_results: "{{ [n for n, r in zip(to_disable, _ or []) if isinstance(r, dict) and r.get('ok')] }}"
+
+    - task_name: save-tools
+      skip_if: "{{ not proceed or not to_import }}"
+      loop:
+        in: "{{ to_import }}"
+        foreach: import_manifest
+        execute_mode: sequential
+        do:
+          task_name: save-tool
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input: {mode: save, agent_id: "{{ aid }}", name: "{{ import_manifest['name'] }}", scope: "{{ sc }}", manifest: "{{ import_manifest }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - saved: "{{ [m['name'] for m, r in zip(to_import, _ or []) if isinstance(r, dict) and r.get('ok')] }}"
+          - import_errors: >-
+              {{ import_errors + [{'tool': m['name'], 'error': (r or {}).get('error') if isinstance(r, dict) else {'message': str(r)[:300]}}
+                                  for m, r in zip(to_import, _ or []) if not (isinstance(r, dict) and r.get('ok'))] }}
+
+    - task_name: validate-tools
+      skip_if: "{{ not proceed or not saved }}"
+      loop:
+        in: "{{ saved }}"
+        foreach: saved_tool
+        execute_mode: sequential
+        do:
+          task_name: validate-tool
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input: {mode: validate, agent_id: "{{ aid }}", name: "{{ saved_tool }}", scope: "{{ sc }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - validated: "{{ [n for n, r in zip(saved, _ or []) if isinstance(r, dict) and r.get('ok')] }}"
+          - import_errors: >-
+              {{ import_errors + [{'tool': n, 'error': (r or {}).get('error') if isinstance(r, dict) else {'message': str(r)[:300]}}
+                                  for n, r in zip(saved, _ or []) if not (isinstance(r, dict) and r.get('ok'))] }}
+
+    # delete, update: the (now disabled) tools leave tool-registry; one already gone is fine.
+    - task_name: delete-tools
+      skip_if: "{{ not proceed or mode not in ['delete', 'update'] or not to_disable }}"
+      loop:
+        in: "{{ to_disable }}"
+        foreach: gone_tool
+        execute_mode: sequential
+        do:
+          task_name: delete-tool
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input: {mode: delete, agent_id: "{{ aid }}", name: "{{ gone_tool }}", scope: "{{ sc }}", definition_access: "{{ access_lists }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - deleted: >-
+              {{ [n for n, r in zip(to_disable, _ or []) if isinstance(r, dict)
+                  and (r.get('ok') or ((r.get('error') or {}).get('code')) == 'not_found')] }}
+          - remaining: "{{ [n for n in to_disable if n not in deleted] }}"
+
+    # ── the row ──────────────────────────────────────────────────────────────
+    - task_name: plan-row
+      skip_if: "{{ not proceed or mode in ['preview', 'list', 'get'] }}"
+      set:
+        - _now: "{{ now().isoformat() }}"
+        - _uid: '{{ str(__user_info__.get("user_id")) }}'
+        - _listed_snapshot: >-
+            {{ {'hash': listing.get('hash'), 'server': listing.get('server'), 'synced_at': _now,
+                'tools': [dict({k: t.get(k) for k in ['name', 'title', 'description', 'input_schema', 'hash']},
+                               **{k: t.get(k) for k in ['schema_too_large', 'side_effects', 'mode', 'timeout_sec', 'tool_name', 'package', 'version'] if k in t})
+                          for t in (listing.get('tools') or [])]} }}
+        - new_row: >-
+            {{ None if mode == 'delete' and not remaining else
+               dict(row, status='disabled', tools=remaining, updated_at=_now, updated_by=_uid)
+                 if mode == 'delete' else
+               dict(row, status='failed', error=list_error, updated_at=_now, updated_by=_uid)
+                 if mode in list_modes and list_error is not None else
+               dict(row, status='ready', error=None, snapshot=_listed_snapshot,
+                    tools=sorted(set(validated + remaining
+                                     + [n for n in row.get('tools') or [] if n in [m['name'] for m in to_import]])),
+                    import_errors=import_errors, updated_at=_now, updated_by=_uid)
+                 if mode == 'update' else
+               dict(row, status='ready', error=None, snapshot=_listed_snapshot,
+                    tools=sorted(set(list(row.get('tools') or []) + validated)), import_errors=import_errors,
+                    updated_at=_now, updated_by=_uid)
+                 if mode in ['register', 'enable'] or (mode == 'sync' and row.get('snapshot') is None) else
+               dict(row, status='drifted', error=None, pending=dict(drift, tools=_listed_snapshot['tools'], server=listing.get('server')),
+                    updated_at=_now, updated_by=_uid)
+                 if mode == 'sync' and drift else
+               dict(row, status='ready' if row.get('status') != 'drifted' else 'drifted', error=None,
+                    snapshot=dict(row.get('snapshot') or {}, synced_at=_now), updated_at=_now, updated_by=_uid)
+                 if mode == 'sync' else
+               dict(row, status='ready', snapshot={'hash': (row.get('pending') or {}).get('hash'), 'server': (row.get('pending') or {}).get('server'),
+                                                   'synced_at': _now, 'tools': (row.get('pending') or {}).get('tools') or []},
+                    pending=None, tools=sorted(set(list(row.get('tools') or []) + validated)), import_errors=import_errors,
+                    updated_at=_now, updated_by=_uid)
+                 if mode == 'accept_drift' else
+               dict(row, status='ready', pending=None, rejected_hash=(row.get('pending') or {}).get('hash'), updated_at=_now, updated_by=_uid)
+                 if mode == 'reject_drift' else
+               dict(row, status='disabled', updated_at=_now, updated_by=_uid) }}
+
+    - task_name: write-row
+      skip_if: "{{ not proceed or new_row is None }}"
+      activity:
+        type: builtin.state.set_state
+        input: {in_global_ns: true, namespace: "{{ ns }}", key: "{{ pkey }}", value: "{{ new_row }}", topic: tool-provider}
+
+    - task_name: delete-row
+      skip_if: "{{ not proceed or mode != 'delete' or new_row is not None }}"
+      activity:
+        type: builtin.state.del_state
+        input: {in_global_ns: true, namespace: "{{ ns }}", key: "{{ pkey }}"}
+
+    - task_name: shape-row
+      skip_if: "{{ not proceed or mode in ['preview', 'list', 'get'] }}"
+      set:
+        - ok: "{{ not (mode in list_modes and list_error is not None) and not (mode == 'delete' and remaining) }}"
+        - error: >-
+            {{ {'code': 'list_failed', 'message': list_error, 'retryable': True} if mode in list_modes and list_error is not None else
+               {'code': 'invalid_state', 'message': 'tool-registry would not delete ' + ', '.join(remaining) + '; provider ' + pname + ' kept as disabled', 'retryable': False}
+                 if mode == 'delete' and remaining else None }}
+        - data: >-
+            {{ {'provider': new_row, 'imported': validated, 'disabled': disabled_results, 'deleted': deleted, 'import_errors': import_errors, 'drift': drift} }}

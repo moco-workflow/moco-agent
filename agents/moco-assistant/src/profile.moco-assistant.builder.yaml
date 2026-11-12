@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.MOCO-ASSISTANT.BUILDER — the `builder` profile (plan-18 step 8, design §13.2)
+# ================================================================================
+# A `kind: wfspec`, `mode: async` profile: subagent.builder answers the turn with
+# async_started and a job_request, and the session starts it as a job (§6.12); the
+# plan comes back as a plan_review pending action, the build as a relayed turn.
+# Gated by requires.worker: agent (claude_agent.query) and not for guests.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.moco-assistant.builder
+
+context:
+  profile:
+    name: builder
+    kind: wfspec
+    mode: async
+    route_description: "A request to build, write or generate a new moco workflow (a wfspec) -- not a question about how moco works."
+    examples: ["build me a workflow that polls an endpoint every 5 minutes and alerts on errors", "write a wfspec that copies new S3 files into postgres"]
+    requires: {worker: agent, not_guest: true}
+    needs_rewrite: true
+    budget_sec: 20
+    estimated_sec: 5
+    wfspec: {name: subagent.builder}
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

@@ -1,0 +1,184 @@
+test_type: integration-test
+
+# qset.route (plan-01 step 6, design §7.2 / §7.3). A data wfspec, so nothing is
+# mocked: each case renders a request and checks what System One would be asked.
+
+wfspec:
+  name: qset.route
+
+test_data:
+  profiles: &profiles
+    - {name: chat, route_description: "Chit-chat and general questions."}
+    - {name: rag, route_description: "A question an indexed source could answer.", examples: ["how do retries work?"]}
+  sources: &sources
+    - {name: moco-docs, description: "Moco platform documentation", keywords: [workflow, retry, activity]}
+    - {name: k8s-runbooks, description: "Kubernetes runbooks", keywords: [pod, deployment]}
+  many_sources: &many_sources
+    - {name: s-alpha, description: "alpha"}
+    - {name: s-beta, description: "beta"}
+    - {name: s-gamma, description: "gamma"}
+    - {name: s-delta, description: "delta"}
+    - {name: s-epsilon, description: "epsilon"}
+    - {name: s-retry, description: "everything about retry policies"}
+    - {name: s-zeta, description: "zeta"}
+
+test_cases:
+
+  # ── The minimum: a first message, no extras ─────────────────────────────
+  - id: a-first-message-asks-only-route-and-ambiguity
+    input: {message: "hello there", profiles: *profiles}
+    expect:
+      output:
+        - kind: system_one
+        - state: "Current message: hello there"
+        - keymap: {profile_0: chat, profile_1: rag}
+      assert:
+        - "{{ sorted(questions) == ['ambiguity', 'route'] }}"
+        - "{{ questions['route']['type'] == 'choice' }}"
+        - "{{ sorted(questions['route']['criteria']) == ['profile_0', 'profile_1'] }}"
+        - "{{ 'For example: how do retries work?' in questions['route']['criteria']['profile_1'] }}"
+        - "{{ questions['ambiguity'] == {'criteria': ['clear', 'somewhat ambiguous', 'too ambiguous to answer without asking'], 'instructions': 'How clear is it what the current message asks for?', 'type': 'score'} }}"
+        - "{{ trace == {'question_count': 2, 'dropped_sources': []} }}"
+
+  # ── Conditional questions ───────────────────────────────────────────────
+  - id: history-adds-needs-context-and-goes-into-the-state
+    input:
+      message: "and how do I configure that?"
+      profiles: *profiles
+      history:
+        - {role: user, content: "how do retries work?"}
+        - {role: assistant, content: "Retries are set per activity."}
+    expect:
+      output:
+        - state: "Conversation so far:\nuser: how do retries work?\nassistant: Retries are set per activity.\n\nCurrent message: and how do I configure that?"
+      assert:
+        - "{{ 'needs_context' in questions }}"
+
+  - id: history-keeps-the-last-four-exchanges-clamped
+    input:
+      message: "x"
+      profiles: *profiles
+      history:
+        - {role: user, content: "m0yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m1yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m2yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m3yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m4yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m5yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m6yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m7yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m8yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m9yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m10yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+        - {role: user, content: "m11yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"}
+    expect:
+      assert:
+        - "{{ state.count('user: ') == 8 }}"
+        - "{{ 'user: m3' not in state and 'user: m4' in state and 'user: m11' in state }}"
+        - "{{ all(len(line) <= len('user: ') + 300 for line in state.split('\\n') if line.startswith('user: ')) }}"
+
+  - id: a-pending-action-adds-the-three-pending-labels
+    input:
+      message: "yes go ahead"
+      profiles: *profiles
+      pending_action: {id: pa-1, summary: "restart pod web-1"}
+    expect:
+      assert:
+        - "{{ sorted(questions['route']['criteria']) == ['pending_approve', 'pending_reject', 'pending_revise', 'profile_0', 'profile_1'] }}"
+        - "{{ 'restart pod web-1' in questions['route']['criteria']['pending_approve'] }}"
+        - "{{ 'pending_approve' not in keymap }}"
+
+  - id: no-pending-action-no-pending-labels
+    input: {message: "yes go ahead", profiles: *profiles, pending_action: {}}
+    expect:
+      assert:
+        - "{{ not any(k.startswith('pending_') for k in questions['route']['criteria']) }}"
+
+  - id: a-previous-answer-adds-negative-feedback
+    input: {message: "that is wrong", profiles: *profiles, previous_answer: true}
+    expect:
+      assert:
+        - "{{ 'negative_feedback' in questions }}"
+
+  - id: states-preference-needs-long-term-memory-and-a-signed-in-user
+    input: {message: "I use GKE", profiles: *profiles, long_term_memory: true, is_guest: false}
+    expect:
+      assert:
+        - "{{ 'states_preference' in questions }}"
+
+  - id: a-guest-is-never-asked-states-preference
+    input: {message: "I use GKE", profiles: *profiles, long_term_memory: true, is_guest: true}
+    expect:
+      assert:
+        - "{{ 'states_preference' not in questions }}"
+
+  - id: episodes-add-refers-to-past
+    input: {message: "like last time", profiles: *profiles, episodes: true}
+    expect:
+      assert:
+        - "{{ 'refers_to_past' in questions }}"
+
+  # ── Sources and the question cap ────────────────────────────────────────
+  - id: sources-are-offered-only-when-a-profile-needs-them
+    input: {message: "how do retries work?", profiles: *profiles, sources: *sources, offer_sources: false}
+    expect:
+      assert:
+        - "{{ not any(k.startswith('source_') for k in questions) }}"
+
+  - id: offered-sources-get-positional-nouls-and-a-keymap
+    input: {message: "how do I set a retry on an activity?", profiles: *profiles, sources: *sources, offer_sources: true}
+    expect:
+      assert:
+        # moco-docs shares "retry" and "activity" with the message, so it ranks first.
+        - "{{ keymap['source_0'] == 'moco-docs' and keymap['source_1'] == 'k8s-runbooks' }}"
+        - "{{ questions['source_0']['type'] == 'noul' }}"
+        - "{{ 'keywords: workflow, retry, activity' in questions['source_0']['instructions'] }}"
+
+  - id: the-cap-keeps-the-best-matching-sources-and-reports-the-rest
+    input:
+      message: "what is our retry policy?"
+      profiles: *profiles
+      sources: *many_sources
+      offer_sources: true
+      history: [{role: user, content: "hi"}]
+      previous_answer: true
+      long_term_memory: true
+      is_guest: false
+      episodes: true
+    expect:
+      assert:
+        # 6 fixed questions leave 4 slots under the cap of 10.
+        - "{{ len(questions) == 10 and trace['question_count'] == 10 }}"
+        - "{{ keymap['source_0'] == 's-retry' }}"
+        # Ties are broken by name: s-alpha, s-beta, s-delta follow.
+        - "{{ [keymap['source_' + str(i)] for i in range(4)] == ['s-retry', 's-alpha', 's-beta', 's-delta'] }}"
+        - "{{ trace['dropped_sources'] == ['s-epsilon', 's-gamma', 's-zeta'] }}"
+
+  - id: a-smaller-cap-leaves-no-room-for-sources
+    input: {message: "retry", profiles: *profiles, sources: *sources, offer_sources: true, max_questions: 2}
+    expect:
+      assert:
+        - "{{ sorted(questions) == ['ambiguity', 'route'] }}"
+        - "{{ trace['dropped_sources'] == ['moco-docs', 'k8s-runbooks'] }}"
+
+  # ── Conventions every qset keeps (§6.3.2) ───────────────────────────────
+  - id: every-question-has-instructions-and-every-level-is-sorted
+    input:
+      message: "how do I set a retry?"
+      profiles: *profiles
+      sources: *sources
+      offer_sources: true
+      history: [{role: user, content: "hi"}]
+      pending_action: {id: pa-1, summary: "x"}
+      previous_answer: true
+      long_term_memory: true
+      is_guest: false
+      episodes: true
+    expect:
+      assert:
+        - "{{ all(q.get('instructions') for q in questions.values()) }}"
+        - "{{ list(questions) == sorted(questions) }}"
+        - "{{ all(list(q) == sorted(q) for q in questions.values()) }}"
+        - "{{ list(questions['route']['criteria']) == sorted(questions['route']['criteria']) }}"
+        - "{{ list(keymap) == sorted(keymap) }}"
+        - "{{ len(questions) <= 10 }}"

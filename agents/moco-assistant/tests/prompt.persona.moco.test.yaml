@@ -1,0 +1,10 @@
+test_type: integration-test
+wfspec:
+  name: prompt.persona.moco
+test_cases:
+  - id: the-persona-renders-as-one-system-message
+    input: {}
+    expect:
+      assert:
+        - "{{ kind == 'chat' and len(messages) == 1 and messages[0]['role'] == 'system' }}"
+        - "{{ messages[0]['content'].startswith('You are Moco Assistant') }}"

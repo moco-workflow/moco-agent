@@ -1,0 +1,115 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROMPT.LOOP — the agent loop's chat prompt (design §6.3, §6.6.3, §6.8.3)
+# ================================================================================
+#
+#   variables                                        out
+#   ──────────────────────────────────────────────── ───────────────────────────
+#   context_bundle, passages, messages,              {kind: chat, messages,
+#   tools_offered, forced_final                       response_format, schema}
+#
+# Renders a context_bundle (context-builder's output, §6.6.3) into chat messages.
+# THE BLOCK CONTRACT context-builder must produce -- blocks arrive admitted and in
+# priority order, each {id, title, content, items?}:
+#
+#   system                                  → the system message, verbatim (it is the
+#                                             rendered prompt.system.base + persona)
+#   pending, jobs, summary, <custom>        → system sections, fenced as <data>
+#   profile_memory, recalled_memory, episodes
+#                                           → ONE system section under "Background,
+#                                             not a source" (§6.6.3), fenced as <data>
+#   recent   items [{role, content}],       → real user/assistant turns, oldest first
+#            newest first
+#   question content, or items             → the final user message: the original
+#            [{original, rewritten}]          question, plus the rewritten one when it
+#                                             differs
+#
+# Then `messages` (the loop's scratch: assistant tool calls and tool results, already
+# screened) are appended as-is, and with `forced_final` a closing instruction to stop
+# calling tools and answer (the `answering` state).
+#
+# Everything that is not the system block or harness text is UNTRUSTED: memory,
+# history, custom providers, the question. It is fenced, and any <data> tag inside it
+# is neutralised so it cannot close its fence.
+#
+# `passages` are ignored here: prompt.rag.answer runs this prompt and adds them.
+# The model role is the caller's to choose (plan-01 §8).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: prompt.loop
+
+context:
+  memory_ids: ["profile_memory", "recalled_memory", "episodes"]
+  special_ids: ["system", "recent", "question"]
+  forced_final_note: >-
+    Stop calling tools now. Answer the user's question with what you have already
+    found, and say plainly if it is incomplete.
+
+input:
+  context_bundle: {}
+  passages: []
+  messages: []
+  tools_offered: false
+  # null, or the number of steps taken, when the loop forces a final answer.
+  forced_final:
+
+output:
+  kind: chat
+  messages: "{{ out_messages }}"
+  response_format:
+  schema:
+
+main:
+  tasks:
+    - task_name: render-loop-messages
+      set:
+        - _blocks: >-
+            {{ [b for b in ((context_bundle or {}).get('blocks') or [])
+                if isinstance(b, dict) and b.get('id')] }}
+        - _system: "{{ [b for b in _blocks if b['id'] == 'system'] }}"
+        - _memory: "{{ [b for b in _blocks if b['id'] in memory_ids] }}"
+        - _sections: "{{ [b for b in _blocks if b['id'] not in memory_ids and b['id'] not in special_ids] }}"
+        - _recent: "{{ [b for b in _blocks if b['id'] == 'recent'] }}"
+        - _question: "{{ [b for b in _blocks if b['id'] == 'question'] }}"
+        # Fence untrusted text; a <data> tag inside it must not close the fence.
+        - _body: >-
+            {{ [(str(b.get('title') or b['id']),
+                 re.sub(r'(?i)</?\s*data\b[^>]*>', '[tag removed]',
+                        str(b.get('content') or '') if not b.get('items')
+                        else '\n'.join('- ' + (str(i.get('title')) + ': ' if isinstance(i, dict) and i.get('title') else '')
+                                       + str(i.get('text') or i.get('content') or i if isinstance(i, dict) else i)
+                                       for i in b['items'])))
+                for b in _sections + _memory] }}
+        - _section_text: >-
+            {{ ['## ' + t + '\n<data>\n' + c + '\n</data>' for t, c in _body[:len(_sections)]] }}
+        - _memory_text: >-
+            {{ (['## Background, not a source\n'
+                 'What is remembered about this user and earlier conversations. Use it to '
+                 'tailor the answer; never cite it.\n'
+                 + '\n'.join('### ' + t + '\n<data>\n' + c + '\n</data>' for t, c in _body[len(_sections):])]
+                if _memory else []) }}
+        - _system_content: >-
+            {{ '\n\n'.join(([str(_system[0].get('content') or '')] if _system else [])
+                           + _section_text + _memory_text) }}
+        - _history: >-
+            {{ [{'role': i['role'], 'content': re.sub(r'(?i)</?\s*data\b[^>]*>', '[tag removed]', str(i['content']))}
+                for b in _recent for i in reversed(b.get('items') or [])
+                if isinstance(i, dict) and i.get('role') in ['user', 'assistant'] and i.get('content')] }}
+        - _q: >-
+            {{ (_question[0].get('items') or [{}])[0] if _question and _question[0].get('items')
+               else {'original': (_question[0].get('content') if _question else '')} }}
+        - _orig: "{{ re.sub(r'(?i)</?\\s*data\\b[^>]*>', '[tag removed]', str(_q.get('original') or '')) }}"
+        - _rewritten: "{{ re.sub(r'(?i)</?\\s*data\\b[^>]*>', '[tag removed]', str(_q.get('rewritten') or '')) }}"
+        - _user: >-
+            {{ _orig + (('\n\n(Read in context, this asks: ' + _rewritten + ')')
+                        if _rewritten and _rewritten.strip() != _orig.strip() else '') }}
+        - out_messages: >-
+            {{ ([{'role': 'system', 'content': _system_content}] if _system_content else [])
+               + _history
+               + ([{'role': 'user', 'content': _user}] if _user else [])
+               + [m for m in (messages or []) if isinstance(m, dict)]
+               + ([{'role': 'system',
+                    'content': forced_final_note + ' (Stopped after ' + str(forced_final) + ' steps.)'}]
+                  if forced_final is not None else []) }}

@@ -1,0 +1,7 @@
+<!doctype html><meta charset="utf-8">
+<script>
+  const q = new URLSearchParams(location.search);
+  localStorage.setItem('moco_guest_mode','true');
+  if (q.get('agent')) localStorage.setItem('moco-agent.agent-id', q.get('agent'));
+  location.replace(q.get('to') || '/');
+</script>

@@ -1,0 +1,24 @@
+test_type: integration-test
+
+# The definition is data; agent-registry validate checks it against the harness on
+# the dev stage (it cannot run here, the harness package is not beside it).
+
+wfspec:
+  name: agent.moco-assistant
+
+test_cases:
+  - id: the-definition-states-a-phase-2-agent
+    input: {}
+    expect:
+      assert:
+        - "{{ definition['agent_id'] == 'moco-assistant' and definition['profiles'] == ['chat', 'rag', 'react', 'memory', 'claude', 'builder'] }}"
+        - "{{ definition['toolsets'] == ['harness-builtin'] and definition['memory']['long_term']['enabled'] == True }}"
+        - "{{ definition['deployment']['agent_worker'] == True and definition['claude']['apikey_secret_key'] == 'MY_CLAUDE_APIKEY' }}"
+        - "{{ definition['router']['default_profile'] in definition['profiles'] }}"
+        - "{{ all(v in definition['profiles'] for v in definition['router']['slash'].values()) }}"
+        - "{{ definition['knowledge']['sources'] == ['moco-docs'] and definition['persona_prompt'] == 'persona.moco' }}"
+        # The trace hook observes the five deferred events, detached (never on the turn path).
+        - "{{ sorted(h['event'] for h in definition['hooks'] if h['wfspec'] == 'hook.moco.trace') == ['context.assembled', 'route.decided', 'session.retired', 'tool.after', 'turn.committed'] }}"
+        - "{{ all(h['mode'] == 'async' for h in definition['hooks'] if h['wfspec'] == 'hook.moco.trace') }}"
+        # Profile text uses {name} placeholders, never double braces (data wfspecs evaluate them).
+        - "{{ '{searched}' in definition['profile_overrides']['rag']['loop']['decline_message'] }}"

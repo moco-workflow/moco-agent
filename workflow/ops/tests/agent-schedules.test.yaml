@@ -1,0 +1,121 @@
+test_type: integration-test
+
+# agent-schedules (plan-17 step 1, design §6.16): the harness's offline jobs installed as
+# platform schedules. The platform calls are mocked by task name; a mock that fails to
+# evaluate is a real task error (and, on update-schedule, the sentinel that it did not run).
+
+wfspec:
+  name: agent-schedules
+
+test_cases:
+  - id: a-fresh-install-creates-every-job-and-updates-none
+    input: {mode: install}
+    mocks:
+      - {step_name: read-namespace, _: {namespace_id: team}}
+      - {step_name: create-schedule, _: {action: created}}
+      - {step_name: update-schedule, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - error: null
+        - data:
+            namespace: team
+            jobs:
+              - {job: janitor, schedule_id: team/agent-harness.janitor, action: created, error: null}
+              - {job: keep_warm, schedule_id: team/agent-harness.keep_warm, action: created, error: null}
+              - {job: knowledge_refresh, schedule_id: team/agent-harness.knowledge_refresh, action: created, error: null}
+              - {job: memory_promote, schedule_id: team/agent-harness.memory_promote, action: created, error: null}
+              - {job: tool_provider_sync, schedule_id: team/agent-harness.tool_provider_sync, action: created, error: null}
+              - {job: tool_stats, schedule_id: team/agent-harness.tool_stats, action: created, error: null}
+
+  - id: a-redeploy-updates-the-schedules-that-exist
+    input: {mode: install}
+    mocks:
+      - {step_name: read-namespace, _: {namespace_id: team}}
+      - {step_name: create-schedule, _: {action: kept}}
+      - {step_name: update-schedule, _: {schedule_id: x}}
+    expect:
+      output:
+        - ok: true
+        - data:
+            namespace: team
+            jobs:
+              - {job: janitor, schedule_id: team/agent-harness.janitor, action: updated, error: null}
+              - {job: keep_warm, schedule_id: team/agent-harness.keep_warm, action: updated, error: null}
+              - {job: knowledge_refresh, schedule_id: team/agent-harness.knowledge_refresh, action: updated, error: null}
+              - {job: memory_promote, schedule_id: team/agent-harness.memory_promote, action: updated, error: null}
+              - {job: tool_provider_sync, schedule_id: team/agent-harness.tool_provider_sync, action: updated, error: null}
+              - {job: tool_stats, schedule_id: team/agent-harness.tool_stats, action: updated, error: null}
+
+  - id: a-failed-update-is-reported-per-job
+    input: {mode: install}
+    mocks:
+      - {step_name: read-namespace, _: {namespace_id: team}}
+      - {step_name: create-schedule, _: {action: kept}}
+      - {step_name: update-schedule, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - error:
+            code: install_failed
+            message: "jobs not installed: janitor, keep_warm, knowledge_refresh, memory_promote, tool_provider_sync, tool_stats"
+            retryable: true
+      assert:
+        - "{{ [j['action'] for j in data['jobs']] == ['update_failed'] * 6 }}"
+        - "{{ all(j['error'] for j in data['jobs']) }}"
+
+  - id: a-refused-create-is-a-per-job-error-not-a-raise
+    input: {mode: install}
+    mocks:
+      - {step_name: read-namespace, _: {namespace_id: team}}
+      - {step_name: create-schedule, _: "{{ 1 / 0 }}"}
+      - {step_name: update-schedule, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+      assert:
+        - "{{ error['code'] == 'install_failed' }}"
+        - "{{ [j['action'] for j in data['jobs']] == ['failed'] * 6 }}"
+        - "{{ all(j['error'] for j in data['jobs']) }}"
+
+  - id: no-deployed-harness-means-no-namespace
+    input: {mode: install}
+    mocks:
+      - {step_name: read-namespace, _: {}}
+      - {step_name: create-schedule, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error['code'] == 'namespace_unknown' }}"
+
+  - id: an-unknown-mode-is-rejected
+    input: {mode: purge}
+    mocks:
+      - {step_name: read-namespace, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error['code'] == 'invalid_mode' }}"
+
+  - id: status-lists-only-the-harness-schedules
+    input: {mode: status}
+    mocks:
+      - {step_name: read-namespace, _: {namespace_id: team}}
+      - step_name: list-schedules
+        _:
+          schedules:
+            - {schedule_id: team/agent-harness.janitor, name: agent-harness.janitor, paused: false, spec: {every_sec: 3600}, next_fire_times: ["2026-10-15T18:00:00+00:00"]}
+            - {schedule_id: team/agent-harness.keep_warm, name: agent-harness.keep_warm, paused: true, spec: {every_sec: 300}, next_fire_times: []}
+            - {schedule_id: team/nightly-report, name: nightly-report, paused: false, spec: {cron: ["0 2 * * *"]}}
+    expect:
+      output:
+        - ok: true
+        - data:
+            namespace: team
+            schedules:
+              - {job: janitor, schedule_id: team/agent-harness.janitor, paused: false, spec: {every_sec: 3600}, next_fire_times: ["2026-10-15T18:00:00+00:00"]}
+              - {job: keep_warm, schedule_id: team/agent-harness.keep_warm, paused: true, spec: {every_sec: 300}, next_fire_times: []}

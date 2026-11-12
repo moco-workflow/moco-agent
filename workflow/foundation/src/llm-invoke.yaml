@@ -1,0 +1,482 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# LLM-INVOKE — the only caller of openai.chat.completions (design §6.2.2)
+# ================================================================================
+#
+#   mode             in                                          data out
+#   ──────────────── ─────────────────────────────────────────── ────────────────
+#   chat             role, models, messages, tools?,             {content, parsed,
+#                    tool_choice?, response_format?, schema?,     tool_calls,
+#                    max_tokens?, timeout_sec?                    finish_reason, model,
+#   render_and_chat  role, models, prompt, variables,             usage, elapsed_ms,
+#                    resolved_refs, tools?, max_tokens?, ...      repaired, fallback_used,
+#                                                                 prompt_version}
+#
+# Code names a ROLE, never a model (§6.2.1). `models` is the resolved
+# `config.models` block; this file turns a role into an endpoint. The `decision`
+# role is an optional alias (S13): when `models.decision` is null it resolves to
+# the inference model with `models.decision_default_max_tokens` (600).
+#
+# A call may override only `max_tokens` and `timeout_sec`. Model, endpoint and
+# temperature come from config, so a caller cannot quietly switch models.
+#
+# ONE CALL, UP TO THREE REQUESTS (plan-02 steps 2-5):
+#   call-model           the configured model
+#   call-fallback-model  only after a timeout / provider_error, when the role has a
+#                        `fallback_model` (same endpoint, another model name)
+#   repair-model         only with a `schema`, when the reply is not valid JSON
+#                        matching it: ONE repair request carrying the errors
+# Three named tasks rather than one function called three times, so a test can
+# mock each request on its own. They share `classify-call` (the error taxonomy)
+# and `parse-json` (parse + schema check), so those rules exist once.
+#
+# ERRORS never raise (§4.3). Each activity task catches its own failure with
+# `on_error`, and a failure comes back as
+#   ok: false, error: {code: timeout | provider_error | auth | context_overflow |
+#                            invalid_json | invalid_input, message, retryable}
+# `auth` is misconfiguration (a missing or wrong secret) and is logged loudly as
+# `misconfig#`. An unknown role, mode or prompt IS a bug and raises.
+#
+# SCHEMA SUBSET (no JSON-Schema activity exists): type (object, array, string,
+# number, integer, boolean, null), enum, required, properties,
+# additionalProperties: false, items, minLength, minimum, maximum. Anything else in
+# a schema is ignored. `parsed` is null unless the reply validated.
+#
+# PLATFORM GAPS this file works around (see plan-02 §8):
+#   - openai.chat.completions returns only the assistant message: no `usage` and
+#     no `finish_reason`. Token counts are ESTIMATED (chars / 4) and flagged
+#     `usage.estimated: true`; `finish_reason` is null.
+#   - (fixed 2026-10-16) activity timeouts CAN be expressions: every model request
+#     is bounded by the call's timeout_sec, else models.<role>.timeout_sec, else
+#     100 s. A caller with a budget (the agent loop) passes what is left of it.
+#   - the activity's temperature field is spelled `temporature`.
+#   - `tool_choice` accepts only a literal, never an expression (phase 2 issue).
+#
+# Secrets (P11): `apikey_secret_key` is a NAME, passed through; the activity
+# resolves it on every call and nothing here ever holds its value.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: llm-invoke
+
+context:
+  valid_modes: ["chat", "render_and_chat"]
+  known_roles: ["inference", "decision"]
+  repair_note: >-
+    Your previous reply was not valid JSON matching the required schema. Problems:
+    {errors}. Reply again with corrected JSON only: no prose, no code fences.
+  # Seeded so the output is bound whichever branch ran.
+  ok: false
+  data:
+  error:
+  prompt_version:
+  parse: {parsed: null, errors: []}
+  fallback_result:
+  repair_result:
+
+input:
+  mode: chat
+  agent_id:
+  role: inference
+  models: {}
+  messages: []
+  tools:
+  tool_choice:
+  response_format:
+  schema:
+  max_tokens:
+  timeout_sec:
+  # render_and_chat
+  prompt:
+  variables: {}
+  resolved_refs: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+functions:
+  # The error taxonomy over what a request left behind: the assistant message, or
+  # on_error's {result: error, error_type, error_message}. Under Temporal the
+  # provider's exception class is usually only in the message, so both are searched.
+  classify-call:
+    input:
+      call_result:
+    output:
+      failed: "{{ failed }}"
+      code: "{{ code }}"
+      text: "{{ text }}"
+      message: "{{ message }}"
+      content: "{{ content }}"
+      tool_calls: "{{ tool_calls }}"
+    main:
+      task_name: classify-result
+      set:
+        - failed: "{{ not isinstance(call_result, dict) or call_result.get('result') == 'error' }}"
+        - text: >-
+            {{ (str(call_result.get('error_type', '')) + ' '
+                + str(call_result.get('error_message', ''))).lower()
+               if isinstance(call_result, dict) else 'no result' }}
+        - code: >-
+            {{ None if not failed else
+               ('auth' if any(s in text for s in
+                   ['authentication', 'unauthorized', 'permission', ' 401', ' 403',
+                    'token authentication failure', 'secret not found', 'secretnotfound',
+                    'environment variable not set', 'invalid jwt', 'invalid token',
+                    'invalid api key', 'incorrect api key', 'invalid_api_key'])
+                else 'context_overflow' if any(s in text for s in
+                   ['context_length', 'context length', 'maximum context', 'too many tokens'])
+                else 'timeout' if ('timeout' in text or 'timed out' in text)
+                else 'provider_error') }}
+        # The provider's own words, case and all, for the caller's error message.
+        - message: "{{ (str(call_result.get('error_message', '')) if isinstance(call_result, dict) else 'no result') if failed else '' }}"
+        - content: "{{ (call_result.get('content') or '') if not failed else '' }}"
+        - tool_calls: "{{ (call_result.get('tool_calls') or []) if not failed else [] }}"
+
+  # Parse a reply as JSON (tolerating a ```json fence) and check it against the
+  # schema subset in the header. `errors` is empty exactly when `parsed` is good.
+  parse-json:
+    input:
+      content:
+      schema:
+    output:
+      parsed: "{{ parsed if not errors else None }}"
+      errors: "{{ errors }}"
+    main:
+      tasks:
+        - task_name: strip-fence
+          set:
+            - candidate: >-
+                {{ (lambda m: m.group(1) if m else str(content or '').strip())(
+                     re.match(r'^\s*```(?:json)?\s*(.*?)\s*```\s*$', str(content or ''), re.S)) }}
+            - parsed:
+            - errors: ["not JSON"]
+        - task_name: load-json
+          set:
+            - parsed: "{{ json.loads(candidate) }}"
+            - errors: []
+          on_error:
+            catch: true
+            do:
+              set:
+                - errors: "{{ ['not JSON: ' + str(_.get('error_message'))[:200]] }}"
+        # A self-applied lambda, because an expression cannot define a named
+        # recursive function; never bound to a variable (it would not survive
+        # serialisation).
+        - task_name: check-schema
+          skip_if: "{{ bool(errors) }}"
+          set:
+            - errors: >-
+                {{ (lambda f: f(f, parsed, schema or {}, '$'))(
+                     lambda self, v, s, p:
+                       ([p + ': expected ' + str(s.get('type'))]
+                        if not {'object': isinstance(v, dict), 'array': isinstance(v, list),
+                                'string': isinstance(v, str),
+                                'number': isinstance(v, (int, float)) and not isinstance(v, bool),
+                                'integer': isinstance(v, int) and not isinstance(v, bool),
+                                'boolean': isinstance(v, bool), 'null': v is None}.get(s.get('type'), True)
+                        else
+                        ([p + ': not one of ' + str(s['enum'])] if 'enum' in s and v not in s['enum'] else [])
+                        + ([p + ': shorter than ' + str(s['minLength'])]
+                           if isinstance(v, str) and len(v) < s.get('minLength', 0) else [])
+                        + ([p + ': below ' + str(s['minimum'])]
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)
+                              and 'minimum' in s and v < s['minimum'] else [])
+                        + ([p + ': above ' + str(s['maximum'])]
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)
+                              and 'maximum' in s and v > s['maximum'] else [])
+                        + [p + '.' + str(k) + ': required'
+                           for k in (s.get('required') or []) if isinstance(v, dict) and k not in v]
+                        + [p + '.' + str(k) + ': not allowed'
+                           for k in (v if isinstance(v, dict) else {})
+                           if s.get('additionalProperties') is False and k not in (s.get('properties') or {})]
+                        + [e for k, sub in (s.get('properties') or {}).items()
+                           if isinstance(v, dict) and k in v and isinstance(sub, dict)
+                           for e in self(self, v[k], sub, p + '.' + str(k))]
+                        + [e for i, x in enumerate(v if isinstance(v, list) and isinstance(s.get('items'), dict) else [])
+                           for e in self(self, x, s['items'], p + '[' + str(i) + ']')])) }}
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "llm-invoke: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-unknown-role
+      raise:
+        if: "{{ role not in known_roles }}"
+        type: error
+        error_type: AbortError
+        message: "llm-invoke: unknown role '{{ role }}'. Must be one of: {{ ', '.join(known_roles) }}"
+
+    # render_and_chat: the prompt decides messages, response_format and schema.
+    # prompt-render raises on an unresolved name (a bug, not an expected failure).
+    - task_name: render-prompt
+      skip_if: "{{ mode != 'render_and_chat' }}"
+      workflow:
+        ref: prompt-render
+        mode: inline
+        input:
+          mode: render
+          agent_id: "{{ agent_id }}"
+          name: "{{ prompt }}"
+          variables: "{{ variables or {} }}"
+          resolved_refs: "{{ resolved_refs or {} }}"
+      output:
+        set:
+          - rendered: "{{ (_ or {}).get('data') or {} }}"
+
+    - task_name: reject-non-chat-prompt
+      raise:
+        if: "{{ mode == 'render_and_chat' and rendered.get('kind') != 'chat' }}"
+        type: error
+        error_type: AbortError
+        message: "llm-invoke: prompt '{{ prompt }}' is not a chat prompt (kind {{ rendered.get('kind') }})"
+
+    - task_name: use-rendered-prompt
+      skip_if: "{{ mode != 'render_and_chat' }}"
+      set:
+        - messages: "{{ rendered.get('messages') or [] }}"
+        - response_format: "{{ rendered.get('response_format') }}"
+        - schema: "{{ rendered.get('schema') }}"
+        - prompt_version: "{{ rendered.get('version') }}"
+
+    # Role → endpoint, including the decision alias. Only max_tokens is taken
+    # from the call; everything else is config.
+    - task_name: resolve-role
+      set:
+        - _models: "{{ models or {} }}"
+        - _aliased: "{{ role == 'decision' and not _models.get('decision') }}"
+        - model_cfg#: >-
+            {{ dict(_models.get('inference') or {},
+                    max_tokens=_models.get('decision_default_max_tokens') or 600)
+               if _aliased else (_models.get(role) or {}) }}
+        - effective_max_tokens: "{{ int(max_tokens) if max_tokens else model_cfg.get('max_tokens') }}"
+        - call_timeout#: "{{ max(1, int(timeout_sec or model_cfg.get('timeout_sec') or 100)) }}"
+        - valid_messages: "{{ isinstance(messages, list) and len(messages) > 0 }}"
+        # tool_choice cannot be templated into the activity (the schema takes
+        # only a literal enum or object), so phase 2 adds one literal variant
+        # per value. Until then a non-null tool_choice is refused, not ignored.
+        - valid_input: "{{ valid_messages and tool_choice is None }}"
+        - started_at: "{{ now() }}"
+
+    # A role with no endpoint configured is misconfiguration: raise, don't
+    # pretend the model is down.
+    - task_name: reject-unconfigured-role
+      raise:
+        if: "{{ not model_cfg.get('apikey_secret_key') }}"
+        type: error
+        error_type: AbortError
+        message: "llm-invoke: role '{{ role }}' has no model configured (models.{{ role }})"
+
+    - task_name: reject-invalid-input
+      skip_if: '{{ bool(valid_input) }}'
+      set:
+        - error:
+            code: invalid_input
+            message: >-
+              {{ 'messages must be a non-empty list' if not valid_messages
+                 else 'tool_choice is not supported before phase 2' }}
+            retryable: false
+
+    # ── request 1: the configured model ─────────────────────────────────────
+    - task_name: call-model
+      skip_if: '{{ not valid_input }}'
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: "{{ model_cfg.get('apikey_secret_key') }}"
+          base_url: "{{ model_cfg.get('base_url') }}"
+          model_name: "{{ model_cfg.get('model') }}"
+          messages: "{{ messages }}"
+          tools: "{{ tools or None }}"
+          response_format: "{{ response_format }}"
+          max_tokens: "{{ effective_max_tokens }}"
+          temporature: "{{ model_cfg.get('temperature') }}"
+        options:
+          # One attempt: the turn budget cannot absorb a retry; fallback_model is the retry.
+          retry_policy:
+            timeout_sec: "{{ call_timeout }}"
+            max_attempts: 1
+      output:
+        set:
+          # The assistant message: a dict under Temporal (serialised), but the
+          # pydantic ChatCompletionMessage itself in an in-memory run.
+          - call_result: >-
+              {{ _ if isinstance(_, dict) or _ is None
+                 else _.model_dump(mode='json') }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - call_result: "{{ {'result': 'error', **_} }}"
+
+    - task_name: classify-primary
+      skip_if: '{{ not valid_input }}'
+      workflow:
+        function: classify-call
+        input:
+          call_result: "{{ call_result }}"
+      output:
+        set:
+          - outcome: "{{ _ }}"
+          - used_model: "{{ model_cfg.get('model') }}"
+          - calls: 1
+
+    # ── request 2: the fallback model, after a timeout or provider error ────
+    - task_name: call-fallback-model
+      skip_if: >-
+        {{ not (valid_input and outcome['failed'] and outcome['code'] in ['timeout', 'provider_error']
+                and model_cfg.get('fallback_model')) }}
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: "{{ model_cfg.get('apikey_secret_key') }}"
+          base_url: "{{ model_cfg.get('base_url') }}"
+          model_name: "{{ model_cfg.get('fallback_model') }}"
+          messages: "{{ messages }}"
+          tools: "{{ tools or None }}"
+          response_format: "{{ response_format }}"
+          max_tokens: "{{ effective_max_tokens }}"
+          temporature: "{{ model_cfg.get('temperature') }}"
+        options:
+          retry_policy:
+            timeout_sec: "{{ call_timeout }}"
+            max_attempts: 1
+      output:
+        set:
+          - fallback_result: >-
+              {{ _ if isinstance(_, dict) or _ is None
+                 else _.model_dump(mode='json') }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - fallback_result: "{{ {'result': 'error', **_} }}"
+
+    - task_name: classify-fallback
+      skip_if: "{{ fallback_result is None }}"
+      workflow:
+        function: classify-call
+        input:
+          call_result: "{{ fallback_result }}"
+      output:
+        set:
+          - outcome: "{{ _ }}"
+          - used_model: "{{ model_cfg.get('fallback_model') }}"
+          - calls: "{{ calls + 1 }}"
+
+    # ── schema: parse, and one repair request if the reply does not validate ─
+    - task_name: parse-reply
+      skip_if: "{{ not (valid_input and schema and not outcome['failed']) }}"
+      workflow:
+        function: parse-json
+        input:
+          content: "{{ outcome['content'] }}"
+          schema: "{{ schema }}"
+      output:
+        set:
+          - parse: "{{ _ }}"
+
+    - task_name: build-repair-messages
+      skip_if: "{{ not (valid_input and schema and not outcome['failed'] and parse['errors']) }}"
+      set:
+        - repair_messages: >-
+            {{ messages + [{'role': 'assistant', 'content': outcome['content']},
+                           {'role': 'user', 'content': repair_note.replace('{errors}', '; '.join(parse['errors'][:10]))}] }}
+
+    - task_name: repair-model
+      skip_if: "{{ not (valid_input and schema and not outcome['failed'] and parse['errors']) }}"
+      activity:
+        type: openai.chat.completions
+        input:
+          apikey_secret_key: "{{ model_cfg.get('apikey_secret_key') }}"
+          base_url: "{{ model_cfg.get('base_url') }}"
+          model_name: "{{ used_model }}"
+          messages: "{{ repair_messages }}"
+          response_format: "{{ response_format }}"
+          max_tokens: "{{ effective_max_tokens }}"
+          temporature: "{{ model_cfg.get('temperature') }}"
+        options:
+          retry_policy:
+            timeout_sec: "{{ call_timeout }}"
+            max_attempts: 1
+      output:
+        set:
+          - repair_result: >-
+              {{ _ if isinstance(_, dict) or _ is None
+                 else _.model_dump(mode='json') }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - repair_result: "{{ {'result': 'error', **_} }}"
+
+    - task_name: classify-repair
+      skip_if: "{{ repair_result is None }}"
+      workflow:
+        function: classify-call
+        input:
+          call_result: "{{ repair_result }}"
+      output:
+        set:
+          - repair_outcome: "{{ _ }}"
+          - calls: "{{ calls + 1 }}"
+
+    - task_name: parse-repair
+      skip_if: "{{ repair_result is None or repair_outcome['failed'] }}"
+      workflow:
+        function: parse-json
+        input:
+          content: "{{ repair_outcome['content'] }}"
+          schema: "{{ schema }}"
+      output:
+        set:
+          - parse: "{{ _ }}"
+          - outcome: "{{ repair_outcome }}"
+
+    - task_name: shape-result
+      skip_if: '{{ not valid_input }}'
+      set:
+        - _failed: "{{ outcome['failed'] }}"
+        - _invalid_json: "{{ (not _failed) and bool(schema) and bool(parse['errors']) }}"
+        - _code: "{{ outcome['code'] if _failed else ('invalid_json' if _invalid_json else None) }}"
+        - misconfig#: "{{ ('llm-invoke auth failure for role ' + role + ': ' + outcome['text'][:300]) if _code == 'auth' else None }}"
+        - elapsed_ms: "{{ int((now() - started_at).total_seconds() * 1000) }}"
+        # Estimated: the activity does not return usage (see header). Every
+        # request is counted, the repair with its two extra messages.
+        - _chars_in: "{{ sum(len(str(m.get('content') or '')) for m in messages if isinstance(m, dict)) }}"
+        - usage#:
+            role: "{{ role }}"
+            model: "{{ used_model }}"
+            max_tokens: "{{ effective_max_tokens }}"
+            calls: "{{ calls }}"
+            tokens_in: "{{ (_chars_in * calls) // 4 }}"
+            tokens_out: "{{ len(outcome['content']) // 4 }}"
+            estimated: true
+            elapsed_ms: "{{ elapsed_ms }}"
+        - ok: "{{ _code is None }}"
+        - data: >-
+            {{ None if _code is not None else
+               {'content': outcome['content'],
+                'parsed': parse['parsed'] if schema else None,
+                'tool_calls': outcome['tool_calls'],
+                'finish_reason': None,
+                'model': used_model,
+                'usage': usage,
+                'elapsed_ms': elapsed_ms,
+                'repaired': repair_result is not None,
+                'fallback_used': fallback_result is not None and used_model != model_cfg.get('model'),
+                'prompt_version': prompt_version} }}
+        - error: >-
+            {{ None if _code is None else
+               {'code': _code,
+                'message': ('reply did not match the schema after one repair: ' + '; '.join(parse['errors'][:10])
+                            if _code == 'invalid_json' else outcome['message'][:500]),
+                'retryable': _code in ['timeout', 'provider_error']} }}

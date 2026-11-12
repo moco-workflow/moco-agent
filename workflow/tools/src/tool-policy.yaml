@@ -1,0 +1,462 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-POLICY — which tools may be offered, and how each may run (design §6.9.7)
+# ================================================================================
+#
+#   mode     in                                       data out
+#   ──────── ──────────────────────────────────────── ─────────────────────────────
+#   resolve  config, toolsets, session_id?            {offerable: [manifest + effective_permission,
+#                                                       grant_used, deprecated], always_offer,
+#                                                       needs_credential: [{name, connect_hint}],
+#                                                       hidden: [{name, reason}]}
+#   grant    session_id, name, tool_version?          {grant}    (only from an approval decision)
+#   revoke   session_id?, name                        {revoked: [session_id, ...]}
+#   set_pref   name, permission: auto|approve|deny    {pref}      (phase 3)
+#   clear_pref name                                   {cleared}
+#   list_prefs —                                      {prefs: [{name, permission, set_at}]}
+#
+# THE ONLY PLACE PERMISSION LOGIC LIVES (§6.9.7). Effective permission is the most
+# restrictive of the layers, in strictness order auto < approve < deny:
+#   manifest          policy.permission: the baseline
+#   agent override    config.tools.overrides.<name>.permission (or a bare string). It
+#                     may tighten anything; it may loosen only down to the DEFAULT for
+#                     the tool's side_effects (auto for none/read, approve otherwise),
+#                     and never to auto for write/external
+#   user preference   tool_pref:<name> (phase 3): the user may TIGHTEN any tool to
+#                     approve or deny. `auto` LOOSENS approve → auto only for a read-only
+#                     tool (side_effects none/read) whose manifest itself asks approve,
+#                     allows session grants (the author's consent to per-user auto) and
+#                     has no agent override -- the agent's own tightening always holds
+#   session grant     tool_grant:<sid>:<name> turns approve into auto, only when the
+#                     manifest has allow_session_grant: true. Never lifts a deny
+#   guest rule        `access authorize call_tool {side_effects}` (one call per
+#                     distinct side_effects value): a guest gets none-effect tools only
+# deny always wins. The per-call layers (guard check_tool_call, the tool.before
+# hook) only escalate, in tool-executor and agent-loop.
+#
+# A tool is HIDDEN (never offered) when: its status is not enabled/deprecated
+# (`status`), the caller is not in enabled_for.users or is in denied_users
+# (`not_enabled_for_user`; "guest" there matches every guest), access refuses it
+# (`guest`, `denied_user`), or the effective permission is deny (`denied`).
+# `deprecated` tools are offerable but flagged, so the selector offers them only
+# when pinned. A tool whose user credential is missing goes to `needs_credential`
+# instead (builtin.secret.list returns NAMES only): not offered, and the context
+# gets a notice telling the user which secret to store.
+#
+# MEMBERSHIP comes from `tool-registry members` (toolset rows ∪ manifests'
+# toolsets, an agent row shadowing a shared one; the harness built-ins included).
+#
+# PREFS live with the user: `tool_pref:<name>`, topic tool-pref, in `<uid>:agent.<id>`
+# (§8). Only this wfspec touches them. set_pref stores any of the three words; resolve
+# decides whether an `auto` applies (the manifest may change after it was set), and
+# reports it as pref_used. Guests cannot write prefs (access write, scope user).
+#
+# GRANTS live with the session: `tool_grant:<sid>:<name>`, topic tool-grant, in
+# `<uid>:agent.<id>.sessions` (§8). Only this wfspec touches them. `grant` is called by
+# the session -- the row's one live writer -- after an "approve for this session"
+# decision; resolve re-checks allow_session_grant, so a stale grant on a tool whose
+# manifest has since dropped it grants nothing. `revoke` without a session_id
+# revokes the tool's grants in every session of this user.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-policy
+
+context:
+  valid_modes: ["resolve", "grant", "revoke", "set_pref", "clear_pref", "list_prefs"]
+  pref_modes: ["set_pref", "clear_pref", "list_prefs"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  name_pattern: "^[a-z][a-z0-9_]{1,48}$"
+  strictness: {auto: 0, approve: 1, deny: 2}
+  offerable_statuses: ["enabled", "deprecated"]
+  schema_version: 1
+  ok: false
+  data:
+  error:
+  # Seeded: their tasks are skipped on some paths.
+  members: {}
+  grant_keys: []
+  user_secrets: []
+  effect_authz: []
+  role: user
+  revoked: []
+  pref_keys: []
+  prefs: []
+  pref_row:
+
+input:
+  mode: resolve
+  agent_id:
+  config: {}
+  toolsets: []
+  session_id:
+  name:
+  tool_version:
+  # set_pref
+  permission:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "tool-policy: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - sid: '{{ str(session_id or "").strip() }}'
+        - tname: '{{ str(name or "").strip() }}'
+        - sessions_ns: "agent.{{ aid }}.sessions"
+        - user_ns: "agent.{{ aid }}"
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - _bad#: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'session_id must match ' + session_id_pattern
+                 if (sid or mode == 'grant') and not re.match(session_id_pattern, sid) else
+               'name must match ' + name_pattern if mode in ['grant', 'revoke', 'set_pref', 'clear_pref'] and not re.match(name_pattern, tname) else
+               'permission must be one of auto, approve, deny' if mode == 'set_pref' and permission not in strictness else
+               'toolsets must be a list' if mode == 'resolve' and not isinstance(toolsets, list) else None }}
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+        - proceed: "{{ _bad is None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RESOLVE
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-resolve
+      skip_if: "{{ not proceed or mode != 'resolve' }}"
+      tasks:
+        - task_name: read-members
+          skip_if: "{{ not toolsets }}"
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input:
+              mode: members
+              agent_id: "{{ aid }}"
+              toolsets: "{{ toolsets }}"
+          output:
+            set:
+              - members: "{{ ((_ or {}).get('data') or {}) }}"
+
+        - task_name: plan-resolve
+          set:
+            - tools: "{{ [t for t in (members.get('tools') or []) if isinstance(t, dict)] }}"
+            - effects: "{{ sorted(set(str((t.get('policy') or {}).get('side_effects')) for t in tools)) }}"
+            - need_secrets: "{{ any((t.get('credential') or {}).get('mode') == 'user' for t in tools) }}"
+
+        - task_name: list-grants
+          skip_if: "{{ not sid or not tools }}"
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: false
+              namespace: "{{ sessions_ns }}"
+              key_pattern: "tool_grant:{{ sid }}:*"
+              topic_pattern: tool-grant
+          output:
+            set:
+              - grant_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+        - task_name: list-user-secrets
+          skip_if: "{{ not need_secrets }}"
+          activity:
+            type: builtin.secret.list
+            input: {in_global_ns: false}
+          output:
+            set:
+              - user_secrets: "{{ [str(k) for k in (_ or [])] }}"
+
+        # The guest / denied rules stay in `access`: one authorize per side_effects value.
+        - task_name: authorize-effects
+          skip_if: "{{ not tools }}"
+          loop:
+            in: "{{ effects }}"
+            foreach: effect
+            execute_mode: parallel
+            do:
+              task_name: authorize-effect
+              workflow:
+                ref: agent-harness-foundation/access
+                mode: inline
+                input:
+                  mode: authorize
+                  agent_id: "{{ aid }}"
+                  action: call_tool
+                  resource: {side_effects: "{{ effect }}"}
+                  definition_access: "{{ (config or {}).get('access') or {} }}"
+          output:
+            set:
+              - effect_authz: "{{ [((r or {}).get('data') or {}) for r in (_ or [])] }}"
+
+        - task_name: identify-caller
+          skip_if: "{{ not tools }}"
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: identify
+              agent_id: "{{ aid }}"
+              definition_access: "{{ (config or {}).get('access') or {} }}"
+          output:
+            set:
+              - role: "{{ (((_ or {}).get('data') or {}).get('role')) or 'user' }}"
+
+        # User preferences (phase 3): keys, then one read each (list_states returns keys).
+        - task_name: list-pref-keys
+          skip_if: "{{ not tools or role == 'guest' }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ user_ns }}", key_pattern: "tool_pref:*", topic_pattern: tool-pref}
+          output:
+            set:
+              - pref_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict) and str(r.get('key')).split(':', 1)[-1] in [t.get('name') for t in tools]] }}"
+
+        - task_name: read-prefs
+          skip_if: "{{ not pref_keys }}"
+          loop:
+            in: "{{ pref_keys }}"
+            foreach: pref_key
+            execute_mode: parallel
+            do:
+              task_name: read-pref
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ user_ns }}", key: "{{ pref_key }}"}
+          output:
+            set:
+              - prefs: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('name')] }}"
+
+        - task_name: compute-policy
+          set:
+            - _authz: "{{ dict(zip(effects, effect_authz)) }}"
+            - _overrides: "{{ (((config or {}).get('tools') or {}).get('overrides') or {}) }}"
+            - _granted: "{{ [str(k).split(':', 2)[2] for k in grant_keys if str(k).count(':') >= 2] }}"
+            - _order: "{{ ['auto', 'approve', 'deny'] }}"
+            - _pol: "{{ {t.get('name'): (t.get('policy') or {}) for t in tools} }}"
+            # Layers 1-2. An unknown permission word counts as deny (fails closed).
+            - _base: "{{ {n: p.get('permission') if p.get('permission') in strictness else 'deny' for n, p in _pol.items()} }}"
+            - _ov: >-
+                {{ {n: (None if o is None else o if o in strictness else 'deny')
+                    for n, o in ((n, (lambda v: v.get('permission') if isinstance(v, dict) else v)(_overrides.get(n)))
+                                 for n in _pol)} }}
+            # The loosening floor: the side_effects default (auto for none/read, else
+            # approve), which is also "never auto for write/external".
+            - _floor: "{{ {n: 0 if p.get('side_effects') in ['none', 'read'] else 1 for n, p in _pol.items()} }}"
+            - _eff: >-
+                {{ {n: _base[n] if _ov[n] is None else
+                       _ov[n] if strictness[_ov[n]] >= strictness[_base[n]] else
+                       _order[max(strictness[_ov[n]], _floor[n])]
+                    for n in _pol} }}
+            # Layer 3 (phase 3): the user's preference. Tighten anything; loosen
+            # approve → auto only for a read-only tool whose manifest asks approve and
+            # allows session grants, with no agent override.
+            - _pref: "{{ {str(r['name']): r.get('permission') for r in prefs if r.get('permission') in strictness and role != 'guest'} }}"
+            - _pref_used: >-
+                {{ {n: n in _pref and (strictness[_pref[n]] > strictness[_eff[n]]
+                                       or (_pref[n] == 'auto' and _eff[n] == 'approve' and _base[n] == 'approve' and _ov[n] is None
+                                           and _pol[n].get('side_effects') in ['none', 'read'] and _pol[n].get('allow_session_grant') is True))
+                    for n in _pol} }}
+            - _eff: "{{ {n: (_pref[n] if _pref_used[n] else _eff[n]) for n in _pol} }}"
+            # Layer 4: a grant lifts approve to auto, only where the manifest allows it.
+            - _grant_used: >-
+                {{ {n: _eff[n] == 'approve' and _pol[n].get('allow_session_grant') is True and n in _granted
+                    for n in _pol} }}
+            - _eu: "{{ {n: (p.get('enabled_for') or {}) for n, p in _pol.items()} }}"
+            # (manifest, verdict): ('hidden', reason) | ('needs_credential', hint) | ('offer', permission)
+            - _rows: >-
+                {{ [(t, ('hidden', 'status') if t.get('status') not in offerable_statuses else
+                        ('hidden', 'not_enabled_for_user')
+                          if not ('*' in (_eu[n].get('users') or ['*']) or uid in (_eu[n].get('users') or []))
+                             or uid in (_eu[n].get('denied_users') or [])
+                             or (role == 'guest' and 'guest' in (_eu[n].get('denied_users') or [])) else
+                        ('hidden', str((_authz.get(str(_pol[n].get('side_effects'))) or {}).get('reason') or 'denied'))
+                          if not (_authz.get(str(_pol[n].get('side_effects'))) or {}).get('allow') else
+                        ('hidden', 'denied') if _eff[n] == 'deny' else
+                        ('needs_credential', str(_c.get('connect_hint')
+                                                 or 'Store your secret ' + str(_c.get('secret_key')) + ' to enable this tool.'))
+                          if _c.get('mode') == 'user' and str(_c.get('secret_key') or '') not in user_secrets else
+                        ('offer', 'auto' if _grant_used[n] else _eff[n]))
+                    for t, n, _c in ((t, t.get('name'), (t.get('credential') or {})) for t in tools)] }}
+            - _offer: >-
+                {{ [dict(t, effective_permission=v[1], grant_used=_grant_used[t.get('name')],
+                         pref_used=_pref_used[t.get('name')], deprecated=t.get('status') == 'deprecated')
+                    for t, v in _rows if v[0] == 'offer'] }}
+            - _offer_names: "{{ [t.get('name') for t in _offer] }}"
+            - ok: true
+            - data: >-
+                {{ {'offerable': _offer,
+                    'always_offer': sorted(set(n for ts in (members.get('toolsets') or {}).values()
+                                               for n in ((ts or {}).get('always_offer') or []) if n in _offer_names)),
+                    'needs_credential': [{'name': t.get('name'), 'connect_hint': v[1]} for t, v in _rows if v[0] == 'needs_credential'],
+                    'hidden': [{'name': t.get('name'), 'reason': v[1]} for t, v in _rows if v[0] == 'hidden'],
+                    'role': role} }}
+            - decision#: "{{ {'offer': _offer_names, 'other': [(t.get('name'), v[1]) for t, v in _rows if v[0] != 'offer']} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GRANT / REVOKE
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-write
+      skip_if: "{{ not proceed or mode not in ['grant', 'revoke'] }}"
+      tasks:
+        - task_name: authorize-write
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: authorize
+              agent_id: "{{ aid }}"
+              action: write
+              scope: session
+              definition_access: "{{ (config or {}).get('access') or {} }}"
+          output:
+            set:
+              - authz: "{{ (_ or {}).get('data') or {} }}"
+
+        - task_name: plan-write
+          set:
+            - allowed: "{{ bool(authz.get('allow')) }}"
+            - error: >-
+                {{ None if allowed else
+                   {'code': 'forbidden', 'message': 'not allowed to change tool grants (' + str(authz.get('reason')) + ')', 'retryable': False} }}
+            - grant_row: >-
+                {{ {'schema_version': schema_version, 'session_id': sid, 'name': tname,
+                    'tool_version': tool_version, 'granted_at': now().isoformat(), 'granted_by': uid}
+                   if allowed and mode == 'grant' else None }}
+
+        - task_name: write-grant
+          skip_if: "{{ grant_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ sessions_ns }}"
+              key: "tool_grant:{{ sid }}:{{ tname }}"
+              value: "{{ grant_row }}"
+              topic: tool-grant
+
+        - task_name: list-revocable
+          skip_if: "{{ not allowed or mode != 'revoke' }}"
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: false
+              namespace: "{{ sessions_ns }}"
+              key_pattern: "tool_grant:{{ sid or '*' }}:{{ tname }}"
+              topic_pattern: tool-grant
+          output:
+            set:
+              - revoked: >-
+                  {{ [r.get('key') for r in (_ or [])
+                      if isinstance(r, dict) and str(r.get('key')).endswith(':' + tname)] }}
+
+        - task_name: delete-grants
+          skip_if: "{{ not allowed or mode != 'revoke' or not revoked }}"
+          loop:
+            in: "{{ revoked }}"
+            foreach: grant_key
+            execute_mode: parallel
+            do:
+              task_name: delete-grant
+              activity:
+                type: builtin.state.del_state
+                input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ grant_key }}"}
+
+        - task_name: shape-write
+          set:
+            - ok: "{{ allowed }}"
+            - data: >-
+                {{ None if not allowed else
+                   {'grant': grant_row} if mode == 'grant' else
+                   {'revoked': [str(k).split(':', 2)[1] for k in revoked]} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PREFS (phase 3) — the user's own tool_pref:<name> rows
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-prefs
+      skip_if: "{{ not proceed or mode not in pref_modes }}"
+      tasks:
+        - task_name: authorize-pref
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: authorize
+              agent_id: "{{ aid }}"
+              action: "{{ 'read' if mode == 'list_prefs' else 'write' }}"
+              scope: user
+              definition_access: "{{ (config or {}).get('access') or {} }}"
+          output:
+            set:
+              - authz: "{{ (_ or {}).get('data') or {} }}"
+
+        - task_name: plan-pref
+          set:
+            - allowed: "{{ bool(authz.get('allow')) }}"
+            - error: >-
+                {{ None if allowed else
+                   {'code': 'forbidden', 'message': 'not allowed to change tool preferences (' + str(authz.get('reason')) + ')', 'retryable': False} }}
+            - pref_row: >-
+                {{ {'schema_version': schema_version, 'name': tname, 'permission': permission, 'set_at': now().isoformat(), 'set_by': uid}
+                   if allowed and mode == 'set_pref' else None }}
+
+        - task_name: write-pref
+          skip_if: "{{ pref_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ user_ns }}"
+              key: "tool_pref:{{ tname }}"
+              value: "{{ pref_row }}"
+              topic: tool-pref
+
+        - task_name: delete-pref
+          skip_if: "{{ not allowed or mode != 'clear_pref' }}"
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: false, namespace: "{{ user_ns }}", key: "tool_pref:{{ tname }}"}
+
+        - task_name: list-own-pref-keys
+          skip_if: "{{ not allowed or mode != 'list_prefs' }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ user_ns }}", key_pattern: "tool_pref:*", topic_pattern: tool-pref}
+          output:
+            set:
+              - pref_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+        - task_name: read-own-prefs
+          skip_if: "{{ not allowed or mode != 'list_prefs' or not pref_keys }}"
+          loop:
+            in: "{{ pref_keys }}"
+            foreach: own_pref_key
+            execute_mode: parallel
+            do:
+              task_name: read-own-pref
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ user_ns }}", key: "{{ own_pref_key }}"}
+          output:
+            set:
+              - prefs: "{{ sorted([r for r in (_ or []) if isinstance(r, dict) and r.get('name')], key=lambda r: str(r['name'])) }}"
+
+        - task_name: shape-pref
+          set:
+            - ok: "{{ allowed }}"
+            - data: >-
+                {{ None if not allowed else
+                   {'pref': pref_row} if mode == 'set_pref' else
+                   {'cleared': tname} if mode == 'clear_pref' else
+                   {'prefs': [{'name': r['name'], 'permission': r.get('permission'), 'set_at': r.get('set_at')} for r in prefs]} }}
+

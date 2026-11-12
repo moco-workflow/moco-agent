@@ -1,0 +1,531 @@
+test_type: unit-test
+
+# check-manifest (plan-10 step 2, design §6.9.3): one case per validate rule. The
+# step reads the row as `current` plus the outside facts (package catalogs, global
+# secret names). The wfspec's context supplies the constants. Each case spells its
+# manifest out in full: the test loader does not resolve YAML merge keys (`<<`), and
+# unit-test input is one evaluated map, so its keys cannot build on each other.
+# `current#literal` keeps the manifest templates unevaluated.
+
+wfspec:
+  name: tool-registry
+
+test_groups:
+  - step_name: check-manifest
+    test_cases:
+
+      - id: a-valid-manifest-has-no-problems
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: a-wfspec-binding-deployed-in-the-harness-is-valid
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"wfspec": {"name": "tool.moco-builtin"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: an-mcp-binding-with-endpoint-and-tool-name-is-valid
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"mcp": {"endpoint": "https://mcp.example.com/jira", "tool_name": "search"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: a-service-credential-that-exists-is-valid
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "service", "secret_key": "global/K8S_TOKEN"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: never-shell-builtin-state-claude-agent-deploy-or-graphql
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "shell.run", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ len(manifest_problems) == 1 and manifest_problems[0].startswith('activity shell.run is not on the allowlist') }}"
+
+      - id: builtin-state-is-not-allowlisted
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "builtin.state.get_state", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: builtin-secret-is-not-allowlisted
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "builtin.secret.get", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: claude-agent-is-not-allowlisted
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "claude_agent.query", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: builtin-deploy-is-not-allowlisted
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "builtin.deploy.get_user", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: graphql-is-not-allowlisted
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "graphql.query", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: k8s-allows-only-get-and-list
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.delete", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'not on the allowlist' in manifest_problems[0] }}"
+
+      - id: a-prefix-entry-allows-the-family
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "http.request", "input_template": {}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "external", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: no-binding-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['binding must be exactly one of wfspec, activity, mcp'] }}"
+
+      - id: two-bindings-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "http.request"}, "mcp": {"endpoint": "https://x", "tool_name": "t"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'binding must be exactly one of wfspec, activity, mcp' in manifest_problems }}"
+
+      - id: a-builtin-binding-is-harness-only
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"builtin": {"module": "knowledge", "mode": "retrieve"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'binding builtin is harness-only (tool-catalog)' in manifest_problems }}"
+
+      - id: a-wfspec-binding-must-be-a-tool-wfspec
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"wfspec": {"name": "agent-session"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [\"wfspec binding must name a tool.* wfspec, got 'agent-session'\"] }}"
+
+      - id: an-undeployed-wfspec-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"wfspec": {"name": "tool.nope"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['wfspec tool.nope is not deployed in agent-harness-tools'] }}"
+
+      - id: an-mcp-binding-needs-an-http-endpoint
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"mcp": {"endpoint": "file:///etc/passwd", "tool_name": "search"}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['mcp binding needs an http(s) endpoint and a tool_name'] }}"
+
+      - id: parameters-must-be-an-object-schema
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "string"}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'parameters must be {type: object, properties: {...}}' in manifest_problems }}"
+
+      - id: required-must-name-declared-properties
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a", "b"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['parameters.required must name declared properties'] }}"
+
+      - id: each-property-needs-a-known-type-and-a-non-empty-enum
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"a": {"type": "str"}, "b": {"type": "string", "enum": []}, "c": {"type": "integer"}}}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ len(manifest_problems) == 1 and manifest_problems[0].startswith('parameter a, b: each needs a type') }}"
+
+      - id: a-template-may-not-use-dunders
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}, "approval_template": "{{ __user_info__ }}"}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['templates may not use dunder names'] }}"
+
+      - id: an-unbalanced-template-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"max_chars": 8000, "shape": "{{ result['items']"}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['unbalanced expression braces in a template'] }}"
+
+      - id: a-template-must-be-a-string
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"max_chars": 8000, "shape": [1, 2]}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ 'templates must be strings (input_template a mapping)' in manifest_problems }}"
+
+      - id: side-effects-must-be-stated
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['policy.side_effects must be one of none, read, write, external'] }}"
+
+      - id: permission-must-be-known
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "sometimes", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['policy.permission must be one of auto, approve, deny'] }}"
+
+      - id: limits-must-be-positive-integers
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 0, "per_session": true}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['policy.limits per_turn and per_session must be positive integers'] }}"
+
+      - id: an-async-tool-is-valid-with-a-long-timeout
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 1800, "mode": "async", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: a-sync-tool-keeps-the-short-timeout-cap
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 1800, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['execution.timeout_sec must be an integer in 1..300'] }}"
+
+      - id: an-unknown-execution-mode-is-rejected
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "batch", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['execution.mode must be sync or async'] }}"
+
+      - id: timeout-and-retry-are-bounded
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 900, "mode": "sync", "retry": {"max_attempts": 9}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['execution.timeout_sec must be an integer in 1..300', 'execution.retry.max_attempts must be an integer in 1..3'] }}"
+
+      - id: max-chars-must-be-positive
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"max_chars": 0}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['result.max_chars must be a positive integer'] }}"
+
+      - id: a-service-credential-must-be-global
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "service", "secret_key": "K8S_TOKEN"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['a service credential is a global secret: global/<NAME>'] }}"
+
+      - id: a-missing-service-secret-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "service", "secret_key": "global/JIRA_TOKEN"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['service secret global/JIRA_TOKEN does not exist'] }}"
+
+      - id: a-user-credential-is-not-global
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "user", "secret_key": "global/JIRA_TOKEN"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == [\"a user credential is the user's own secret: drop the global/ prefix\"] }}"
+
+      - id: a-malformed-secret-name-is-a-problem
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "user", "secret_key": "bad name!"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['credential.secret_key must match ^(global/)?[A-Za-z0-9_.-]{1,128}$'] }}"
+
+      - id: credential-mode-must-be-known
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "oauth"}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['credential.mode must be one of none, service, user'] }}"
+
+      - id: description-is-required
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "  ", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["k8s-readonly"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['description is required'] }}"
+
+      - id: toolset-names-are-checked
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_pods", "description": "List the pods in a namespace.", "parameters": {"type": "object", "properties": {"namespace": {"type": "string"}, "kind": {"type": "string", "enum": ["Pod"]}}, "required": ["namespace"]}, "binding": {"activity": {"type": "k8s.list", "input_template": {"kind": "Pod", "namespace": "{{ args['namespace'] }}"}}}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "credential": {"mode": "none", "secret_key": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "approval_template": "List pods in {{ args['namespace'] }}?", "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": ["K8S"]}
+        expect:
+          assert:
+            - "{{ manifest_problems == ['toolsets must match ^[a-z][a-z0-9-]{1,31}$'] }}"
+
+      - id: an-http-binding-cannot-carry-a-credential-f49
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN", "JIRA_TOKEN"]
+          current#literal: {"name": "jira_search", "description": "Search Jira.", "parameters": {"type": "object", "properties": {"jql": {"type": "string"}}, "required": ["jql"]}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "policy": {"side_effects": "external", "permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": [], "binding": {"activity": {"type": "http.request", "input_template": {}}}, "credential": {"mode": "service", "secret_key": "global/JIRA_TOKEN"}}
+        expect:
+          assert:
+            - "{{ len(manifest_problems) == 1 and 'takes no secret name (F49)' in manifest_problems[0] }}"
+
+      - id: an-mcp-binding-cannot-carry-a-credential-f49
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN", "JIRA_TOKEN"]
+          current#literal: {"name": "jira_search", "description": "Search Jira.", "parameters": {"type": "object", "properties": {"jql": {"type": "string"}}, "required": ["jql"]}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": [], "binding": {"mcp": {"endpoint": "https://mcp.example.com", "tool_name": "search"}}, "credential": {"mode": "user", "secret_key": "JIRA_TOKEN"}}
+        expect:
+          assert:
+            - "{{ len(manifest_problems) == 1 and 'mcp.call_tool takes no secret name (F49)' in manifest_problems[0] }}"
+
+      - id: a-k8s-binding-may-carry-a-service-credential
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access", "tool.moco-builtin"]}
+          global_secrets: ["K8S_TOKEN", "JIRA_TOKEN"]
+          current#literal: {"name": "jira_search", "description": "Search Jira.", "parameters": {"type": "object", "properties": {"jql": {"type": "string"}}, "required": ["jql"]}, "result": {"schema": null, "shape": null, "max_chars": 8000, "sources": null}, "policy": {"side_effects": "read", "permission": "auto", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 4, "per_session": 50}}, "execution": {"timeout_sec": 30, "mode": "sync", "retry": {"max_attempts": 1}}, "toolsets": [], "binding": {"activity": {"type": "k8s.list", "input_template": {"connection": {"token_secret_key": "global/K8S_TOKEN"}}}}, "credential": {"mode": "service", "secret_key": "global/K8S_TOKEN"}}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"
+
+      - id: a-whole-expression-ending-in-nested-braces-is-balanced
+        input:
+          mode: "validate"
+          valid: true
+          run_checks: true
+          cat_harness: {"wfspecs": ["access"]}
+          global_secrets: ["K8S_TOKEN"]
+          current#literal: {"name": "k8s_get_secret", "description": "Secret keys.", "parameters": {"type": "object", "properties": {}}, "binding": {"activity": {"type": "k8s.get", "input_template": {}}}, "result": {"shape": "{{ {'keys': {k: len(v) for k, v in result['data'].items()}} }}", "max_chars": 2000}, "credential": {"mode": "none"}, "policy": {"side_effects": "read", "permission": "approve", "idempotent": true, "allow_session_grant": false, "limits": {"per_turn": 2, "per_session": 10}}, "execution": {"timeout_sec": 20, "mode": "sync", "retry": {"max_attempts": 2}}, "toolsets": []}
+        expect:
+          assert:
+            - "{{ manifest_problems == [] }}"

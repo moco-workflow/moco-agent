@@ -1,0 +1,176 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-JANITOR — the agent-wide cost rollup (§6.10.5)
+# ================================================================================
+#
+#   in                 out
+#   ────────────────── ────────────────────────────────────────────────────────────
+#   max_usage_rows?    {ok, data: {agents, usage_tokens: {aid: n}, paused_changed}, error}
+#
+# Started hourly by its schedule (agent-harness.janitor, installed by agent-schedules),
+# or by an admin. Idempotent.
+#
+# COST ROLLUP: for agents with limits.cost.agent_daily_tokens (or a pause set), today's
+# usage rows are summed across the agent's users; over the cap → agent-config save
+# {limits: {paused: true}} (agent tier, the schedule's user is the agent's admin), and
+# a later day under the cap clears it. The sessions refuse turns while paused. The rows
+# are GLOBAL counters, `usage_day:<day>:<uid>` in `agent.<aid>.usage`, written by each
+# user's session (agent-session) -- this job reads no user's namespace.
+#
+# NO LONGER HERE (F50 closed: nobody can address another user's namespace). Each is
+# done as the user, lazily:
+#   reaping dead sessions, expiring their pending actions, retention, memory caps and
+#   decay   → session-housekeep (spawned by agent-session at every idle stop)
+#   stuck jobs → job-manager reconcile (the session's init)
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-janitor
+
+context:
+  agent_ids: []
+  agent_configs: {}
+  usage_refs: []
+  agent_tokens: {}
+  pause_changes: []
+  paused_changed: []
+  ok: true
+  error:
+  data:
+
+input:
+  max_usage_rows: 5000
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: list-agents
+      workflow:
+        ref: agent-harness-foundation/agent-registry
+        mode: inline
+        input: {mode: list}
+      output:
+        set:
+          - agent_ids: "{{ sorted(str(a.get('agent_id')) for a in ((((_ or {}).get('data') or {}).get('agents')) or []) if a.get('agent_id')) }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'agent_list_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+
+    - task_name: resolve-agent-configs
+      skip_if: "{{ not agent_ids }}"
+      loop:
+        in: "{{ agent_ids }}"
+        foreach: janitor_aid
+        # Sequential (F52): parallel iterations whose inline child starts the same
+        # sync grandchild (agent-registry's package-catalog) collide on its workflow id.
+        execute_mode: sequential
+        do:
+          task_name: resolve-agent-config
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input: {mode: resolve, agent_id: "{{ janitor_aid }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          # Only agents with a cost cap or a pause to clear.
+          - agent_configs: >-
+              {{ {a: c for a, r in zip(agent_ids, _ or [])
+                  for c in [((r or {}).get('data') or {}).get('config') if isinstance(r, dict) and r.get('ok') else None]
+                  if c and ((((c.get('limits') or {}).get('cost') or {}).get('agent_daily_tokens') is not None)
+                            or (c.get('limits') or {}).get('paused') is True)} }}
+
+    - task_name: list-usage-keys
+      skip_if: "{{ not agent_configs }}"
+      loop:
+        in: "{{ sorted(agent_configs) }}"
+        foreach: usage_aid
+        execute_mode: parallel
+        do:
+          task_name: list-usage-day
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: true
+              namespace: "agent.{{ usage_aid }}.usage"
+              key_pattern: "usage_day:{{ now().date().isoformat() }}:*"
+              topic_pattern: usage
+              limit: "{{ int(max_usage_rows) }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - usage_refs: >-
+              {{ [{'aid': a, 'key': r.get('key')} for a, rows in zip(sorted(agent_configs), _ or [])
+                  for r in (rows or []) if isinstance(r, dict) and r.get('key')] }}
+
+    - task_name: read-usage-rows
+      skip_if: "{{ not usage_refs }}"
+      loop:
+        in: "{{ usage_refs }}"
+        foreach: usage_ref
+        execute_mode: parallel
+        do:
+          task_name: read-usage-row
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "agent.{{ usage_ref['aid'] }}.usage", key: "{{ usage_ref['key'] }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - agent_tokens: >-
+              {{ {a: sum(int((r or {}).get('tokens_in') or 0) + int((r or {}).get('tokens_out') or 0)
+                         for ref, r in zip(usage_refs, _ or []) if ref['aid'] == a and isinstance(r, dict))
+                  for a in sorted(agent_configs)} }}
+
+    # An agent with no usage row today counts 0 tokens (it can be un-paused).
+    - task_name: plan-pause
+      set:
+        - _used: "{{ {a: int(agent_tokens.get(a) or 0) for a in sorted(agent_configs)} }}"
+        - pause_changes#: >-
+            {{ [(a, want) for a, used in _used.items()
+                for want in [(((agent_configs[a].get('limits') or {}).get('cost') or {}).get('agent_daily_tokens') is not None
+                              and used >= int(((agent_configs[a].get('limits') or {}).get('cost') or {})['agent_daily_tokens']))]
+                if want != ((agent_configs[a].get('limits') or {}).get('paused') is True)] }}
+
+    # The flag is agent-tier config; the schedule's user is the agent's admin.
+    - task_name: apply-pause
+      skip_if: "{{ not pause_changes }}"
+      loop:
+        in: "{{ pause_changes }}"
+        foreach: pause_change
+        do:
+          task_name: save-pause
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input:
+              mode: save
+              agent_id: "{{ pause_change[0] }}"
+              scope: agent
+              patch: {limits: {paused: "{{ pause_change[1] }}"}}
+          on_error:
+            catch: true
+      output:
+        set:
+          - paused_changed: "{{ [{'agent': c[0], 'paused': c[1], 'ok': (r or {}).get('ok') == True} for c, r in zip(pause_changes, _ or [])] }}"
+
+    - task_name: shape-report
+      set:
+        - ok: "{{ ok and all(c['ok'] for c in paused_changed) }}"
+        - error: >-
+            {{ error if error is not None else
+               None if all(c['ok'] for c in paused_changed) else
+               {'code': 'partial', 'message': 'a pause change could not be saved', 'retryable': True} }}
+        - data: "{{ {'agents': sorted(agent_configs), 'usage_tokens': agent_tokens, 'paused_changed': paused_changed} }}"

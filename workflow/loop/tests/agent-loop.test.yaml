@@ -1,0 +1,203 @@
+test_type: integration-test
+
+# agent-loop, phase 1 (plan-11 steps 2-8; design §6.8). Its children are mocked by
+# task name: `retrieve-passages` (knowledge), `screen-passages` / `check-output`
+# (guard), `invoke-model` (llm-invoke). A sentinel mock (1 / 0) proves a step did
+# not run.
+
+wfspec:
+  name: agent-loop
+
+test_data:
+  config: &config
+    models: {inference: {model: m, apikey_secret_key: K}}
+    knowledge: {sources: [moco-docs]}
+    decisions: {guard: {grounded_min_p: 0.5}}
+    profiles: [chat, rag]
+  chat: &chat
+    name: chat
+    kind: loop
+    loop: {model_role: inference, prompt: loop, retrieval: {when: none}, output_checks: [], grounding: none}
+  rag: &rag
+    name: rag
+    kind: loop
+    loop:
+      model_role: inference
+      prompt: rag.answer
+      retrieval: {when: before, sources: from_router, on_empty: decline}
+      output_checks: [check_output]
+      grounding: passages
+      decline_message: "I couldn't find that in {searched}. I can answer questions about {catalog}."
+  bundle: &bundle
+    blocks: [{id: question, items: [{original: "q", rewritten: ""}]}]
+    used_memory: ["mem:fact:helm"]
+  answer_ok: &answer_ok
+    ok: true
+    data: {content: "Set max_attempts in the retry_policy [2].", model: m, usage: {calls: 1, tokens_in: 100, tokens_out: 10}, elapsed_ms: 800}
+  retrieved: &retrieved
+    ok: true
+    data:
+      passages:
+        - {n: 1, text: "Activities run tasks.", title: activities, url: "http://d/a", source: moco-docs}
+        - {n: 2, text: "retry_policy sets max_attempts.", title: retries, url: "http://d/r", source: moco-docs}
+      searched: [moco-docs]
+      failed: []
+      empty: false
+  screened: &screened
+    ok: true
+    data:
+      items:
+        - {n: 1, text: "Activities run tasks.", title: activities, url: "http://d/a", source: moco-docs, injection_p: 0.05, action: fence}
+        - {n: 2, text: "retry_policy sets max_attempts.", title: retries, url: "http://d/r", source: moco-docs, injection_p: 0.04, action: fence}
+      degraded: false
+  sentinel: &sentinel "{{ 1 / 0 }}"
+
+test_cases:
+
+  # ── chat: no retrieval ──────────────────────────────────────────────────
+  - id: chat-thinks-once-and-returns-the-full-contract
+    input: {profile: *chat, query: "hello", context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *sentinel}
+      - {step_name: invoke-model, _: {ok: true, data: {content: "Hi!", model: m, usage: {calls: 1, tokens_in: 5, tokens_out: 1}}}}
+    expect:
+      output:
+        - status: ok
+        - answer: "Hi!"
+        - sources: []
+        - grounded: false
+        - grounded_p: null
+        - pending_action: null
+        - job_request: null
+        - handoff: null
+        - used_memory: ["mem:fact:helm"]
+      assert:
+        - "{{ [s['state'] for s in trace['steps']] == ['thinking', 'checking'] }}"
+        - "{{ usage['llm_calls'] == 1 and usage['tokens_in'] == 5 and usage['classifier_calls'] == 0 }}"
+
+  - id: a-model-failure-is-status-error-never-raised
+    input: {profile: *chat, query: "hello", context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: invoke-model, _: {ok: false, data: null, error: {code: timeout, message: "t", retryable: true}}}
+    expect:
+      output:
+        - status: error
+        - answer: ""
+      assert:
+        - "{{ trace['error']['code'] == 'timeout' }}"
+
+  # ── rag ─────────────────────────────────────────────────────────────────
+  - id: rag-retrieves-screens-answers-and-cites
+    input: {profile: *rag, query: "retries?", router: {sources: [moco-docs]}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *retrieved}
+      - {step_name: screen-passages, _: *screened}
+      - {step_name: invoke-model, _: *answer_ok}
+      - {step_name: check-output, _: {ok: true, data: {grounded_p: 0.8, answered_p: 0.9, degraded: false, decided_by: system_one}}}
+    expect:
+      output:
+        - status: ok
+        - answer: "Set max_attempts in the retry_policy [2]."
+        - grounded: true
+        - grounded_p: 0.8
+        - sources: [{title: retries, url: "http://d/r", source: moco-docs, n: 2}]
+      assert:
+        - "{{ [s['state'] for s in trace['steps']] == ['retrieving', 'thinking', 'checking'] }}"
+        - "{{ trace['steps'][0]['passages'] == 2 and trace['steps'][2]['cited'] == [2] }}"
+        - "{{ usage['classifier_calls'] == 3 }}"
+
+  - id: a-weakly-grounded-answer-is-kept-with-a-note
+    input: {profile: *rag, query: "retries?", router: {sources: [moco-docs]}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *retrieved}
+      - {step_name: screen-passages, _: *screened}
+      - {step_name: invoke-model, _: *answer_ok}
+      - {step_name: check-output, _: {ok: true, data: {grounded_p: 0.3, answered_p: 0.9, degraded: false, decided_by: system_one}}}
+    expect:
+      output:
+        - grounded: false
+        - answer: "Set max_attempts in the retry_policy [2].\n\n_Note: I could not fully verify this answer against the sources._"
+
+  - id: a-degraded-check-is-neither-grounded-nor-noted
+    input: {profile: *rag, query: "retries?", router: {sources: [moco-docs]}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *retrieved}
+      - {step_name: screen-passages, _: *screened}
+      - {step_name: invoke-model, _: *answer_ok}
+      - {step_name: check-output, _: {ok: true, data: {grounded_p: null, answered_p: null, degraded: true, decided_by: null}}}
+    expect:
+      output:
+        - grounded: false
+        - grounded_p: null
+        - answer: "Set max_attempts in the retry_policy [2]."
+
+  - id: zero-passages-decline-with-no-model-call
+    input: {profile: *rag, query: "what is the capital of mars?", router: {sources: [moco-docs]}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: {ok: true, data: {passages: [], searched: [moco-docs], failed: [], empty: true}}}
+      - {step_name: screen-passages, _: *sentinel}
+      - {step_name: invoke-model, _: *sentinel}
+      - {step_name: check-output, _: *sentinel}
+    expect:
+      output:
+        - status: declined
+        - answer: "I couldn't find that in moco-docs. I can answer questions about moco-docs."
+      assert:
+        - "{{ usage['llm_calls'] == 0 and usage['classifier_calls'] == 0 }}"
+
+  - id: the-decline-names-claude-when-the-agent-has-it
+    input: {profile: *rag, query: "q", router: {sources: [moco-docs]}, context_bundle: *bundle, config: {knowledge: {sources: [moco-docs]}, profiles: [chat, rag, claude]}}
+    mocks:
+      - {step_name: retrieve-passages, _: {ok: true, data: {passages: [], searched: [moco-docs], failed: [], empty: true}}}
+    expect:
+      assert:
+        - "{{ status == 'declined' and answer.endswith('You can also ask /claude, which can search the web.') }}"
+
+  - id: no-router-sources-means-nothing-to-search-and-a-decline
+    input: {profile: *rag, query: "q", router: {sources: []}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *sentinel}
+      - {step_name: invoke-model, _: *sentinel}
+    expect:
+      output:
+        - status: declined
+        - answer: "I couldn't find that in the sources. I can answer questions about moco-docs."
+
+  - id: a-replaced-passage-is-never-a-source
+    input: {profile: *rag, query: "q", router: {sources: [moco-docs]}, context_bundle: *bundle, config: *config}
+    mocks:
+      - {step_name: retrieve-passages, _: *retrieved}
+      - step_name: screen-passages
+        _:
+          ok: true
+          data:
+            items:
+              - {n: 1, text: "ok", source: moco-docs, action: fence}
+              - {n: 2, text: "[content removed: …]", source: moco-docs, action: replace}
+            degraded: false
+      - {step_name: invoke-model, _: {ok: true, data: {content: "See [1] and [2].", usage: {calls: 1}}}}
+      - {step_name: check-output, _: {ok: true, data: {grounded_p: 0.9, degraded: false, decided_by: system_one}}}
+    expect:
+      assert:
+        - "{{ [s['n'] for s in sources] == [1] }}"
+        - "{{ trace['steps'][0]['replaced'] == [2] }}"
+
+  # Phase 2: a guard.<name> extension in output_checks runs through guard run_checks,
+  # whose answer (annotated / redacted) replaces the model's; check-output is not called.
+  - id: a-guard-extension-check-can-rewrite-the-answer
+    input:
+      agent_id: moco
+      profile: {name: chat, kind: loop, loop: {model_role: inference, prompt: loop, retrieval: {when: none}, output_checks: [guard.house-style], grounding: none}}
+      query: "q"
+      config: *config
+      budget_sec: 40
+    mocks:
+      - {step_name: invoke-model, _: {ok: true, data: {content: "Hi!!!", model: m}}}
+      - {step_name: run-output-checks, _: {ok: true, data: {answer: "Hi.", blocked: false, verdicts: [{check: guard.house-style, action: redact}], degraded: false}}}
+      - {step_name: check-output, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - status: ok
+        - answer: "Hi."
+      assert:
+        - "{{ trace['steps'][-1]['verdicts'] == [{'check': 'guard.house-style', 'action': 'redact'}] }}"

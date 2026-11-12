@@ -1,0 +1,80 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PACKAGE-CATALOG — which wfspecs does the deployed version of a package hold?
+# ================================================================================
+#
+#   in              out
+#   ─────────────── ──────────────────────────────────────────────────────────
+#   package_name    {package, version, wfspecs: [workflow_name, ...]}
+#
+# agent-registry's existence check (plan-03 step 5): a prompt, profile, hook or
+# provider "exists" when the version of its package that THIS user would get on
+# THIS stage contains it. The version is the targeted one
+# (get_targeted_wfspec_version, keyed by PACKAGE name, with exclude_files: only the
+# version is needed), then the package's file list.
+#
+# WHY A SEPARATE WFSPEC, run as a `sync` child: the file list grows with the package.
+# Called inline, it would land in the caller's Temporal history (the session entity,
+# on every config change). As a sync child only this workflow's short output does
+# (plan-00a). list_files carries no file content.
+#
+# Each file's wfspec name is its `workflow_name`, which the platform records at
+# publish from `header.workflow_name` (v2) or `wfspec_name` (v1), not its filename;
+# a file with none (not a wfspec) is skipped. null version and [] when there
+# is no stage (a file run) or nothing is targeted: callers treat "nothing found" as
+# missing, which fails loudly where it matters (agent-registry load).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: package-catalog
+
+context:
+  version:
+  wfspecs: []
+
+input:
+  package_name:
+
+output:
+  package: "{{ package_name }}"
+  version: "{{ version }}"
+  wfspecs: "{{ wfspecs }}"
+
+main:
+  tasks:
+    - task_name: read-identity
+      set:
+        - stage#: "{{ __sys_info__.get('tier') }}"
+        - uid: "{{ __user_info__.get('user_id') }}"
+
+    - task_name: get-targeted-version
+      skip_if: '{{ not (bool(stage) and bool(uid) and bool(package_name)) }}'
+      activity:
+        type: builtin.deploy.query.get_targeted_wfspec_version
+        input:
+          wfspec_name: "{{ package_name }}"
+          user_id: "{{ uid }}"
+          stage_id: "{{ stage }}"
+          exclude_files: true
+        options:
+          retry_policy: {timeout_sec: 20, max_attempts: 2}
+      output:
+        set:
+          - version#: >-
+              {{ '.'.join(str(_.get(k)) for k in ['version_major', 'version_minor', 'version_patch'])
+                 if isinstance(_, dict) else None }}
+
+    - task_name: list-package-files
+      skip_if: "{{ version is None }}"
+      activity:
+        type: builtin.deploy.package.list_files
+        input:
+          package_id: "{{ package_name }}:{{ version }}"
+        options:
+          retry_policy: {timeout_sec: 20, max_attempts: 2}
+      output:
+        set:
+          - wfspecs#: >-
+              {{ sorted(set(f.get('workflow_name') for f in (_ if isinstance(_, list) else [])
+                            if isinstance(f, dict) and f.get('workflow_name'))) }}

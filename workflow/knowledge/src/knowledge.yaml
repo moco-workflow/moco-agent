@@ -1,0 +1,558 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KNOWLEDGE — the knowledge manager's facade (design §6.5.1)
+# ================================================================================
+#
+#   mode      in                                            data out
+#   ───────── ───────────────────────────────────────────── ──────────────────────
+#   catalog   config                                        {sources: [{name,
+#                                                             description, keywords,
+#                                                             kind, scope, status}]}
+#   retrieve  config, sources, query, top_k_per_source?,    {passages: [{n, text,
+#             max_chunks?, budget_sec                         title, url, source,
+#                                                             score}], searched,
+#                                                             failed, dropped, empty}
+#   register  config, name, scope, description, keywords,   {source, indexer}
+#             index_sources, embed_model_info?, every_hours?
+#   reindex   config, name, scope                           {source, indexer}
+#   refresh   config, name, scope                           {source, indexer, table_name}
+#   set_refresh config, name, scope, every_hours            {source}
+#   delete    config, name, scope                           {removed: name}
+#
+# CATALOG: the `ready` sources the definition allows (config.knowledge.sources), plus
+# the user's private `ready` sources when config.knowledge.allow_user_sources. A
+# shared source shadows a private one of the same name. Only `ready` rows appear.
+#
+# RETRIEVE: the requested sources ∩ catalog (others are `dropped`); one retriever per
+# source as a `sync` child (failure isolation and its own timeout, §4.3), all in
+# parallel, timeout min(10 s, budget_sec) (M5: ~0.3 s warm, ~2 s first). A source that
+# fails or times out is listed in `failed` and the others' passages are kept.
+# Results are INTERLEAVED round-robin -- rank 1 of every source, then rank 2, ... --
+# because scores from different tables and embedding models are not comparable
+# (§6.5.1); then numbered `n` from 1 (what answers cite) and clamped to max_chunks.
+# Screening the passages (guard screen_content) is the loop's job, not this one's.
+#
+# MANAGEMENT (plan-06 step 6), via agent-admin: every write goes through
+# source-registry, which calls `access` (shared sources need an admin).
+#   register  the row is created `indexing` (with refresh.sources = what to index),
+#             then knowledge-indexer starts DETACHED and records ready | failed
+#   reindex   ready | failed → indexing, then the indexer with the row's sources
+#   refresh   (phase 3) re-index a SERVING source without taking it offline: the row
+#             stays `ready` and keeps answering from its table while knowledge-indexer
+#             (refresh: true) builds the other table of its pair (kb_<x> ⇄ kbr_<x>),
+#             then swaps table_name and drops the old one. A failed refresh drops the
+#             new table and leaves the source as it was, with refresh_error. Needs a
+#             pgvector source that is ready, has refresh.sources, and is not already
+#             refreshing (one started more than refresh_stale_sec ago is taken as dead).
+#             knowledge-refresh (the hourly schedule) calls it for due sources; an
+#             admin can call it any time
+#   set_refresh  refresh.every_hours (≥ 1; 0 or null turns scheduled refresh off)
+#   delete    → deleting, DROP the table (`data_<table_name>`, the name llama-index
+#             stores `kb_*` under; checked against the naming pattern first), → removed.
+#             A failed drop leaves the row `deleting`; deleting again retries it
+# The embedding model is the call's embed_model_info, else config.models.embedding;
+# it is stored on the row, because queries must use the model the table was built
+# with. kind: wfspec sources (phase 2): register writes the row, probes the named
+# `source.*` retriever once and moves it to ready (or failed with the probe's
+# error); retrieve dispatches each source to its retriever by kind. `move` is later.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: knowledge
+
+context:
+  valid_modes: ["catalog", "retrieve", "register", "reindex", "refresh", "set_refresh", "delete"]
+  table_pattern: "^kbr?_(u_[0-9a-f]{8}_)?[a-z0-9_]{1,48}$"
+  # A refresh older than this is taken as dead (the indexer's own timeout is 3600 s).
+  refresh_stale_sec: 7200
+  ref_row:
+  ref_error:
+  shadow_table:
+  public_fields: ["name", "description", "keywords", "kind", "scope", "status"]
+  # The per-source ceiling of design §6.5.1 (M5), not a config default.
+  per_source_cap_sec: 10
+  ok: false
+  data:
+  error:
+  reg_result: {}
+  settle_result: {}
+  probe_error:
+
+input:
+  mode: catalog
+  agent_id:
+  config: {}
+  sources: []
+  query: ""
+  top_k_per_source:
+  max_chunks:
+  budget_sec: 10
+  # register / reindex / delete
+  name:
+  scope: shared
+  description: ""
+  keywords: []
+  index_sources: []
+  embed_model_info:
+  # register / set_refresh: scheduled refresh interval (knowledge-refresh)
+  every_hours:
+  # register, kind wfspec (phase 2)
+  kind: pgvector
+  wfspec_name:
+  source_config: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "knowledge: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: read-settings
+      set:
+        - kcfg: "{{ (config or {}).get('knowledge') or {} }}"
+        - allowed: "{{ list(kcfg.get('sources') or []) }}"
+        - allow_user: "{{ bool(kcfg.get('allow_user_sources')) }}"
+
+    # Both modes start from the catalog.
+    - task_name: list-sources
+      skip_if: "{{ mode not in ['catalog', 'retrieve'] or (not allowed and not allow_user) }}"
+      workflow:
+        ref: source-registry
+        mode: inline
+        input:
+          mode: list
+          agent_id: "{{ agent_id }}"
+          scope: "{{ 'both' if allow_user else 'shared' }}"
+          status: ready
+      output:
+        set:
+          - rows: "{{ ((_ or {}).get('data') or {}).get('sources') or [] }}"
+
+    - task_name: build-catalog
+      skip_if: "{{ mode not in ['catalog', 'retrieve'] }}"
+      set:
+        - _rows: "{{ rows if (allowed or allow_user) else [] }}"
+        - _shared: "{{ [r for r in _rows if r.get('scope') == 'shared' and r.get('name') in allowed] }}"
+        - _names: "{{ set(r['name'] for r in _shared) }}"
+        - catalog_rows: >-
+            {{ sorted(_shared + [r for r in _rows if r.get('scope') == 'private' and allow_user
+                                 and r.get('name') not in _names],
+                      key=lambda r: str(r.get('name'))) }}
+
+    - task_name: mode-catalog
+      skip_if: "{{ mode != 'catalog' }}"
+      set:
+        - ok: true
+        - data: "{{ {'sources': [{k: r.get(k) for k in public_fields} for r in catalog_rows]} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RETRIEVE
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-retrieve
+      skip_if: "{{ mode != 'retrieve' }}"
+      tasks:
+        - task_name: plan-retrieval
+          set:
+            - _by_name: "{{ {r['name']: r for r in catalog_rows} }}"
+            - _asked: "{{ list(dict.fromkeys(str(s) for s in (sources or []))) }}"
+            - targets: "{{ [_by_name[s] for s in _asked if s in _by_name] }}"
+            - dropped#: "{{ [s for s in _asked if s not in _by_name] }}"
+            # From the call, else the resolved config; the defaults live only in
+            # agent-harness-defaults.
+            - top_k: "{{ top_k_per_source or kcfg.get('top_k_per_source') }}"
+            - cap: "{{ max_chunks or kcfg.get('max_chunks') }}"
+            - per_source_sec: "{{ max(1, int(min(per_source_cap_sec, float(budget_sec or per_source_cap_sec)))) }}"
+            - per_source: []
+
+        - task_name: reject-unresolved-config
+          raise:
+            if: "{{ top_k is None or cap is None }}"
+            type: error
+            error_type: AbortError
+            message: "knowledge: config.knowledge lacks top_k_per_source or max_chunks (pass the resolved config)"
+
+        - task_name: query-sources
+          skip_if: "{{ not targets or not str(query or '').strip() }}"
+          loop:
+            in: "{{ targets }}"
+            foreach: src
+            execute_mode: parallel
+            do:
+              task_name: query-source
+              # The retriever contract (§6.5.2) is the same for both kinds: pgvector is
+              # built in, a wfspec source names its own `source.*` retriever.
+              workflow:
+                ref: "{{ ((src.get('wfspec') or {}).get('name') if src.get('kind') == 'wfspec' else None) or 'source.pgvector' }}"
+                mode: sync
+                input:
+                  query: "{{ query }}"
+                  top_k: "{{ int(top_k) }}"
+                  budget_sec: "{{ per_source_sec }}"
+                  config: >-
+                    {{ (src.get('config') or {}) if src.get('kind') == 'wfspec' else
+                       {'table_name': src.get('table_name'), 'embed_model_info': src.get('embed_model_info'),
+                        'pgvector_secret_key': kcfg.get('pgvector_secret_key')} }}
+                options:
+                  retry_policy: {timeout_sec: "{{ per_source_sec }}", max_attempts: 1}
+              output:
+                data: "{{ {'source': src['name'], 'passages': (_ or {}).get('passages') or [], 'error': None} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - _failed: true
+                  output:
+                    data: "{{ {'source': src['name'], 'passages': [], 'error': str(_.get('error_message'))[:300]} }}"
+          output:
+            set:
+              - per_source: "{{ list(_ or []) }}"
+
+        - task_name: interleave
+          set:
+            - _groups: "{{ [[dict(p, source=g['source']) for p in g['passages']] for g in per_source] }}"
+            - _deepest: "{{ max([len(g) for g in _groups], default=0) }}"
+            - _ranked: "{{ [g[i] for i in range(_deepest) for g in _groups if i < len(g)][:int(cap)] }}"
+            - failed#: "{{ [g['source'] for g in per_source if g.get('error')] }}"
+            - ok: true
+            - data:
+                passages: >-
+                  {{ [{'n': i + 1, 'text': p['text'], 'title': p.get('title'), 'url': p.get('url'),
+                       'source': p['source'], 'score': p.get('score')}
+                      for i, p in enumerate(_ranked)] }}
+                searched: "{{ [t['name'] for t in targets] }}"
+                failed: "{{ failed }}"
+                # The failed sources' error text (F70: an embedding endpoint or key that is
+                # not set up reads differently from an empty result).
+                errors: "{{ {g['source']: g['error'] for g in per_source if g.get('error')} }}"
+                dropped: "{{ dropped }}"
+                empty: "{{ len(_ranked) == 0 }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # REGISTER / REINDEX — record `indexing`, then index off the chat path
+    # ══════════════════════════════════════════════════════════════════════
+    # kind wfspec (phase 2): register the row, PROBE the retriever once, and go
+    # straight to ready (or failed) -- there is nothing to index.
+    - task_name: mode-register-wfspec
+      skip_if: "{{ mode != 'register' or kind != 'wfspec' }}"
+      tasks:
+        - task_name: register-wfspec-row
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: register
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              kind: wfspec
+              wfspec_name: "{{ wfspec_name }}"
+              source_config: "{{ source_config }}"
+              description: "{{ description }}"
+              keywords: "{{ keywords }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - reg_result: "{{ _ or {} }}"
+        - task_name: probe-retriever
+          skip_if: "{{ not reg_result.get('ok') }}"
+          workflow:
+            ref: "{{ wfspec_name }}"
+            mode: sync
+            input: {query: "{{ description or name }}", top_k: 1, config: "{{ source_config }}", budget_sec: 10}
+            options:
+              retry_policy: {timeout_sec: 15, max_attempts: 1}
+          output:
+            set:
+              - probe_error: "{{ ((_ or {}).get('error') or {}).get('message') if isinstance(_, dict) and (_ or {}).get('error') else (None if isinstance(_, dict) else 'the retriever returned ' + str(_)[:200]) }}"
+          on_error:
+            catch: true
+            do:
+              set:
+                - probe_error: "{{ str(_.get('error_message'))[:300] }}"
+        - task_name: settle-wfspec-source
+          skip_if: "{{ not reg_result.get('ok') }}"
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: transition
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              to: "{{ 'failed' if probe_error else 'ready' }}"
+              patch: "{{ {'error': probe_error} if probe_error else {'indexed_at': now().isoformat(), 'error': None} }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - settle_result: "{{ _ or {} }}"
+        - task_name: shape-register-wfspec
+          set:
+            - ok: "{{ bool(reg_result.get('ok')) and bool(settle_result.get('ok')) }}"
+            - data: "{{ {'source': settle_result['data']['source'], 'probe_error': probe_error} if ok else None }}"
+            - error: "{{ reg_result.get('error') if not reg_result.get('ok') else settle_result.get('error') }}"
+
+    - task_name: mode-register
+      skip_if: "{{ mode != 'register' or kind == 'wfspec' }}"
+      tasks:
+        - task_name: pick-embedding
+          set:
+            - embed: "{{ embed_model_info or ((config or {}).get('models') or {}).get('embedding') }}"
+            - error: >-
+                {{ None if embed else
+                   {'code': 'invalid_input', 'message': 'no embed_model_info and no models.embedding in config', 'retryable': False} }}
+        - task_name: register-row
+          skip_if: "{{ not embed }}"
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: register
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              kind: pgvector
+              description: "{{ description }}"
+              keywords: "{{ keywords }}"
+              embed_model_info: "{{ embed }}"
+              refresh: "{{ dict({'sources': index_sources}, **({'every_hours': int(every_hours)} if isinstance(every_hours, int) and every_hours > 0 else {})) }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - reg_result: "{{ _ or {} }}"
+        - task_name: start-indexer-for-register
+          skip_if: "{{ not embed or not reg_result.get('ok') }}"
+          workflow:
+            ref: knowledge-indexer
+            mode: detached
+            input:
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              index_sources: "{{ index_sources }}"
+              overwrite: true
+              pgvector_secret_key: "{{ kcfg.get('pgvector_secret_key') }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - indexer_id: "{{ _ }}"
+        - task_name: shape-register
+          skip_if: "{{ not embed }}"
+          set:
+            - ok: "{{ bool(reg_result.get('ok')) }}"
+            - data: "{{ {'source': reg_result['data']['source'], 'indexer': indexer_id} if reg_result.get('ok') else None }}"
+            - error: "{{ reg_result.get('error') }}"
+
+    - task_name: mode-reindex
+      skip_if: "{{ mode != 'reindex' }}"
+      tasks:
+        - task_name: reindex-transition
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: transition
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              to: indexing
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - reidx: "{{ _ or {} }}"
+        - task_name: start-indexer-for-reindex
+          skip_if: "{{ not reidx.get('ok') }}"
+          workflow:
+            ref: knowledge-indexer
+            mode: detached
+            input:
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              index_sources: "{{ ((reidx['data']['source'] or {}).get('refresh') or {}).get('sources') or [] }}"
+              overwrite: true
+              pgvector_secret_key: "{{ kcfg.get('pgvector_secret_key') }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - indexer_id: "{{ _ }}"
+        - task_name: shape-reindex
+          set:
+            - ok: "{{ bool(reidx.get('ok')) }}"
+            - data: "{{ {'source': reidx['data']['source'], 'indexer': indexer_id} if reidx.get('ok') else None }}"
+            - error: "{{ reidx.get('error') }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # REFRESH / SET_REFRESH — a serving source, no transition (source-registry patch)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-refresh
+      skip_if: "{{ mode not in ['refresh', 'set_refresh'] }}"
+      tasks:
+        - task_name: read-for-refresh
+          workflow:
+            ref: source-registry
+            mode: inline
+            input: {mode: get, agent_id: "{{ agent_id }}", name: "{{ name }}", scope: "{{ scope }}"}
+          output:
+            set:
+              - ref_row: "{{ ((_ or {}).get('data') or {}).get('source') }}"
+              - ref_error: "{{ (_ or {}).get('error') }}"
+
+        - task_name: plan-refresh
+          skip_if: "{{ ref_row is None }}"
+          set:
+            - _rf: "{{ ref_row.get('refresh') or {} }}"
+            - _t: "{{ str(ref_row.get('table_name') or '') }}"
+            - shadow_table: "{{ (('kb_' + _t[4:]) if _t.startswith('kbr_') else ('kbr_' + _t[3:])) if _t else None }}"
+            - _inflight: "{{ ref_row.get('refreshing') or {} }}"
+            - _age: >-
+                {{ (now().replace(tzinfo=None) - dt.datetime.fromisoformat(str(_inflight['started_at'])).replace(tzinfo=None)).total_seconds()
+                   if _inflight.get('started_at') else None }}
+            - _problem: >-
+                {{ ('invalid_input', 'every_hours must be a whole number of hours (0 or null: off)')
+                     if mode == 'set_refresh' and not (every_hours is None or (isinstance(every_hours, int) and not isinstance(every_hours, bool) and every_hours >= 0)) else
+                   ('invalid_input', 'only a pgvector source can be refreshed')
+                     if ref_row.get('kind', 'pgvector') != 'pgvector' else
+                   ('invalid_input', 'source ' + str(name) + ' has nothing to re-index (no refresh.sources)')
+                     if not (_rf.get('sources') or []) else
+                   ('invalid_state', 'source ' + str(name) + ' is ' + str(ref_row.get('status')) + '; reindex it instead')
+                     if mode == 'refresh' and ref_row.get('status') != 'ready' else
+                   ('invalid_input', 'source ' + str(name) + ' has an unsafe table name')
+                     if mode == 'refresh' and not (re.match(table_pattern, _t) and re.match(table_pattern, str(shadow_table))) else
+                   ('invalid_state', 'source ' + str(name) + ' is already refreshing into ' + str(_inflight.get('table_name')))
+                     if mode == 'refresh' and _inflight and (_age is None or _age < refresh_stale_sec) else None }}
+            - ref_error: "{{ {'code': _problem[0], 'message': _problem[1], 'retryable': False} if _problem else None }}"
+            - ref_patch: >-
+                {{ {'refresh': dict({k: v for k, v in _rf.items() if k != 'every_hours'},
+                                    **({'every_hours': every_hours} if every_hours else {}))}
+                   if mode == 'set_refresh' else
+                   {'refreshing': {'table_name': shadow_table, 'started_at': now().isoformat()}, 'refresh_error': None} }}
+
+        - task_name: patch-for-refresh
+          skip_if: "{{ ref_row is None or ref_error is not None }}"
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: patch
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              patch: "{{ ref_patch }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - ref_row: "{{ ((_ or {}).get('data') or {}).get('source') if (_ or {}).get('ok') else ref_row }}"
+              - ref_error: "{{ None if (_ or {}).get('ok') else (_ or {}).get('error') }}"
+
+        - task_name: start-indexer-for-refresh
+          skip_if: "{{ mode != 'refresh' or ref_row is None or ref_error is not None }}"
+          workflow:
+            ref: knowledge-indexer
+            mode: detached
+            input:
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              index_sources: "{{ (ref_row.get('refresh') or {}).get('sources') or [] }}"
+              refresh: true
+              target_table: "{{ shadow_table }}"
+              overwrite: true
+              pgvector_secret_key: "{{ kcfg.get('pgvector_secret_key') }}"
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - indexer_id: "{{ _ }}"
+
+        - task_name: shape-refresh
+          set:
+            - ok: "{{ ref_row is not None and ref_error is None }}"
+            - data: >-
+                {{ None if not (ref_row is not None and ref_error is None) else
+                   {'source': ref_row, 'indexer': indexer_id, 'table_name': shadow_table} if mode == 'refresh' else
+                   {'source': ref_row} }}
+            - error: "{{ ref_error }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DELETE — deleting → drop the table → removed
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-delete
+      skip_if: "{{ mode != 'delete' }}"
+      tasks:
+        - task_name: read-for-delete
+          workflow:
+            ref: source-registry
+            mode: inline
+            input: {mode: get, agent_id: "{{ agent_id }}", name: "{{ name }}", scope: "{{ scope }}"}
+          output:
+            set:
+              - del_row: "{{ ((_ or {}).get('data') or {}).get('source') }}"
+              - del_error: "{{ (_ or {}).get('error') }}"
+        # Already `deleting` (a failed drop earlier): retry the drop without a transition.
+        - task_name: mark-deleting
+          skip_if: "{{ not del_row or del_row.get('status') == 'deleting' }}"
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: transition
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              to: deleting
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - del_error: "{{ (_ or {}).get('error') }}"
+        - task_name: reject-unsafe-table-name
+          raise:
+            if: "{{ bool(del_row) and del_error is None and not re.match(table_pattern, str(del_row.get('table_name'))) }}"
+            type: error
+            error_type: AbortError
+            message: "knowledge: refusing to drop table '{{ (del_row or {}).get('table_name') }}' (not a source table name)"
+        - task_name: drop-table
+          skip_if: "{{ not del_row or del_error is not None }}"
+          # llama_index.drop_table, not sql.execute: it shares the other llama_index
+          # activities' MOCO_PGVECTOR_CONN fallback when pgvector_secret_key is empty.
+          activity:
+            type: llama_index.drop_table
+            input:
+              vectordb_info:
+                connection_string_secret_key: "{{ kcfg.get('pgvector_secret_key') }}"
+                table_name: "{{ del_row['table_name'] }}"
+            options:
+              retry_policy: {timeout_sec: 60, max_attempts: 2}
+          on_error:
+            catch: true
+            do:
+              set:
+                - del_error: "{{ {'code': 'drop_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+        - task_name: mark-removed
+          skip_if: "{{ not del_row or del_error is not None }}"
+          workflow:
+            ref: source-registry
+            mode: inline
+            input:
+              mode: transition
+              agent_id: "{{ agent_id }}"
+              name: "{{ name }}"
+              scope: "{{ scope }}"
+              to: removed
+              definition_access: "{{ (config or {}).get('access') }}"
+          output:
+            set:
+              - del_error: "{{ (_ or {}).get('error') }}"
+        - task_name: shape-delete
+          set:
+            - ok: "{{ del_error is None }}"
+            - data: "{{ {'removed': name} if del_error is None else None }}"
+            - error: "{{ del_error }}"

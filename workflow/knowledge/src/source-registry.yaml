@@ -1,0 +1,292 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SOURCE-REGISTRY — the knowledge source rows and their lifecycle (design §6.5.2)
+# ================================================================================
+#
+#   mode        in                                         data out
+#   ─────────── ────────────────────────────────────────── ───────────────────────
+#   get         name, scope                                {source}
+#   list        scope: shared|private|both, status?        {sources: [row, ...]}
+#   register    name, scope, kind, description, keywords,  {source}
+#               embed_model_info, definition_access
+#   transition  name, scope, to, patch?, definition_access {source} (to removed: null)
+#   patch       name, scope, patch, if_refreshing?,        {source}
+#               definition_access
+#
+# ONE OWNER (§4.3): only this wfspec reads or writes `source:<name>` rows, topic
+# `source`:
+#   shared   namespace agent-harness           (in_global_ns: true)
+#   private  <uid>:agent-harness               (in_global_ns: false)
+#   row      {schema_version: 1, name, kind, description, keywords, scope, status,
+#             table_name, embed_model_info, refresh: {sources, every_hours?},
+#             node_count, indexed_at, error, refreshing: {table_name, started_at}?,
+#             refresh_error?, refresh_failed_at?, created_at, updated_at, updated_by}
+#
+# LIFECYCLE (row state machine; an illegal transition is ok: false, invalid_state):
+#   register → indexing ──→ ready | failed
+#   failed → indexing        ready → indexing (reindex, refresh, move)
+#   ready | failed → deleting ──→ removed (the row is deleted)
+#
+# PATCH changes fields WITHOUT a transition, on a `ready` or `failed` row: the
+# refresh settings, and the shadow-table refresh of a serving source (§6.5.2, knowledge
+# refresh). Those two touch `refreshing` / `table_name`, so they need `ready`, and
+# table_name may only move to the row's own pair (kb_<x> ⇄ kbr_<x>). `if_refreshing`
+# is the refresh's compare-and-set: the patch applies only while the row is still
+# refreshing into that table -- a reindex or a newer refresh in between makes it
+# invalid_state, and the stale refresh drops its table instead. A transition to
+# indexing or deleting clears `refreshing` for that reason.
+#
+# TABLE NAMES (pgvector): shared `kb_<slug>`, private `kb_u_<h>_<slug>` with <h> an
+# 8-hex checksum of the user id. The sandbox has no hash function, so it is a
+# 31-polynomial mod 2^32 -- deterministic, and it keeps the user id itself out of the
+# table name (the old agent's private tables collided across users). A refresh
+# alternates between `kb_…` and `kbr_…`: the prefix differs, so the pair cannot collide
+# even where Postgres truncates a long `data_kb_…` name to 63 characters.
+#
+# WRITES call `access` (write; scope shared → shared, private → user): shared sources
+# need an admin, guests write nothing. Reads are unguarded; `knowledge catalog`
+# decides what a user may see. kind pgvector (phase 1) has a table; kind wfspec
+# (phase 2) names a `source.*` retriever and its config instead, and knowledge
+# register moves it straight to ready after a probe call.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: source-registry
+
+context:
+  valid_modes: ["get", "list", "register", "transition", "patch"]
+  valid_scopes: ["shared", "private"]
+  valid_kinds: ["pgvector", "wfspec"]
+  wfspec_name_pattern: "^source\\.[a-z0-9][a-z0-9.-]{0,62}$"
+  name_pattern: "^[a-z0-9][a-z0-9-]{0,47}$"
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  namespace: agent-harness
+  transitions:
+    indexing: [ready, failed]
+    failed: [indexing, deleting]
+    ready: [indexing, deleting]
+    deleting: [removed]
+  patchable: [node_count, indexed_at, error, embed_model_info, description, keywords, refresh]
+  # patch mode (no transition): the refresh settings and the shadow-table swap.
+  patch_fields: [description, keywords, refresh, refreshing, refresh_error, refresh_failed_at,
+                 table_name, node_count, indexed_at]
+  serving_fields: [refreshing, table_name]
+  patch_from: [ready, failed]
+  ok: false
+  data:
+  error:
+
+input:
+  mode: get
+  agent_id:
+  name:
+  scope: shared
+  status:
+  kind: pgvector
+  # kind wfspec: the retriever and its config (secrets by NAME only)
+  wfspec_name:
+  source_config: {}
+  description: ""
+  keywords: []
+  embed_model_info: {}
+  # register: what to index, kept on the row so reindex/refresh can repeat it.
+  refresh: {}
+  to:
+  patch: {}
+  # patch: apply only while the row is refreshing into this table
+  if_refreshing:
+  definition_access: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "source-registry: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-bad-scope
+      raise:
+        if: "{{ scope not in valid_scopes + (['both'] if mode == 'list' else []) }}"
+        type: error
+        error_type: AbortError
+        message: "source-registry: scope must be one of {{ ', '.join(valid_scopes) }}{{ ' or both' if mode == 'list' else '' }}, got '{{ scope }}'"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST — keys from each scope, then one read per row (no batch read exists).
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-list
+      skip_if: "{{ mode != 'list' }}"
+      tasks:
+        - task_name: list-shared-keys
+          skip_if: "{{ scope == 'private' }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ namespace }}", key_pattern: "source:*", topic_pattern: source}
+          output:
+            set:
+              - shared_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: list-private-keys
+          skip_if: "{{ scope == 'shared' }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key_pattern: "source:*", topic_pattern: source}
+          output:
+            set:
+              - private_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: read-rows
+          loop:
+            in: >-
+              {{ [(True, k) for k in (shared_keys if scope != 'private' else [])]
+                 + [(False, k) for k in (private_keys if scope != 'shared' else [])] }}
+            foreach: entry
+            execute_mode: parallel
+            do:
+              task_name: read-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: "{{ entry[0] }}", namespace: "{{ namespace }}", key: "{{ entry[1] }}"}
+          output:
+            set:
+              - ok: true
+              - data: >-
+                  {{ {'sources': [r for r in (_ or [])
+                                  if isinstance(r, dict) and r.get('schema_version', 0) in supported_schema_versions
+                                     and (status is None or r.get('status') == status)]} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GET / REGISTER / TRANSITION — one row
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-row
+      skip_if: "{{ mode == 'list' }}"
+      tasks:
+        - task_name: check-name
+          set:
+            - sname: '{{ str(name or "").strip() }}'
+            - valid#: "{{ bool(re.match(name_pattern, sname)) }}"
+            - in_global: "{{ scope == 'shared' }}"
+            - key: "source:{{ sname }}"
+            - error: >-
+                {{ None if valid else
+                   {'code': 'invalid_input', 'message': 'name must match ' + name_pattern, 'retryable': False} }}
+
+        - task_name: read-current
+          skip_if: "{{ not valid }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: "{{ in_global }}", namespace: "{{ namespace }}", key: "{{ key }}"}
+          output:
+            set:
+              - current: "{{ _ if isinstance(_, dict) else None }}"
+
+        - task_name: shape-get
+          skip_if: "{{ not valid or mode != 'get' }}"
+          set:
+            - ok: "{{ current is not None }}"
+            - data: "{{ {'source': current} if current is not None else None }}"
+            - error: "{{ None if current is not None else {'code': 'not_found', 'message': 'no ' + scope + ' source ' + sname, 'retryable': False} }}"
+
+        # Writes: authorize first (shared → admin), then check the transition.
+        - task_name: authorize-write
+          skip_if: "{{ not valid or mode not in ['register', 'transition', 'patch'] }}"
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: authorize
+              agent_id: "{{ agent_id }}"
+              action: write
+              scope: "{{ 'shared' if in_global else 'user' }}"
+              definition_access: "{{ definition_access }}"
+          output:
+            set:
+              - authz: "{{ (_ or {}).get('data') or {} }}"
+
+        - task_name: plan-write
+          skip_if: "{{ not valid or mode not in ['register', 'transition', 'patch'] }}"
+          set:
+            - _uid: '{{ str(__user_info__.get("user_id")) }}'
+            - _slug: "{{ re.sub(r'[^a-z0-9_]', '_', sname) }}"
+            - _h: "{{ '%08x' % (sum(ord(c) * pow(31, i, 4294967296) for i, c in enumerate(_uid)) % 4294967296) }}"
+            - _from: "{{ (current or {}).get('status') }}"
+            - _t: "{{ str((current or {}).get('table_name') or '') }}"
+            - _pair: "{{ [_t, ('kb_' + _t[4:]) if _t.startswith('kbr_') else ('kbr_' + _t[3:])] if _t else [] }}"
+            - _pf: "{{ sorted((patch or {}).keys()) }}"
+            - problem#: >-
+                {{ ('forbidden', 'not allowed to write ' + scope + ' sources (' + str(authz.get('reason')) + ')')
+                     if not authz.get('allow') else
+                   ('invalid_input', 'kind must be one of ' + ', '.join(valid_kinds))
+                     if mode == 'register' and kind not in valid_kinds else
+                   ('invalid_input', 'a wfspec source names a source.* retriever (' + wfspec_name_pattern + ')')
+                     if mode == 'register' and kind == 'wfspec' and not re.match(wfspec_name_pattern, str(wfspec_name or '')) else
+                   ('invalid_state', 'source ' + sname + ' already exists (' + str(_from) + ')')
+                     if mode == 'register' and current is not None else
+                   ('not_found', 'no ' + scope + ' source ' + sname)
+                     if mode == 'transition' and current is None else
+                   ('invalid_state', 'source ' + sname + ': ' + str(_from) + ' -> ' + str(to) + ' is not a legal transition')
+                     if mode == 'transition' and to not in (transitions.get(_from) or []) else
+                   ('invalid_input', 'patch may only set ' + ', '.join(patchable))
+                     if mode == 'transition' and any(k not in patchable for k in (patch or {})) else
+                   ('not_found', 'no ' + scope + ' source ' + sname)
+                     if mode == 'patch' and current is None else
+                   ('invalid_input', 'patch may only set ' + ', '.join(patch_fields))
+                     if mode == 'patch' and (not _pf or any(k not in patch_fields for k in _pf)) else
+                   ('invalid_state', 'source ' + sname + ' is ' + str(_from) + '; patch needs ' + ' or '.join(patch_from))
+                     if mode == 'patch' and _from not in patch_from else
+                   ('invalid_state', 'source ' + sname + ' is ' + str(_from) + '; only a ready source can be refreshed')
+                     if mode == 'patch' and _from != 'ready' and any(k in serving_fields for k in _pf) else
+                   ('invalid_input', 'table_name may only move to ' + ' or '.join(_pair))
+                     if mode == 'patch' and 'table_name' in _pf and patch.get('table_name') not in _pair else
+                   ('invalid_state', 'source ' + sname + ' is no longer refreshing into ' + str(if_refreshing))
+                     if mode == 'patch' and if_refreshing and ((current.get('refreshing') or {}).get('table_name') != if_refreshing) else None }}
+            - error: "{{ None if problem is None else {'code': problem[0], 'message': problem[1], 'retryable': False} }}"
+            - _now: "{{ now().isoformat() }}"
+            - new_row: >-
+                {{ None if problem is not None or (mode == 'transition' and to == 'removed') else
+                   ({'schema_version': schema_version, 'name': sname, 'kind': kind,
+                     'description': str(description or ''), 'keywords': list(keywords or []),
+                     'scope': scope, 'status': 'indexing',
+                     'table_name': (('kb_' if in_global else 'kb_u_' + _h + '_') + _slug) if kind == 'pgvector' else None,
+                     'wfspec': {'name': str(wfspec_name)} if kind == 'wfspec' else None,
+                     'config': (source_config or {}) if kind == 'wfspec' else None,
+                     'embed_model_info': embed_model_info or {}, 'refresh': refresh or {},
+                     'node_count': 0, 'indexed_at': None,
+                     'error': None, 'created_at': _now, 'updated_at': _now, 'updated_by': _uid}
+                    if mode == 'register' else
+                    dict(current, **(patch or {}), schema_version=schema_version, updated_at=_now, updated_by=_uid)
+                    if mode == 'patch' else
+                    dict(current, **(patch or {}), status=to, schema_version=schema_version,
+                         updated_at=_now, updated_by=_uid,
+                         **({'refreshing': None} if to in ['indexing', 'deleting'] else {}))) }}
+
+        - task_name: write-row
+          skip_if: "{{ not valid or mode not in ['register', 'transition', 'patch'] or new_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: "{{ in_global }}"
+              namespace: "{{ namespace }}"
+              key: "{{ key }}"
+              value: "{{ new_row }}"
+              topic: source
+
+        - task_name: delete-row
+          skip_if: "{{ not (valid and mode == 'transition' and problem is None and to == 'removed') }}"
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: "{{ in_global }}", namespace: "{{ namespace }}", key: "{{ key }}"}
+
+        - task_name: shape-write
+          skip_if: "{{ not valid or mode not in ['register', 'transition', 'patch'] }}"
+          set:
+            - ok: "{{ problem is None }}"
+            - data: "{{ {'source': new_row} if problem is None else None }}"

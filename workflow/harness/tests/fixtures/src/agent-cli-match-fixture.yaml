@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../../../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# Test fixture for agent-cli's answer matching (P16, plan-00a §6). NOT published:
+# it lives in tests/fixtures/src/ -- its own directory, because an integration
+# test loads every yaml beside the wfspec -- outside the package's `sources`.
+#
+# Two agent_answer events land in this workflow's buffer -- another caller's first,
+# then ours -- and `await-answer` must take ours. emit_event and wait_for cannot be
+# mocked, so this runs the real engine path. The match_expression is a COPY of
+# agent-cli's `await-answer`; keep the two identical.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-cli-match-fixture
+
+context:
+  answer_event:
+
+input:
+  mid: m-mine
+  # false: only the other caller's answer is sent.
+  send_ours: true
+
+output:
+  matched_message_id: "{{ ((answer_event or {}).get('data') or {}).get('message_id') }}"
+  matched_answer: "{{ ((answer_event or {}).get('data') or {}).get('answer') }}"
+
+main:
+  tasks:
+    - task_name: self-id
+      set:
+        - me: "{{ __sys_info__.get('workflow_id') }}"
+
+    - task_name: answer-for-someone-else
+      emit_event:
+        target_workflow_id: "{{ me }}"
+        topic: agent-session
+        event_type: agent_answer
+        data: {message_id: m-other, answer: "not yours"}
+
+    - task_name: answer-for-us
+      skip_if: '{{ not send_ours }}'
+      emit_event:
+        target_workflow_id: "{{ me }}"
+        topic: agent-session
+        event_type: agent_answer
+        data: {message_id: "{{ mid }}", answer: "yours"}
+
+    # COPY of agent-cli await-answer.
+    - task_name: await-answer
+      wait_for:
+        event:
+          topic: agent-session
+          event_type: agent_answer
+          match_expression: "{{ (event.get('data') or {}).get('message_id') == mid }}"
+        timeout_sec: 20
+      output:
+        set:
+          - answer_event: "{{ _ }}"

@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT.MOCO-ASSISTANT — the reference agent's definition (design §5.2, §13; plan-18)
+# ================================================================================
+#
+# The old moco-agent, rebuilt on the harness. PHASE 1: library `chat` and `rag`
+# profiles over the shared `moco-docs` source, the moco persona, and the rag decline
+# message overridden field by field (profile_overrides, §5.3) -- no code of its own.
+# PHASE 2 (plan-18 steps 5-6): `react` over the harness built-ins (knowledge search,
+# memory, the time), the library `memory` profile with long-term memory on, and
+# `claude` (subagent.claude, agent-local) on the agent worker. PHASE 3 (plan-18 step 8):
+# `builder` (subagent.builder), an async profile that runs as a job: plan, review,
+# implement.
+#
+# It is the agent tier of config: agent-config merges it over agent-harness-defaults,
+# so it only states what differs. The models are the internal gateway and the local
+# embedding endpoint `moco-docs` was indexed with (the old agent's, so a parity run
+# compares harnesses, not models). Secrets are NAMES (P11).
+#
+# admin_user_ids is empty: a deployment names its admins here, reviewed like any
+# change (§6.13). moco-docs is registered by an admin (seed-knowledge).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent.moco-assistant
+
+context:
+  definition:
+    agent_id: moco-assistant
+    display_name: Moco Assistant
+    harness: ">=0.10 <3.0"
+    persona_prompt: persona.moco
+    models:
+      inference:
+        provider: default
+        model:
+        base_url:
+        apikey_secret_key: MY_LLM_TOKEN
+      embedding:
+        apikey_secret_key:
+        base_url:
+        model_name:
+        embed_dim: 768
+    router:
+      default_profile: chat
+      classifier: true
+      slash: {/rag: rag, /docs: rag, /tools: react, /claude: claude, /memory: memory, /build: builder}
+    profiles: [chat, rag, react, memory, claude, builder]
+    toolsets: [harness-builtin]
+    deployment: {agent_worker: true}
+    claude: {apikey_secret_key: MY_CLAUDE_APIKEY, max_turns: 12}
+    builder: {apikey_secret_key: MY_CLAUDE_APIKEY, model: sonnet}
+    hooks:
+      - {event: answer.ready, wfspec: hook.moco.link-check, mode: sync, timeout_sec: 8}
+      - {event: route.decided, wfspec: hook.moco.trace, mode: async}
+      - {event: context.assembled, wfspec: hook.moco.trace, mode: async}
+      - {event: tool.after, wfspec: hook.moco.trace, mode: async}
+      - {event: turn.committed, wfspec: hook.moco.trace, mode: async}
+      - {event: session.retired, wfspec: hook.moco.trace, mode: async}
+    profile_overrides:
+      rag:
+        route_description: "A question about moco -- its workflow specs, activities, expressions, runtimes, state machines, deployment or CLI -- that the moco documentation could answer."
+        examples: ["how do retries work?", "how do I call a child workflow?", "what does wait_for match_expression do?"]
+        loop:
+          decline_message: "I couldn't find that in the moco documentation ({searched}). Try rephrasing, or ask about a specific moco feature."
+      chat:
+        route_description: "Greetings, thanks, small talk, and questions about this assistant itself -- anything that needs no moco documentation."
+    knowledge:
+      sources: [moco-docs]
+    memory:
+      short_term: {recent_turns: 6}
+      long_term: {enabled: true, kinds: [profile, fact, lesson], curate_every_turns: 4}
+    access:
+      admin_user_ids: ["tjin4"]
+
+output:
+  definition: "{{ definition }}"
+  # Part of agent-config's config_version (F21): the agent package's version.
+  version: "{{ __sys_info__.get('wfspec_version') }}"
+
+main:
+  task_name: emit-definition
+  set:
+    - _loaded: true

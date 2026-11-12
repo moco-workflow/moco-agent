@@ -1,0 +1,175 @@
+{
+ "summary": {
+  "target": "moco-assistant",
+  "cases": 12,
+  "answer_ok": 1.0,
+  "cited": 1.0,
+  "keyword_coverage": 0.94,
+  "decline_ok": 1.0,
+  "chat_ok": 1.0,
+  "mean_secs": 13.8
+ },
+ "rows": [
+  {
+   "id": "retries",
+   "kind": "answer",
+   "answer": "To implement exponential backoff for an activity, you must define a `retry_policy` within the activity's `options` [1]. You do this by setting the `backoff_coefficient` field, which acts as the multiplier applied to the wait time after each retry [1].\n\nYou should also configure the following related fields to control the retry behavior:\n* **`initial_interval_sec`**: The amount of time to wait before the first retry [1].\n* **`maximum_interval_sec`**: The upper bound on the wait time between retries [1].\n* **`max_attempts`**: The total number of attempts (including the first) [1].\n\n### Example YAML Configuration\nIn the example below, the activity will use a backoff coefficient of `2.0`, meaning the wait time doubles after every failed attempt [1]:\n\n```yaml\nmain:\n  task_name: fetch-report\n  activity:\n    type: http.request\n    input:\n      method: GET\n      url: https://httpbin.org/get\n    options:\n      retry_policy:\n        max_attempts: 5\n        initial_interval_sec: 1\n        backoff_coefficient: 2.0\n        timeout_sec: 10\n```\n\n**Note:** Retry policies are applied by the Temporal runtime; the in-memory runtime ignores them [1]. Additionally, an activity's specific `options.retry_policy` is laid over the default policy defined in `header.metadata.default_activity_retry_policy` field by field [1].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/reference/workflowspec-reference/"
+   ],
+   "secs": 14.5,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "child-workflow",
+   "kind": "answer",
+   "answer": "To call a child workflow from a workflow specification, you use the `workflow` key within a task [1]. You can call a published workflow using the `ref` key, which identifies the workflow by its name, package, and optionally its version and namespace [2, 3].\n\n### Basic Syntax\nThe contract for a child workflow involves passing data via the task's `input` map and receiving the result through the task's `output` [1].\n\n```yaml\n- task_name: my-child-task\n  workflow:\n    ref: my-published-workflow\n    input:\n      key: \"{{ parent_variable }}\"\n  output:\n    as: result_variable\n```\n\n### Choosing a Mode\nThe `mode` determines how the child executes and how the parent behaves [1, 3]:\n\n| Mode | Description | Parent Behavior |\n| :--- | :--- | :--- |\n| `inline` (default) | Runs inside the parent's execution (cheapest) | Waits for the result |\n| `sync` | Runs as a separate workflow with its own history/retries | Waits for the result |\n| `async` | Starts the child and is cancelled if the parent finishes | Carries on; receives `workflow_id` |\n| `detached` | Starts the child; it survives even if the parent finishes | Carries on; receives `workflow_id` |\n\n### Referencing Workflows (`ref`)\nYou can reference workflows using a string path or a mapping object [2]:\n* **String path:** `payments/1.*/payment-charge` (Package `payments`, highest `1.x.y` version, workflow `payment-charge`) [2].\n* **Mapping:**\n  ```yaml\n  ref:\n    namespace: finance\n    name: payments/payment-charge\n    version: \"1.2.0\"\n  ```\n\n### Alternative Methods\n* **`contents` / `contents_yaml`:** Used to inline child documents or YAML text instead of using a `ref` [3].\n* **`builtin.execute_workflow`:** An activity that runs a workflow as a single, atomic activity rather than a child workflow [4].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/concepts/child-workflows/",
+    "http://localhost:8080/docs/concepts/child-workflows/",
+    "http://localhost:8080/docs/guides/writing-workflows/",
+    "http://localhost:8080/docs/concepts/child-workflows/"
+   ],
+   "secs": 17.0,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "checkpoint",
+   "kind": "answer",
+   "answer": "In Moco, a checkpoint for a state machine (configured via a `checkpoint_policy` within a state) allows a long-running workflow to save its context and start a fresh event history [1, 4]. This is particularly useful on the Temporal runtime to prevent event history from becoming too large [4].\n\nWhen a checkpoint occurs, the following happens:\n\n*   **Context Preservation:** The workflow context is serialized and carried over to the new run (this is the default behavior via `serialize_context: true`) [1, 2].\n*   **Resumption:** By default (`auto_resume: true`), the machine resumes directly in the state where the checkpoint was triggered, skipping that state's `on_enter` task [1, 2].\n*   **Timer Reset:** Upon resumption, any timers declared in that state are restarted from their full duration [2].\n*   **Opting Out of Auto-Resume:** If `auto_resume` is set to `false`, the machine restarts at the `initial_state` instead of the checkpointed state, but it still carries the saved context [2]. This is useful if an `init` state needs to re-run side effects, such as restarting an `async_mode` activity [2].\n\n**Note:** Checkpointing applies only on the Temporal runtime; it does nothing on the in-memory runtime [1, 4]. At least one of `event_count` or `timeout_sec` must be defined in the policy to trigger a checkpoint [1, 2].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/reference/statements/",
+    "http://localhost:8080/docs/reference/statements/"
+   ],
+   "secs": 14.9,
+   "cited": true,
+   "keyword_coverage": 0.5,
+   "ok": true
+  },
+  {
+   "id": "secrets",
+   "kind": "answer",
+   "answer": "How secrets are resolved depends on whether the activity has built-in support for secret keys:\n\n*   **Activities with built-in support:** Most activities that require a secret take a **secret key** instead of the plaintext secret itself [1]. For example, an activity might use a field like `openai.chat.completions.apikey_secret_key` [1]. The activity then looks up and decrypts the secret internally, ensuring plaintext never touches the workflow context [1].\n*   **Activities without built-in support:** If an activity does not yet support a secret key field (such as `http.request`), you must use the `builtin.secret.get` activity [1, 2]. This activity returns the secret **still encrypted** [1, 2]. You must pass this encrypted blob directly to the activity's specific field (e.g., `encrypted_auth_token` for `http.request`), which then decrypts it internally [1, 3].\n\n**Resolution Namespaces:**\n*   A bare `NAME` resolves a secret owned by the calling user [2].\n*   `global/NAME` resolves a secret from the shared global store [1, 2].\n\n**Security Note:**\nPlaintext secrets never travel between activities [1]. Plaintext only exists inside the secret manager and inside the specific activity that consumes the secret [2]. Additionally, any values placed in `headers` are passed through workflow context and history in plaintext, so you should use `encrypted_auth_token` for bearer credentials instead [4].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/concepts/activities/",
+    "http://localhost:8080/docs/reference/activities/secret/",
+    "http://localhost:8080/docs/reference/activities/mcp/"
+   ],
+   "secs": 14.9,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "wait-for",
+   "kind": "answer",
+   "answer": "In a `wait_for` task, `match_expression` is used to filter incoming events so that the task only proceeds if the event meets specific criteria [1].\n\nIt functions as a **condition**, which is an expression that evaluates to a boolean, or an `and` / `or` / `not` tree of boolean expressions [1].\n\n### Example Usage\nYou can use `match_expression` to select events based on their payload data. For example, to wait for a payment event that matches a specific `transaction_id` and has a status of `\"completed\"`, you would use:\n\n```yaml\n- task_name: await-payment\n  wait_for:\n    event:\n      topic: payment_events\n      match_expression:\n        and:\n          - '{{ event[\"data\"].get(\"transaction_id\") == transaction_id }}'\n          - '{{ event[\"data\"].get(\"status\") == \"completed\" }}'\n    timeout_sec: 120\n  output:\n    as: payment_event\n```\n[1]",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/concepts/events/"
+   ],
+   "secs": 12.1,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "publish",
+   "kind": "answer",
+   "answer": "To publish a workflow package using the moco CLI, follow these steps:\n\n1.  **Prepare your project**: Ensure your project root contains a `moco.json` file that describes the package, including the `wfspec_package_name`, `wfspec_package_version`, and the paths to your `sources` and `tests` [1].\n2.  **Validate**: It is recommended to run `moco publish --dry-run` first to validate the package and see what would be published [1, 2, 4].\n3.  **Publish**: Run the following command to publish the package to your working namespace:\n    ```bash\n    moco publish\n    ```\n    If you need to publish to a different namespace, use:\n    ```bash\n    moco publish --namespace <namespace-id>\n    ```\n    [1, 2]\n\n**Note on Deployment**: Publishing only stores the package [1, 2]. To make a specific version resolvable by name in a stage (such as `dev`, `beta`, or `prod`), you must perform a separate **deployment** step via the web console [1, 2].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/quick-start/"
+   ],
+   "secs": 13.1,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "expressions",
+   "kind": "answer",
+   "answer": "To write an expression that reads a variable in a moco workflow, you must wrap the expression in double curly braces: `{{ }}` [2].\n\n### Name Resolution Order\nWhen you use a bare name in an expression, Moco looks it up in the following order [2]:\n1. **Reserved names** (e.g., `_`, `__context__`, `__sys_info__`)\n2. **Current task's locals** (e.g., `_name`)\n3. **Container scopes** (e.g., `name@`), starting from the innermost\n4. **Workflow context** (e.g., `context`, `input`, and all other variables written without a marker)\n\n### Accessing Variables\n* **Standard Variables:** Simply use the name inside the braces, such as `{{ price * quantity }}` [2].\n* **Checking Existence:** Because a missing name results in a `NameError`, you can test if a variable exists by querying `__context__` [2]:\n  ```yaml\n  - set:\n      - tier: '{{ tier if \"tier\" in __context__ else \"standard\" }}'\n  ```\n* **Child Workflow Outputs:** If a child workflow returns a key, you read it using the `_` notation, such as `_[\"currency\"]` [4].\n* **Loop Variables:** In a `loop`, you can access the iteration variable (the `foreach` value) and an optional index [4].\n\n### Important Note on Types\nThe way the expression is written affects the resulting data type [2]:\n* **Typed Value:** `{{ [1, 2] }}` results in a list.\n* **String Interpolation:** `'n={{ [1, 2] }}'` results in a string where the expression is replaced by its string representation (e.g., `'n=[1, 2]'`).",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/concepts/expressions/",
+    "http://localhost:8080/docs/guides/writing-workflows/"
+   ],
+   "secs": 15.9,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "runtimes",
+   "kind": "answer",
+   "answer": "The primary differences between the Temporal and in-memory runtimes involve durability, orchestration capabilities, and how they handle execution:\n\n*   **Durability and Recovery:** The Temporal runtime provides durable, distributed execution where every run has a complete event log that can be inspected via `moco history` [4]. In contrast, the in-memory runtime records nothing; if the process crashes, the run is lost [4].\n*   **Retries and Error Handling:** On Temporal, activities that fail transiently are retried according to their retry policies [4]. The in-memory runtime ignores retry policies entirely, giving activities only one attempt [4].\n*   **Workflow Management:** Temporal allows you to address workflows via a `workflow_id` using commands like `moco start`, `status`, `cancel`, `terminate`, and `history` [4]. These are unavailable in the in-memory runtime, which returns a `400` error for such requests [4].\n*   **Execution and Scaling:** Temporal executes activities on workers, allowing for scale and isolation (e.g., `claude_agent.*` activities run on dedicated workers) [4]. In-memory activities execute in-process [4].\n*   **Waiting and Blocking:** A workflow blocked on a long timer or `wait_for` does not occupy a process on Temporal [4]. On the in-memory runtime, the same wait ties up the caller for the entire duration [4].\n*   **Advanced Features:** Certain settings, such as `tier` (used to resolve workflow names to `dev` or `prod` versions), are only honored by the Temporal runtime [1]. Additionally, checkpointing for long-running state machines applies only to the Temporal runtime [3].",
+   "status": "ok",
+   "route": "rag",
+   "sources": [
+    "http://localhost:8080/docs/concepts/how-to-run-workflow/",
+    "http://localhost:8080/docs/concepts/state-machines/",
+    "http://localhost:8080/docs/concepts/dual-runtime/"
+   ],
+   "secs": 14.1,
+   "cited": true,
+   "keyword_coverage": 1.0,
+   "ok": true
+  },
+  {
+   "id": "kafka-v9",
+   "kind": "decline",
+   "answer": "The provided documentation does not contain information regarding a \"moco's built-in Kafka Streams v9 connector\" or its maximum message size in megabytes.\n\n_Note: I could not fully verify this answer against the sources._",
+   "status": "ok",
+   "route": "rag",
+   "sources": [],
+   "secs": 13.9,
+   "ok": true
+  },
+  {
+   "id": "quantum",
+   "kind": "decline",
+   "answer": "I am sorry, but the provided documentation does not mention a \"quantum scheduler\" or specify which moco release introduced such a feature.",
+   "status": "ok",
+   "route": "rag",
+   "sources": [],
+   "secs": 11.9,
+   "ok": true
+  },
+  {
+   "id": "hello",
+   "kind": "chat",
+   "answer": "I am Moco Assistant, an expert on the moco workflow platform. I can help you with:\n\n* **YAML workflow specs** (DSL v2)\n* **Activities** (including Playwright, Email, HTTP, etc.)\n* **Double-brace expressions**\n* **State machines and rules engines**\n* **Runtimes** (Temporal and in-memory)\n* **Deployment and the moco CLI**\n\n_Note: I could not fully verify this answer against the sources._",
+   "status": "ok",
+   "route": "rag",
+   "sources": [],
+   "secs": 12.0,
+   "ok": true
+  },
+  {
+   "id": "thanks",
+   "kind": "chat",
+   "answer": "You're very welcome! Feel free to reach out if you have more questions about Moco workflows, activities, or testing later on. Happy coding!",
+   "status": "ok",
+   "route": "rag",
+   "sources": [],
+   "secs": 11.7,
+   "ok": true
+  }
+ ]
+}

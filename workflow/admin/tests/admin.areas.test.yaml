@@ -1,0 +1,64 @@
+test_type: integration-test
+
+# admin.sessions (the area with logic of its own): get_session merges the rows and a
+# page of turns; delete removes the rows (and signals the entity, an emit_event that
+# cannot be mocked, which its on_error: {catch: true} keeps harmless here).
+
+wfspec:
+  name: admin.sessions
+
+test_cases:
+  - id: get-session-merges-rows-and-turns
+    input: {op: get_session, agent_id: skeleton, session_id: s1}
+    mocks:
+      - {step_name: get-session-rows, _: {ok: true, data: {meta: {title: "t", turn_count: 1}, context: {recent: []}}, error: null}}
+      - {step_name: get-session-turns, _: {ok: true, data: {turns: [{turn: 1, role: user, content: "q"}], next_page: null}}}
+    expect:
+      assert:
+        - "{{ ok == True and data['meta']['title'] == 't' and len(data['turns']) == 1 and data['next_page'] is None }}"
+
+  - id: get-of-an-unknown-session-is-not-found
+    input: {op: get_session, agent_id: skeleton, session_id: nope}
+    mocks:
+      - {step_name: get-session-rows, _: {ok: false, data: null, error: {code: not_found}}}
+      - {step_name: get-session-turns, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - error: {code: not_found}
+
+  - id: delete-session-removes-the-rows
+    input: {op: delete_session, agent_id: skeleton, session_id: s1}
+    mocks:
+      - {step_name: delete-config, _: {ok: true, data: {config: {}}}}
+      - {step_name: list-session-jobs, _: {ok: true, data: {jobs: []}}}
+      - {step_name: delete-session-rows, _: {ok: true, data: {deleted_keys: [k]}, error: null}}
+    expect:
+      output:
+        - ok: true
+        - data: {deleted_keys: [k]}
+
+  # Phase 3: the session's live jobs are cancelled and every job row goes. The mocks
+  # fail for any other job, so only j1 is cancelled and both rows are deleted.
+  - id: delete-session-cancels-live-jobs-and-drops-job-rows
+    input: {op: delete_session, agent_id: skeleton, session_id: s1}
+    mocks:
+      - {step_name: delete-config, _: {ok: true, data: {config: {}}}}
+      - {step_name: list-session-jobs, _: {ok: true, data: {jobs: [{job_id: j1, status: running}, {job_id: j2, status: completed}]}}}
+      - {step_name: cancel-session-job, _: "{{ {'ok': True, 'data': {'cancelled': True}} if cancel_job_id == 'j1' else 1 / 0 }}"}
+      - {step_name: delete-session-job, _: "{{ {'ok': True, 'data': {'deleted': True}} if delete_job_id in ['j1', 'j2'] else 1 / 0 }}"}
+      - {step_name: delete-session-rows, _: {ok: true, data: {deleted_keys: [k]}, error: null}}
+    expect:
+      output:
+        - ok: true
+        - data: {deleted_keys: [k]}
+
+  # Phase 2: feedback goes to session-store with the agent's access lists.
+  - id: feedback-is-submitted-through-session-store
+    input: {op: submit_feedback, agent_id: skeleton, session_id: s1, turn: 2, rating: down, comment: wrong}
+    mocks:
+      - {step_name: feedback-config, _: {ok: true, data: {config: {access: {guest_user_ids: [guest]}}}}}
+      - {step_name: op-feedback, _: {ok: true, data: {feedback: {rating: down}, memory: true}}}
+    expect:
+      assert:
+        - "{{ ok == True and data['feedback']['rating'] == 'down' }}"

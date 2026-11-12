@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-harness-session",
+    "wfspec_package_version": "0.15.0",
+    "wfspec_description": "Agent harness - Orchestration: the agent-session entity, session-store, conversation-compactor, hitl. Part of the agent-harness-* package set; see moco-agent/docs/plan-00-overview.md.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.test.yaml"
+    ]
+}

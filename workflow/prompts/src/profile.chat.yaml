@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.CHAT — library profile: one inference call, no retrieval, no tools (§5.3)
+# ================================================================================
+# A data wfspec. agent-registry load reads it and merges the definition's
+# profile_overrides.chat over it field by field. Shape: design §6.8.2.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.chat
+
+context:
+  profile:
+    name: chat
+    kind: loop
+    mode: sync
+    route_description: "Greetings, chit-chat, and general questions that need no documents and no tools."
+    examples: ["hello", "what can you do?"]
+    requires: {}
+    needs_rewrite: false
+    budget_sec: 40
+    estimated_sec: 10
+    loop:
+      model_role: inference
+      prompt: loop
+      retrieval: {when: none}
+      tools:
+      max_steps: 1
+      output_checks: []
+      grounding: none
+    wfspec:
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

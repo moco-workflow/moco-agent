@@ -1,0 +1,35 @@
+test_type: integration-test
+
+# hook.moco.link-check: a dead link is noted in the answer (patch); live links or none
+# → continue. HEAD requests are mocked by task name (one mock per call, so a mock
+# answers by `link`).
+
+wfspec:
+  name: hook.moco.link-check
+
+test_cases:
+  - id: a-dead-link-is-noted
+    input: {hook_event: answer.ready, payload: {answer: "See https://docs.ok/a and https://gone.example/b.", sources: []}}
+    mocks:
+      - {step_name: head-link, _: "{{ {'status_code': 404 if 'gone' in link else 200} }}"}
+    expect:
+      output:
+        - action: patch
+        - patch: {answer: "See https://docs.ok/a and https://gone.example/b.\n\n_Note: these links did not respond: https://gone.example/b._"}
+
+  - id: live-links-continue
+    input: {hook_event: answer.ready, payload: {answer: "See https://docs.ok/a", sources: []}}
+    mocks:
+      - {step_name: head-link, _: {status_code: 200}}
+    expect:
+      output:
+        - action: continue
+        - patch: {}
+
+  - id: no-links-no-requests
+    input: {hook_event: answer.ready, payload: {answer: "No links here.", sources: []}}
+    mocks:
+      - {step_name: head-link, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - action: continue

@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.MEMORY — library profile: "remember / forget / what do you know about me"
+# ================================================================================
+# Gated by requires.config: memory.long_term.enabled. A `kind: wfspec` profile: the
+# work is profile-memory (qset.memory.command → memory remember / forget / list →
+# a templated answer, no chat-model call; §6.4.7).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.memory
+
+context:
+  profile:
+    name: memory
+    kind: wfspec
+    mode: sync
+    route_description: "The user asks the assistant to remember or forget something about them, or what it remembers."
+    examples: ["remember that I deploy with helm", "what do you know about me?"]
+    requires: {config: memory.long_term.enabled, not_guest: true}
+    needs_rewrite: false
+    budget_sec: 30
+    estimated_sec: 8
+    wfspec: {name: agent-harness-memory/profile-memory}
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

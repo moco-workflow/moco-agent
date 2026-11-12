@@ -1,0 +1,448 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# JOB-MANAGER — async work as detached entities (design §6.12, plan-13)
+# ================================================================================
+#
+#   mode            in                                          data out
+#   ─────────────── ─────────────────────────────────────────── ─────────────────────
+#   start           session_id, profile, wfspec, job_input,      {job_id, workflow_id, job}
+#                   summary?, config
+#   report          job_id, session_id, to, progress?, result?,  {job, kind, notified}
+#                   error_info?, pending_action?
+#   send            job_id, decision, feedback?, pending_action  {sent}
+#   get             job_id                                      {job}
+#   list            session_id?, status?                        {jobs}
+#   cancel          job_id, reason?                             {cancelled, via, job}
+#   mark_delivered  job_id                                      {job, already}
+#   reconcile       session_id, config                          {to_relay: [row], active: [summary],
+#                                                                 failed_stuck: [job_id]}
+#   delete          job_id                                      {deleted}  (session delete; cancel first)
+#
+# WHO CALLS WHAT. The session starts jobs in `finalizing` (F6: never the profile
+# or the tool executor -- they only RETURN a job_request), reconciles in `init`,
+# marks delivered in `relaying` and sends replies in `resuming`. The job entity
+# reports. agent-admin cancels (delete_session, the jobs area).
+#
+# THE ROW IS THE TRUTH, THE EVENT A NUDGE. `report` writes the row (job-store
+# transition), and only then emits `subagent_event {job_id, kind, status}` to the
+# session: kind progress (running) is a plain signal, dropped when the session is
+# not running; pending_action (awaiting_input) and complete (terminal) wake it
+# (start-or-signal), and the session reads the row before acting. A report the row
+# refuses (the job was cancelled meanwhile) returns invalid_state and emits
+# nothing: the entity then stops (§6.12 Writers).
+#
+# CANCEL. The entity is the row's only live writer, so cancel SIGNALS it
+# (job_cancel) and it writes `cancelled` itself. Only when the signal fails --
+# no entity runs -- does cancel write `cancelled` directly.
+#
+# STUCK JOBS (reconcile). The job entity is its row's only live writer, so a job whose
+# entity died (worker crash, terminate) stays unfinished forever. reconcile -- run by the
+# session as the job's own user, the only identity that can address the row (F50
+# closed) -- probes each unfinished row that is
+#   queued          for more than job_stuck_queued_sec (the entity starts in seconds)
+#   running         past limits.job_timeout_sec + job_stuck_grace_sec since its last report
+#   awaiting_input  past its pending action's expires_at + job_stuck_grace_sec
+# with a `ping` to the entity (job-signal to_job: a running entity buffers it). Dead →
+# transition failed {code: entity_gone}, and the row goes to to_relay with the others.
+# A probe that errors counts as alive: never fail a job on doubt. A job of a user who
+# never comes back stays unfinished; nothing else reads it.
+#
+# LIMIT. `limits.max_async_jobs` (default 1) non-terminal jobs per session; start
+# over the limit is limit_exceeded.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: job-manager
+
+context:
+  valid_modes: ["start", "report", "send", "get", "list", "cancel", "mark_delivered", "reconcile", "delete"]
+  terminal_statuses: ["completed", "failed", "cancelled"]
+  default_max_async_jobs: 1
+  default_job_timeout_sec: 3600
+  job_stuck_queued_sec: 600
+  job_stuck_grace_sec: 600
+  stuck_rows: []
+  job_probes: []
+  job_alive: false
+  failed_rows: []
+  ok: false
+  data:
+  error:
+  store_result: {}
+  active_rows: []
+  job_id_new:
+  sent: false
+  notified: false
+  cancel_row: {}
+
+input:
+  mode: get
+  agent_id:
+  job_id:
+  session_id:
+  profile:
+  wfspec:
+  job_input: {}
+  summary: ""
+  config: {}
+  to:
+  progress:
+  result:
+  error_info:
+  pending_action:
+  decision:
+  feedback:
+  reason: ""
+  status:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "job-manager: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: prepare
+      set:
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - aid: '{{ str(agent_id or "").strip() }}'
+
+    # ── pass-through reads and writes ───────────────────────────────────────
+    - task_name: store-passthrough
+      skip_if: "{{ mode not in ['get', 'list', 'mark_delivered', 'delete'] }}"
+      workflow:
+        ref: job-store
+        mode: inline
+        input:
+          mode: "{{ mode }}"
+          agent_id: "{{ aid }}"
+          job_id: "{{ job_id }}"
+          session_id: "{{ session_id }}"
+          status: "{{ status }}"
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') is True }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    # ── start ───────────────────────────────────────────────────────────────
+    - task_name: mode-start
+      skip_if: "{{ mode != 'start' }}"
+      tasks:
+        - task_name: list-active
+          workflow:
+            ref: job-store
+            mode: inline
+            input: {mode: list, agent_id: "{{ aid }}", session_id: "{{ session_id }}", status: ["queued", "running", "awaiting_input"]}
+          output:
+            set:
+              - active_rows: "{{ (((_ or {}).get('data') or {}).get('jobs')) or [] }}"
+              - list_ok: "{{ (_ or {}).get('ok') is True }}"
+
+        - task_name: check-limit
+          set:
+            - _max: "{{ int(((config or {}).get('limits') or {}).get('max_async_jobs') or default_max_async_jobs) }}"
+            - start_problem#: >-
+                {{ ('invalid_input', 'start needs a session_id, a profile and a wfspec')
+                     if not (session_id and profile and wfspec) else
+                   ('store_failed', 'cannot read the jobs of session ' + str(session_id)) if not list_ok else
+                   ('limit_exceeded', 'a background job is already running in this session ('
+                                      + ', '.join(r.get('job_id') for r in active_rows) + ')')
+                     if len(active_rows) >= _max else None }}
+            - job_id_new: "{{ 'job-' + str(uuid4()).replace('-', '')[:12] }}"
+            - job_workflow_id: "agent-job-{{ aid }}-{{ uid }}-{{ job_id_new }}"
+
+        - task_name: create-row
+          skip_if: "{{ start_problem is not None }}"
+          workflow:
+            ref: job-store
+            mode: inline
+            input:
+              mode: create
+              agent_id: "{{ aid }}"
+              job_id: "{{ job_id_new }}"
+              session_id: "{{ session_id }}"
+              profile: "{{ profile }}"
+              wfspec: "{{ wfspec }}"
+              workflow_id: "{{ job_workflow_id }}"
+              summary: "{{ summary }}"
+          output:
+            set:
+              - store_result: "{{ _ or {} }}"
+              - start_problem: >-
+                  {{ None if (_ or {}).get('ok') is True else
+                     ('store_failed', str(((_ or {}).get('error') or {}).get('message') or 'cannot write the job row')) }}
+
+        - task_name: start-entity
+          skip_if: "{{ start_problem is not None }}"
+          workflow:
+            ref: job-signal
+            mode: inline
+            input:
+              kind: start_job
+              agent_id: "{{ aid }}"
+              owner_user_id: "{{ uid }}"
+              job_id: "{{ job_id_new }}"
+              data:
+                agent_id: "{{ aid }}"
+                job_id: "{{ job_id_new }}"
+                session_id: "{{ session_id }}"
+                profile: "{{ profile }}"
+                wfspec: "{{ wfspec }}"
+                job_input: "{{ job_input or {} }}"
+          output:
+            set:
+              - sent: "{{ (_ or {}).get('sent') is True }}"
+
+        # Nothing will ever run it: the row must not stay queued.
+        - task_name: fail-unstarted
+          skip_if: "{{ start_problem is not None or sent }}"
+          workflow:
+            ref: job-store
+            mode: inline
+            input: {mode: transition, agent_id: "{{ aid }}", job_id: "{{ job_id_new }}", to: failed, error_info: {code: start_failed, message: "the job entity could not be started"}}
+          on_error:
+            catch: true
+
+        - task_name: shape-start
+          set:
+            - _problem: "{{ start_problem if start_problem is not None else (None if sent else ('start_failed', 'the job entity could not be started')) }}"
+            - ok: "{{ _problem is None }}"
+            - error: "{{ None if _problem is None else {'code': _problem[0], 'message': _problem[1], 'retryable': _problem[0] in ['store_failed', 'start_failed']} }}"
+            - data: >-
+                {{ None if _problem is not None else
+                   {'job_id': job_id_new, 'workflow_id': job_workflow_id,
+                    'job': ((store_result.get('data') or {}).get('job'))} }}
+
+    # ── report (called by the job entity) ───────────────────────────────────
+    - task_name: mode-report
+      skip_if: "{{ mode != 'report' }}"
+      tasks:
+        - task_name: write-report
+          workflow:
+            ref: job-store
+            mode: inline
+            input:
+              mode: transition
+              agent_id: "{{ aid }}"
+              job_id: "{{ job_id }}"
+              to: "{{ to }}"
+              progress: "{{ progress }}"
+              result: "{{ result }}"
+              error_info: "{{ error_info }}"
+              pending_action: "{{ pending_action }}"
+          output:
+            set:
+              - store_result: "{{ _ or {} }}"
+
+        - task_name: classify-report
+          set:
+            - report_ok: "{{ store_result.get('ok') is True }}"
+            - report_kind#: >-
+                {{ 'progress' if to == 'running' else
+                   'pending_action' if to == 'awaiting_input' else
+                   'complete' if to in terminal_statuses else None }}
+
+        - task_name: notify-session
+          skip_if: "{{ not report_ok or report_kind is None or not session_id }}"
+          workflow:
+            ref: job-signal
+            mode: inline
+            input:
+              kind: to_session
+              agent_id: "{{ aid }}"
+              owner_user_id: "{{ uid }}"
+              session_id: "{{ session_id }}"
+              event_type: subagent_event
+              data: {job_id: "{{ job_id }}", kind: "{{ report_kind }}", status: "{{ to }}"}
+              wake: "{{ report_kind != 'progress' }}"
+          output:
+            set:
+              - notified: "{{ (_ or {}).get('sent') is True }}"
+
+        - task_name: shape-report
+          set:
+            - ok: "{{ report_ok }}"
+            - error: "{{ store_result.get('error') }}"
+            - data: "{{ {'job': (store_result.get('data') or {}).get('job'), 'kind': report_kind, 'notified': notified} if report_ok else None }}"
+
+    # ── send (a reply to the job's pending action) ──────────────────────────
+    - task_name: mode-send
+      skip_if: "{{ mode != 'send' }}"
+      tasks:
+        - task_name: signal-reply
+          workflow:
+            ref: job-signal
+            mode: inline
+            input:
+              kind: to_job
+              agent_id: "{{ aid }}"
+              owner_user_id: "{{ uid }}"
+              job_id: "{{ job_id }}"
+              event_type: job_reply
+              data: {decision: "{{ decision }}", feedback: "{{ feedback }}", pending_action: "{{ pending_action }}"}
+          output:
+            set:
+              - sent: "{{ (_ or {}).get('sent') is True }}"
+        - task_name: shape-send
+          set:
+            - ok: "{{ sent }}"
+            - error: "{{ None if sent else {'code': 'not_running', 'message': 'job ' + str(job_id) + ' is not running', 'retryable': False} }}"
+            - data: "{{ {'sent': True} if sent else None }}"
+
+    # ── cancel ──────────────────────────────────────────────────────────────
+    - task_name: mode-cancel
+      skip_if: "{{ mode != 'cancel' }}"
+      tasks:
+        - task_name: read-to-cancel
+          workflow:
+            ref: job-store
+            mode: inline
+            input: {mode: get, agent_id: "{{ aid }}", job_id: "{{ job_id }}"}
+          output:
+            set:
+              - cancel_row: "{{ (((_ or {}).get('data') or {}).get('job')) or {} }}"
+
+        - task_name: signal-cancel
+          skip_if: "{{ not cancel_row or cancel_row.get('status') in terminal_statuses }}"
+          workflow:
+            ref: job-signal
+            mode: inline
+            input:
+              kind: to_job
+              agent_id: "{{ aid }}"
+              owner_user_id: "{{ uid }}"
+              job_id: "{{ job_id }}"
+              event_type: job_cancel
+              data: {reason: "{{ reason }}"}
+          output:
+            set:
+              - sent: "{{ (_ or {}).get('sent') is True }}"
+
+        # The entity is gone: nobody else will ever write this row.
+        - task_name: cancel-row-directly
+          skip_if: "{{ not cancel_row or cancel_row.get('status') in terminal_statuses or sent }}"
+          workflow:
+            ref: job-store
+            mode: inline
+            input: {mode: transition, agent_id: "{{ aid }}", job_id: "{{ job_id }}", to: cancelled, error_info: {code: cancelled, message: "{{ reason or 'cancelled' }}"}}
+          output:
+            set:
+              - store_result: "{{ _ or {} }}"
+
+        - task_name: shape-cancel
+          set:
+            - _live: "{{ bool(cancel_row) and cancel_row.get('status') not in terminal_statuses }}"
+            - ok: "{{ bool(cancel_row) and (not _live or sent or store_result.get('ok') is True) }}"
+            - error: >-
+                {{ None if ok else
+                   {'code': 'not_found', 'message': 'no job ' + str(job_id), 'retryable': False} if not cancel_row else
+                   store_result.get('error') }}
+            - data: >-
+                {{ None if not ok else
+                   {'cancelled': _live, 'via': ('event' if sent else 'row') if _live else None,
+                    'job': (store_result.get('data') or {}).get('job') or cancel_row} }}
+
+    # ── reconcile (session init) ────────────────────────────────────────────
+    - task_name: mode-reconcile
+      skip_if: "{{ mode != 'reconcile' }}"
+      tasks:
+        - task_name: list-session-jobs
+          workflow:
+            ref: job-store
+            mode: inline
+            input: {mode: list, agent_id: "{{ aid }}", session_id: "{{ session_id }}"}
+          output:
+            set:
+              - store_result: "{{ _ or {} }}"
+        - task_name: pick-stuck
+          set:
+            - _now: "{{ now().replace(tzinfo=None) }}"
+            - _timeout: "{{ int((((config or {}).get('limits') or {}).get('job_timeout_sec')) or default_job_timeout_sec) }}"
+            - _open: "{{ [r for r in (((store_result.get('data') or {}).get('jobs')) or []) if isinstance(r, dict) and r.get('status') not in terminal_statuses] }}"
+            - _age: >-
+                {{ [int((_now - dt.datetime.fromisoformat(str(r.get('updated_at') or r.get('created_at'))).replace(tzinfo=None)).total_seconds())
+                    if (r.get('updated_at') or r.get('created_at')) else 0 for r in _open] }}
+            - _exp_age: >-
+                {{ [int((_now - dt.datetime.fromisoformat(str((r.get('pending_action') or {}).get('expires_at'))).replace(tzinfo=None)).total_seconds())
+                    if (r.get('pending_action') or {}).get('expires_at') else 0 for r in _open] }}
+            - stuck_rows#: >-
+                {{ [r for r, a, e in zip(_open, _age, _exp_age)
+                    if (r.get('status') == 'queued' and a > job_stuck_queued_sec)
+                       or (r.get('status') == 'running' and a > _timeout + job_stuck_grace_sec)
+                       or (r.get('status') == 'awaiting_input' and e > job_stuck_grace_sec)] }}
+
+        - task_name: probe-stuck
+          skip_if: "{{ not stuck_rows }}"
+          loop:
+            in: "{{ stuck_rows }}"
+            foreach: stuck
+            do:
+              tasks:
+                - task_name: probe-job
+                  workflow:
+                    ref: job-signal
+                    mode: inline
+                    input: {kind: to_job, agent_id: "{{ aid }}", owner_user_id: "{{ uid }}", job_id: "{{ stuck.get('job_id') }}", event_type: ping, data: {from: job-manager}}
+                  output:
+                    set:
+                      - job_alive: "{{ bool((_ or {}).get('sent')) }}"
+                  on_error:
+                    catch: true
+                    do:
+                      set:
+                        - job_alive: true
+                - task_name: record-job-probe
+                  set:
+                    - job_probes: "{{ job_probes + [dict(stuck, _alive=job_alive)] }}"
+
+        - task_name: fail-dead
+          skip_if: "{{ not [p for p in job_probes if not p['_alive']] }}"
+          loop:
+            in: "{{ [p for p in job_probes if not p['_alive']] }}"
+            foreach: dead_job
+            do:
+              task_name: fail-job-row
+              workflow:
+                ref: job-store
+                mode: inline
+                input:
+                  mode: transition
+                  agent_id: "{{ aid }}"
+                  job_id: "{{ dead_job.get('job_id') }}"
+                  to: failed
+                  error_info: {code: entity_gone, message: "the job stopped unexpectedly (its workflow is gone)"}
+              on_error:
+                catch: true
+          output:
+            set:
+              - failed_rows: >-
+                  {{ [((r.get('data') or {}).get('job')) for r in (_ or [])
+                      if isinstance(r, dict) and r.get('ok') and isinstance((r.get('data') or {}).get('job'), dict)] }}
+
+        - task_name: shape-reconcile
+          set:
+            # A row failed just now replaces its stale copy.
+            - _failed_ids: "{{ [r.get('job_id') for r in failed_rows] }}"
+            - _rows: "{{ [r for r in (((store_result.get('data') or {}).get('jobs')) or []) if r.get('job_id') not in _failed_ids] + failed_rows }}"
+            - ok: "{{ store_result.get('ok') is True }}"
+            - error: "{{ store_result.get('error') }}"
+            # Terminal and not yet delivered, or waiting for an answer: the session
+            # relays these (a pending action it already holds is not re-opened).
+            - data: >-
+                {{ None if not ok else
+                   {'to_relay': [r for r in _rows
+                                 if (r.get('status') in terminal_statuses and not r.get('delivered_at'))
+                                    or r.get('status') == 'awaiting_input'],
+                    'active': [{k: r.get(k) for k in ['job_id', 'status', 'profile', 'summary', 'progress', 'updated_at']}
+                               for r in _rows if r.get('status') not in terminal_statuses],
+                    'failed_stuck': _failed_ids} }}

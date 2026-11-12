@@ -1,0 +1,224 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KNOWLEDGE-INDEXER — index one source and record the verdict (design §6.5.2)
+# ================================================================================
+#
+#   in                                              out
+#   ─────────────────────────────────────────────── ───────────────────────────────
+#   name, scope, index_sources, overwrite,          {name, status: ready|failed,
+#   pgvector_secret_key, chunk_size?, chunk_overlap?, node_count, error, per_source,
+#   definition_access, refresh?, target_table?       table_name, dropped}
+#
+# Started DETACHED by `knowledge register / reindex` (off the chat path: indexing
+# takes minutes, a turn has ~110 s). The row is already `indexing` -- the facade
+# made that transition, so a worker that dies mid-run leaves a visible `indexing`
+# row whose `updated_at` tells "still going" from "died".
+#
+# Ported from the old agent's knowledge-indexer, which wrote its own registry rows;
+# here source-registry owns them (§4.3), so this file only:
+#   1. reads the row (table_name and embed_model_info come from it: the same model
+#      must be used at query time);
+#   2. runs knowledge-index-run as a `sync` child with on_error, so a bad source
+#      kind or a dead endpoint becomes a `failed` row rather than a lost attempt;
+#   3. records ready | failed through source-registry transition.
+# An index that produced 0 chunks is FAILED even without an error: with overwrite the
+# table has just been emptied, and calling it ready would advertise an empty source.
+#
+# REFRESH (refresh: true, from `knowledge refresh`): the row is `ready` and stays so --
+# it keeps serving from its table while this run builds `target_table`, the other table
+# of its pair, which the facade recorded as `refreshing.table_name`. Then:
+#   ok (> 0 chunks)  source-registry patch {table_name: target, node_count, indexed_at,
+#                    refreshing: null, refresh_error: null} with if_refreshing: target,
+#                    then DROP the old table -- queries have already moved over
+#   failed           DROP the target table; patch {refreshing: null, refresh_error,
+#                    refresh_failed_at} (the source keeps its old data and stays ready)
+#   patch refused    a reindex, delete or newer refresh took the row meanwhile: DROP the
+#                    target table and leave the row to whoever has it
+# A failed drop leaves an orphan table (named in `dropped` as false); it holds no row's
+# data, and the next refresh into that name overwrites it.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: knowledge-indexer
+
+context:
+  run_result: {}
+  table_pattern: "^kbr?_(u_[0-9a-f]{8}_)?[a-z0-9_]{1,48}$"
+  swap_result: {}
+  drop_table:
+  dropped:
+  final_status:
+  error_message:
+
+input:
+  agent_id:
+  name:
+  scope: shared
+  index_sources: []
+  overwrite: true
+  pgvector_secret_key:
+  chunk_size: 1024
+  chunk_overlap: 200
+  definition_access: {}
+  # refresh: build target_table beside the serving table, then swap (see above)
+  refresh: false
+  target_table:
+
+output:
+  name: "{{ name }}"
+  status: "{{ final_status }}"
+  node_count: "{{ total_nodes }}"
+  error: "{{ error_message }}"
+  per_source: "{{ per_source }}"
+  table_name: "{{ index_table }}"
+  dropped: "{{ dropped }}"
+
+main:
+  tasks:
+    - task_name: read-source
+      workflow:
+        ref: source-registry
+        mode: inline
+        input: {mode: get, agent_id: "{{ agent_id }}", name: "{{ name }}", scope: "{{ scope }}"}
+      output:
+        set:
+          - row: "{{ ((_ or {}).get('data') or {}).get('source') or {} }}"
+
+    - task_name: reject-not-indexing
+      raise:
+        if: "{{ not refresh and row.get('status') != 'indexing' }}"
+        type: error
+        error_type: AbortError
+        message: "knowledge-indexer: source {{ name }} ({{ scope }}) is {{ row.get('status') or 'missing' }}, not indexing"
+
+    - task_name: reject-not-refreshing
+      raise:
+        if: >-
+          {{ bool(refresh) and not (row.get('status') == 'ready' and (row.get('refreshing') or {}).get('table_name') == target_table
+                                    and re.match(table_pattern, str(target_table or ''))) }}
+        type: error
+        error_type: AbortError
+        message: "knowledge-indexer: source {{ name }} ({{ scope }}) is not refreshing into {{ target_table }}"
+
+    - task_name: pick-table
+      set:
+        - index_table: "{{ target_table if refresh else row['table_name'] }}"
+
+    - task_name: run-index
+      workflow:
+        ref: knowledge-index-run
+        mode: sync
+        input:
+          domain: "{{ name }}"
+          table_name: "{{ index_table }}"
+          sources: "{{ index_sources }}"
+          overwrite: "{{ overwrite }}"
+          pgvector_secret_key: "{{ pgvector_secret_key }}"
+          embed_model_info: "{{ row.get('embed_model_info') }}"
+          chunk_size: "{{ chunk_size }}"
+          chunk_overlap: "{{ chunk_overlap }}"
+        options:
+          retry_policy: {timeout_sec: 3600, max_attempts: 1}
+      output:
+        set:
+          - run_result: "{{ _ if isinstance(_, dict) else {} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - run_result: "{{ {'result': 'error', **_} }}"
+
+    - task_name: read-verdict
+      set:
+        - _ok: "{{ run_result.get('result') != 'error' }}"
+        - total_nodes#: "{{ int(run_result.get('node_count') or 0) if _ok else 0 }}"
+        - per_source: "{{ run_result.get('per_source') or [] if _ok else [] }}"
+        - _failed_sources: "{{ run_result.get('failed_sources') or [] if _ok else [] }}"
+        - final_status#: "{{ 'ready' if (_ok and total_nodes > 0) else 'failed' }}"
+        - error_message#: >-
+            {{ None if final_status == 'ready'
+               else (str(run_result.get('error_message') or 'indexing failed')[:500] if not _ok
+                     else ('Indexed 0 chunks. ' + str(len(_failed_sources)) + ' source(s) failed: '
+                           + (', '.join(str(f.get('source')) + ' (' + str(f.get('error')) + ')'
+                                        for f in _failed_sources if isinstance(f, dict)) or 'none'))[:500]) }}
+
+    - task_name: record-verdict
+      skip_if: "{{ bool(refresh) }}"
+      workflow:
+        ref: source-registry
+        mode: inline
+        input:
+          mode: transition
+          agent_id: "{{ agent_id }}"
+          name: "{{ name }}"
+          scope: "{{ scope }}"
+          to: "{{ final_status }}"
+          patch: {node_count: "{{ total_nodes }}", indexed_at: "{{ now().isoformat() }}", error: "{{ error_message }}"}
+          definition_access: "{{ definition_access }}"
+      output:
+        set:
+          - recorded#: "{{ _ }}"
+
+    - task_name: reject-unrecorded-verdict
+      raise:
+        if: "{{ not refresh and not (recorded or {}).get('ok') }}"
+        type: error
+        error_type: AbortError
+        message: "knowledge-indexer: could not record {{ final_status }} for {{ name }}: {{ (recorded or {}).get('error') }}"
+
+    # ── refresh: swap or discard the new table ──────────────────────────────
+    - task_name: record-refresh
+      skip_if: "{{ not refresh }}"
+      workflow:
+        ref: source-registry
+        mode: inline
+        input:
+          mode: patch
+          agent_id: "{{ agent_id }}"
+          name: "{{ name }}"
+          scope: "{{ scope }}"
+          if_refreshing: "{{ target_table }}"
+          patch: >-
+            {{ {'table_name': target_table, 'node_count': total_nodes, 'indexed_at': now().isoformat(),
+                'refreshing': None, 'refresh_error': None}
+               if final_status == 'ready' else
+               {'refreshing': None, 'refresh_error': error_message, 'refresh_failed_at': now().isoformat()} }}
+          definition_access: "{{ definition_access }}"
+      output:
+        set:
+          - swap_result#: "{{ _ or {} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - swap_result: "{{ {'ok': False, 'error': {'code': 'patch_failed', 'message': str(_.get('error_message'))[:300]}} }}"
+
+    # Swapped → the old table goes; anything else → the new one does.
+    - task_name: plan-drop
+      skip_if: "{{ not refresh }}"
+      set:
+        - drop_table#: "{{ row['table_name'] if (final_status == 'ready' and swap_result.get('ok')) else target_table }}"
+        - final_status: "{{ final_status if swap_result.get('ok') else 'failed' }}"
+        - error_message: >-
+            {{ error_message if swap_result.get('ok') else
+               'refresh discarded: ' + str((swap_result.get('error') or {}).get('message') or 'the source changed meanwhile') }}
+
+    - task_name: drop-replaced-table
+      skip_if: "{{ not refresh or not re.match(table_pattern, str(drop_table or '')) }}"
+      activity:
+        type: llama_index.drop_table
+        input:
+          vectordb_info:
+            connection_string_secret_key: "{{ pgvector_secret_key }}"
+            table_name: "{{ drop_table }}"
+        options:
+          retry_policy: {timeout_sec: 60, max_attempts: 2}
+      output:
+        set:
+          - dropped: "{{ {'table_name': drop_table, 'ok': True} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - dropped: "{{ {'table_name': drop_table, 'ok': False, 'error': str(_.get('error_message'))[:300]} }}"

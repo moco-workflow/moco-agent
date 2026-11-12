@@ -1,0 +1,186 @@
+test_type: unit-test
+
+# subagent.builder (plan-18 step 8): the phase decision (turn → job; plan; approve →
+# implement; revise → re-plan with feedback), the job hand-off, the plan_review
+# pending action, and the artifact envelope (unfencing, sanitising, report).
+
+wfspec:
+  name: subagent.builder
+
+test_groups:
+
+  - step_name: decide-phase
+    test_cases:
+      - id: a-turn-without-a-job-id-only-starts
+        input: {job_id: null, resume: null, query: "build a poller", config: {}}
+        expect:
+          assert:
+            - "{{ phase == 'start' and user_request == 'build a poller' and cfg['model'] == 'sonnet' }}"
+
+      - id: the-job-body-plans-first
+        input: {job_id: job-1, resume: null, job_input: {query: "build a poller", excerpt: "user: hi"}, config: {builder: {model: opus}}}
+        expect:
+          assert:
+            - "{{ phase == 'plan' and revision == 1 and user_request == 'build a poller' and excerpt == 'user: hi' and cfg['model'] == 'opus' }}"
+
+      - id: approve-implements-the-plan-from-detail
+        input:
+          job_id: job-1
+          config: {}
+          job_input: {query: "ignored"}
+          resume: {decision: approve, pending_action: {detail: {revision: 2, plan_markdown: "VERDICT: FEASIBLE\nplan", user_request: "build a poller", excerpt: ""}}}
+        expect:
+          assert:
+            - "{{ phase == 'implement' and previous_plan.startswith('VERDICT: FEASIBLE') and user_request == 'build a poller' and revision == 2 }}"
+
+      - id: revise-re-plans-with-the-feedback
+        input:
+          job_id: job-1
+          config: {}
+          resume: {decision: revise, feedback: "use kafka instead", pending_action: {detail: {revision: 1, plan_markdown: "old plan", user_request: "r"}}}
+        expect:
+          assert:
+            - "{{ phase == 'plan' and revision == 2 and feedback == 'use kafka instead' and previous_plan == 'old plan' }}"
+
+      - id: a-stray-reject-is-declined
+        input: {job_id: job-1, config: {}, resume: {decision: reject, pending_action: {detail: {}}}}
+        expect:
+          assert:
+            - "{{ phase == 'declined' }}"
+
+      - id: the-api-key-falls-back-to-claudes
+        input: {job_id: job-1, resume: null, config: {claude: {apikey_secret_key: K1}}}
+        expect:
+          assert:
+            - "{{ apikey == 'K1' }}"
+
+  - step_name: hand-to-job
+    test_cases:
+      - id: the-turn-returns-a-job-request-with-the-recent-turns
+        input:
+          phase: start
+          user_request: "build a poller"
+          context_bundle: {blocks: [{id: recent, items: [{role: assistant, content: "hello"}, {role: user, content: "hi"}]}]}
+        expect:
+          assert:
+            - "{{ status == 'async_started' and job_request['wfspec'] == 'subagent.builder' and job_request['summary'] == 'build a poller' }}"
+            - "{{ job_request['input'] == {'query': 'build a poller', 'excerpt': 'user: hi' + chr(10) + 'assistant: hello'} and 'review' in answer }}"
+
+      - id: an-empty-request-is-declined
+        input: {phase: start, user_request: "", context_bundle: {}}
+        expect:
+          assert:
+            - "{{ status == 'declined' and job_request is None }}"
+
+  - step_name: shape-plan
+    test_cases:
+      - id: a-plan-becomes-a-plan-review-action
+        input:
+          phase: plan
+          revision: 1
+          user_request: "build a poller"
+          excerpt: ""
+          cfg: {review_timeout_sec: 3600}
+          plan_summary_chars: 6000
+          run: {result: "VERDICT: FEASIBLE WITH GAPS\n\nIt polls.", num_turns: 4, total_cost_usd: 0.2}
+        expect:
+          assert:
+            - "{{ status == 'needs_approval' and verdict == 'FEASIBLE WITH GAPS' and pending_action['kind'] == 'plan_review' and pending_action['expires_in_sec'] == 3600 }}"
+            - "{{ pending_action['detail'] == {'phase': 'plan', 'revision': 1, 'plan_markdown': 'VERDICT: FEASIBLE WITH GAPS' + chr(10) * 2 + 'It polls.', 'verdict': 'FEASIBLE WITH GAPS', 'user_request': 'build a poller', 'excerpt': ''} }}"
+
+      - id: a-long-plan-is-truncated-in-the-summary-only
+        input:
+          phase: plan
+          revision: 1
+          user_request: "r"
+          excerpt: ""
+          cfg: {review_timeout_sec: 60}
+          plan_summary_chars: 10
+          run: {result: "VERDICT: FEASIBLE and a lot more"}
+        expect:
+          assert:
+            - "{{ pending_action['summary'] == 'VERDICT: F' + chr(10) * 2 + '_(plan truncated)_' and pending_action['detail']['plan_markdown'] == 'VERDICT: FEASIBLE and a lot more' }}"
+
+      # The first live run: the plan was an earlier message, the final one a reply to a
+      # background command's notice.
+      - id: the-plan-is-the-last-message-with-a-verdict-not-the-final-message
+        input:
+          phase: plan
+          revision: 1
+          user_request: "r"
+          excerpt: ""
+          cfg: {review_timeout_sec: 60}
+          plan_summary_chars: 6000
+          run:
+            result: "Another cleanup notification for the same superseded find command -- no action needed."
+            transcript:
+              - {type: system, subtype: init}
+              - {type: assistant, content: [{type: text, text: "Let me check the catalog."}, {type: tool_use, name: Bash}]}
+              - {type: assistant, content: [{type: text, text: "Here is the plan.\n\nVERDICT: FEASIBLE\n\nSum and average."}]}
+              - {type: assistant, content: [{type: text, text: "Another cleanup notification for the same superseded find command -- no action needed."}]}
+        expect:
+          assert:
+            - "{{ status == 'needs_approval' and verdict == 'FEASIBLE' and plan_markdown.startswith('VERDICT: FEASIBLE') and 'Sum and average.' in plan_markdown }}"
+            - "{{ 'cleanup' not in pending_action['summary'] }}"
+
+      - id: no-verdict-anywhere-fails-instead-of-asking-for-review
+        input:
+          phase: plan
+          revision: 1
+          user_request: "r"
+          excerpt: ""
+          cfg: {review_timeout_sec: 60}
+          plan_summary_chars: 6000
+          run: {result: "Another cleanup notification.", transcript: [{type: assistant, content: [{type: text, text: "Looking around."}]}]}
+        expect:
+          assert:
+            - "{{ status == 'error' and pending_action is None and trace['error']['code'] == 'plan_failed' }}"
+            - "{{ trace['error']['message'].startswith('the planning run produced no plan (no VERDICT line); its last message began: Another cleanup') }}"
+
+      - id: a-failed-run-is-an-error
+        input: {phase: plan, revision: 1, user_request: "r", excerpt: "", cfg: {review_timeout_sec: 60}, plan_summary_chars: 100, run: {is_error: true, result: "", error: "no key"}}
+        expect:
+          assert:
+            - "{{ status == 'error' and pending_action is None and trace['error'] == {'code': 'plan_failed', 'message': 'no key'} }}"
+
+  - step_name: parse-artifacts
+    test_cases:
+      - id: the-envelope-becomes-files-and-an-answer
+        input:
+          phase: implement
+          answer_file_chars: 1000
+          run:
+            result: "Done.\n===MOCO-ARTIFACT: src/poller.yaml===\n```yaml\nheader: {}\n```\n===MOCO-ARTIFACT: tests/poller.test.yaml===\ntest_type: unit-test\n===MOCO-ARTIFACT: BUILD_REPORT.md===\nWorkflow spec is valid.\n===MOCO-ARTIFACT-END===\n"
+        expect:
+          assert:
+            - "{{ status == 'ok' and validated == True and [a['path'] for a in artifacts] == ['src/poller.yaml', 'tests/poller.test.yaml', 'BUILD_REPORT.md'] }}"
+            - "{{ artifacts[0]['content'] == 'header: {}' and artifacts[0]['bytes'] == 10 and report == 'Workflow spec is valid.' }}"
+            - "{{ answer.startswith('The workflow is built and passes `moco validate`.') and '**src/poller.yaml**' in answer and 'BUILD_REPORT' not in answer.split('Workflow spec is valid.')[1] }}"
+
+      - id: the-build-is-the-last-message-with-the-envelope
+        input:
+          phase: implement
+          answer_file_chars: 1000
+          run:
+            result: "Done, the background job finished too."
+            transcript:
+              - {type: assistant, content: [{type: text, text: "===MOCO-ARTIFACT: src/a.yaml===\nheader: {}\n===MOCO-ARTIFACT-END==="}]}
+              - {type: assistant, content: [{type: text, text: "Done, the background job finished too."}]}
+        expect:
+          assert:
+            - "{{ status == 'ok' and [a['path'] for a in artifacts] == ['src/a.yaml'] }}"
+
+      - id: unsafe-paths-are-sanitised-or-dropped
+        input:
+          phase: implement
+          answer_file_chars: 1000
+          run: {result: "===MOCO-ARTIFACT: src/my spec.yaml===\na: 1\n===MOCO-ARTIFACT: ../etc/passwd===\nx\n===MOCO-ARTIFACT-END==="}
+        expect:
+          assert:
+            - "{{ [a['path'] for a in artifacts] == ['src/my-spec.yaml'] }}"
+
+      - id: no-wfspec-is-a-failed-build
+        input: {phase: implement, answer_file_chars: 1000, run: {result: "I could not do it."}}
+        expect:
+          assert:
+            - "{{ status == 'error' and answer == '' and trace['error']['code'] == 'build_failed' and 'I could not do it.' in trace['error']['message'] }}"

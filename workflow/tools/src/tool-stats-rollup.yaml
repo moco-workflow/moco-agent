@@ -1,0 +1,266 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-STATS-ROLLUP — per-tool stats from the audit rows; retire past grace (§6.9.11)
+# ================================================================================
+#
+#   mode    in                                   out
+#   ─────── ──────────────────────────────────── ───────────────────────────────────
+#   rollup  max_sessions?,                       {ok, data: {sessions, entries, tools,
+#           deprecated_grace_days?                 flagged, retired}, error}
+#   stats   name?                                {ok, data: {stats: [row]}}  (agent-admin)
+#
+# Hourly from its schedule (agent-harness.tool_stats). NOTHING writes tool_stats per call (§6.9.11): the
+# session appends each turn's audit records to `session:<sid>:toolcalls` (private) and
+# session-store mirrors a slim copy to the GLOBAL `tool_audit:<uid>:<sid>` in
+# `agent.<aid>.tool-audit` (one writer per row, so concurrent sessions never contend,
+# P15). This job reads only those global rows -- read-only, their owner is
+# session-store -- for every deployed agent (agent-registry), and rolls them up.
+#
+#   tool_stats:<name>   namespace agent-harness (global), topic tool-stats, owner: this
+#     {schema_version: 1, name, calls, errors, error_rate, p50_ms, p95_ms,
+#      approval_requests, approved, grants_used, truncated, denied,
+#      last_error: {message, ts} | null, agents: {aid: calls}, flag: failing | null,
+#      rolled_up_at}
+#   calls = audits with status ok|error (dispatched or failed); approval_requests =
+#   needs_approval audits. A tool is flagged `failing` at error_rate ≥ failing_rate
+#   with at least failing_min_calls calls -- for the admin's usage report; v1 never
+#   disables a tool automatically (§6.9.11).
+#
+# RETIRE: deprecated AGENT-scope tools (each deployed agent)
+# whose updated_at is older than deprecated_grace_days are retired through
+# tool-registry, authorised against that agent's access lists (the schedule's user
+# must be its admin). Shared tools are retired by an admin.
+#
+# Reads no user's namespace (F50 closed); writes only its own rows.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-stats-rollup
+
+context:
+  stats_namespace: agent-harness
+  failing_rate: 0.5
+  failing_min_calls: 5
+  schema_version: 1
+  agent_ids: []
+  toolcall_refs: []
+  entries: []
+  stats: {}
+  retired: []
+  agent_access: {}
+  stat_keys: []
+  deprecated: []
+  ok: true
+  error:
+  data:
+
+input:
+  mode: rollup
+  name:
+  max_sessions: 2000
+  deprecated_grace_days: 30
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: mode-stats
+      skip_if: "{{ mode != 'stats' }}"
+      tasks:
+        - task_name: list-stat-keys
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ stats_namespace }}", key_pattern: "{{ 'tool_stats:' + str(name) if name else 'tool_stats:*' }}", topic_pattern: tool-stats}
+          output:
+            set:
+              - stat_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: read-stat-rows
+          loop:
+            in: "{{ stat_keys }}"
+            foreach: stat_key
+            execute_mode: parallel
+            do:
+              task_name: read-stat-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "{{ stats_namespace }}", key: "{{ stat_key }}"}
+          output:
+            set:
+              - data: "{{ {'stats': sorted([r for r in (_ or []) if isinstance(r, dict)], key=lambda r: str(r.get('name')))} }}"
+
+    - task_name: mode-rollup
+      skip_if: "{{ mode != 'rollup' }}"
+      tasks:
+        - task_name: list-agents
+          workflow:
+            ref: agent-harness-foundation/agent-registry
+            mode: inline
+            input: {mode: list}
+          output:
+            set:
+              - agent_ids: "{{ sorted(str(a.get('agent_id')) for a in ((((_ or {}).get('data') or {}).get('agents')) or []) if a.get('agent_id')) }}"
+          on_error:
+            catch: true
+
+        - task_name: list-toolcall-keys
+          skip_if: "{{ not agent_ids }}"
+          loop:
+            in: "{{ agent_ids }}"
+            foreach: stats_aid
+            execute_mode: parallel
+            do:
+              task_name: list-toolcalls
+              activity:
+                type: builtin.state.list_states
+                input:
+                  in_global_ns: true
+                  namespace: "agent.{{ stats_aid }}.tool-audit"
+                  key_pattern: "tool_audit:*"
+                  topic_pattern: tool-audit
+                  order_by: last_update_time
+                  order_direction: desc
+                  limit: "{{ int(max_sessions) }}"
+          output:
+            set:
+              - toolcall_refs: >-
+                  {{ [{'aid': a, 'ns': 'agent.' + a + '.tool-audit', 'key': r.get('key')} for a, rows in zip(agent_ids, _ or [])
+                      for r in (rows or []) if isinstance(r, dict) and str(r.get('key', '')).startswith('tool_audit:')][:int(max_sessions)] }}
+
+        - task_name: read-toolcall-rows
+          skip_if: "{{ not toolcall_refs }}"
+          loop:
+            in: "{{ toolcall_refs }}"
+            foreach: toolcall_ref
+            execute_mode: parallel
+            do:
+              task_name: read-toolcalls
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "{{ toolcall_ref['ns'] }}", key: "{{ toolcall_ref['key'] }}"}
+          output:
+            set:
+              - entries: >-
+                  {{ [dict(e, _aid=ref['aid']) for ref, row in zip(toolcall_refs, _ or [])
+                      for e in ((row.get('entries') or []) if isinstance(row, dict) else (row or []))
+                      if isinstance(e, dict) and e.get('tool')] }}
+
+        - task_name: compute-stats
+          set:
+            - _by_tool: "{{ {t: [e for e in entries if e.get('tool') == t] for t in sorted(set(e['tool'] for e in entries))} }}"
+            - stats#: >-
+                {{ {t: (lambda calls, lat, errs:
+                         {'schema_version': schema_version, 'name': t,
+                          'calls': len(calls), 'errors': len(errs),
+                          'error_rate': round(len(errs) / len(calls), 3) if calls else 0.0,
+                          'p50_ms': lat[(len(lat) - 1) // 2] if lat else None,
+                          'p95_ms': lat[min(len(lat) - 1, int(round(0.95 * (len(lat) - 1))))] if lat else None,
+                          'approval_requests': len([e for e in es if e.get('status') == 'needs_approval']),
+                          'approved': len([e for e in calls if e.get('approved_by')]),
+                          'grants_used': len([e for e in calls if e.get('grant_used')]),
+                          'truncated': len([e for e in calls if e.get('truncated')]),
+                          'denied': len([e for e in es if e.get('status') == 'denied']),
+                          'last_error': ({'message': str(((errs[-1].get('error') or {}).get('message')) or '')[:300], 'ts': errs[-1].get('ts')}
+                                         if errs else None),
+                          'agents': {a: len([e for e in calls if e['_aid'] == a]) for a in sorted(set(e['_aid'] for e in es))},
+                          'flag': 'failing' if len(calls) >= failing_min_calls and len(errs) / len(calls) >= failing_rate else None,
+                          'rolled_up_at': now().isoformat()})(
+                       [e for e in es if e.get('status') in ['ok', 'error']],
+                       sorted(int(e['elapsed_ms']) for e in es if e.get('status') in ['ok', 'error'] and isinstance(e.get('elapsed_ms'), (int, float))),
+                       sorted([e for e in es if e.get('status') == 'error'], key=lambda e: str(e.get('ts') or '')))
+                    for t, es in _by_tool.items()} }}
+
+        - task_name: write-stats
+          skip_if: "{{ not stats }}"
+          loop:
+            in: "{{ sorted(stats) }}"
+            foreach: stat_name
+            execute_mode: parallel
+            do:
+              task_name: write-stat
+              activity:
+                type: builtin.state.set_state
+                input:
+                  in_global_ns: true
+                  namespace: "{{ stats_namespace }}"
+                  key: "tool_stats:{{ stat_name }}"
+                  value: "{{ stats[stat_name] }}"
+                  topic: tool-stats
+
+        # ── retire deprecated agent-scope tools past their grace period ──────────
+        # Agent scope only: the write is authorised against that agent's access lists.
+        # A shared tool has no one agent to authorise against, so an admin retires it.
+        - task_name: resolve-agent-configs
+          loop:
+            in: "{{ agent_ids }}"
+            foreach: stats_aid
+            # Sequential (F52): parallel iterations whose inline child starts the same
+            # sync grandchild (agent-registry's package-catalog) collide on its workflow id.
+            execute_mode: sequential
+            do:
+              task_name: resolve-agent-config
+              workflow:
+                ref: agent-harness-foundation/agent-config
+                mode: inline
+                input: {mode: resolve, agent_id: "{{ stats_aid }}"}
+              on_error:
+                catch: true
+          output:
+            set:
+              - agent_access: >-
+                  {{ {a: (((r or {}).get('data') or {}).get('config') or {}).get('access') or {}
+                      for a, r in zip(agent_ids, _ or []) if (r or {}).get('ok')} }}
+
+        - task_name: list-deprecated
+          loop:
+            in: "{{ sorted(agent_access) }}"
+            foreach: scope_aid
+            execute_mode: parallel
+            do:
+              task_name: list-scope-deprecated
+              workflow:
+                ref: tool-registry
+                mode: inline
+                input: {mode: list, scope: agent, agent_id: "{{ scope_aid }}", status: deprecated}
+              on_error:
+                catch: true
+          output:
+            set:
+              - deprecated: >-
+                  {{ [dict(t, _aid=a)
+                      for a, r in zip(sorted(agent_access), _ or [])
+                      for t in (((r or {}).get('data') or {}).get('tools') or [])
+                      if t.get('scope') == 'agent' and t.get('updated_at')
+                         and (now().replace(tzinfo=None) - dt.datetime.fromisoformat(str(t['updated_at'])).replace(tzinfo=None)).days
+                             >= int(deprecated_grace_days)] }}
+
+        - task_name: retire-deprecated
+          skip_if: "{{ not deprecated }}"
+          loop:
+            in: "{{ deprecated }}"
+            foreach: old_tool
+            do:
+              task_name: retire-tool
+              workflow:
+                ref: tool-registry
+                mode: inline
+                input:
+                  mode: retire
+                  name: "{{ old_tool['name'] }}"
+                  scope: agent
+                  agent_id: "{{ old_tool['_aid'] }}"
+                  definition_access: "{{ agent_access.get(old_tool['_aid']) or {} }}"
+              on_error:
+                catch: true
+          output:
+            set:
+              - retired: "{{ [t['_aid'] + '/' + t['name'] for t, r in zip(deprecated, _ or []) if (r or {}).get('ok')] }}"
+
+        - task_name: shape-report
+          set:
+            - data: >-
+                {{ {'sessions': len(toolcall_refs), 'entries': len(entries), 'tools': sorted(stats),
+                    'flagged': sorted(t for t, s in stats.items() if s.get('flag')), 'retired': retired} }}

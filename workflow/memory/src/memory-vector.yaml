@@ -1,0 +1,165 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-VECTOR — the derived vector index over user memory (design §6.4.5, P2)
+# ================================================================================
+#
+#   mode    in                                         data out
+#   ─────── ────────────────────────────────────────── ────────────────────────────────
+#   upsert  items: [{key, kind, title, text, tags}]    {indexed: [key], skipped}
+#   delete  keys: [key]                                {deleted: [key], skipped}
+#   search  query, top_k?                              {hits: [{key, score}], skipped}
+#   every   agent_id, config (resolved: memory, models.embedding, knowledge.pgvector_secret_key)
+#
+# A DERIVED index, phase 3: memory-store's rows stay the source of truth (P2). Off unless
+# memory.long_term.vector.enabled; then every mode is `skipped: true` and does nothing,
+# so callers need no flag of their own. The index can always be rebuilt from the rows,
+# so a failed write is reported (ok: false), never raised -- recall falls back to its
+# lexical score.
+#
+# ONE TABLE PER AGENT, `mem_<agent_id>` (dashes → underscores), user scope only: each
+# chunk carries metadata {user_id, kind, key} and its document id is `<user_id>|<key>`,
+# so one user's key never collides with another's. `search` FILTERS on the caller's
+# user_id (__user_info__, never an input): a user reads only their own vectors. Agent-
+# scope items are not indexed -- the session caches them (agent_scope_snapshot) and
+# recall scores them lexically.
+#
+# Needs the platform's llama_index.index_texts / delete_docs (moco-core, 2026-10-16) and
+# the embedding model of config.models.embedding -- the same one knowledge uses.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-vector
+
+context:
+  valid_modes: ["upsert", "delete", "search"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  key_pattern: "^mem:[a-z0-9-]{1,48}:[a-z0-9-]{1,48}$"
+  default_top_k: 8
+  text_chars: 2000
+  ok: false
+  data:
+  error:
+
+input:
+  mode: search
+  agent_id:
+  config: {}
+  items: []
+  keys: []
+  query: ""
+  top_k:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "memory-vector: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: plan
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - vcfg: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('vector')) or {} }}"
+        - embed: "{{ ((config or {}).get('models') or {}).get('embedding') or {} }}"
+        - vectordb:
+            table_name: "{{ 'mem_' + aid.replace('-', '_') }}"
+            connection_string_secret_key: "{{ (((config or {}).get('knowledge') or {}).get('pgvector_secret_key')) or '' }}"
+        - enabled#: "{{ bool(vcfg.get('enabled') is True and re.match(agent_id_pattern, aid) and embed.get('embed_dim')) }}"
+        - _items: "{{ [i for i in (items or []) if isinstance(i, dict) and re.match(key_pattern, str(i.get('key') or ''))] }}"
+        - vkeys: "{{ [str(k) for k in (keys or []) if re.match(key_pattern, str(k))] }}"
+        - texts: >-
+            {{ [{'id': uid + '|' + i['key'],
+                 'text': (str(i.get('title') or '') + '\n' + str(i.get('text') or '')
+                          + (('\ntags: ' + ', '.join(str(t) for t in i.get('tags'))) if i.get('tags') else ''))[:text_chars],
+                 'metadata': {'user_id': uid, 'kind': str(i.get('kind') or i['key'].split(':')[1]), 'key': i['key']}}
+                for i in _items] }}
+        - doc_ids: "{{ [uid + '|' + k for k in vkeys] }}"
+        # Nothing to do counts as done: an empty upsert or delete, or the index off.
+        - ok: true
+        - data: >-
+            {{ {'skipped': True, 'indexed': [], 'deleted': [], 'hits': []}
+               if not enabled or (mode == 'upsert' and not texts) or (mode == 'delete' and not doc_ids)
+                  or (mode == 'search' and not str(query or '').strip()) else None }}
+
+    - task_name: index-texts
+      skip_if: "{{ data is not None or mode != 'upsert' }}"
+      activity:
+        type: llama_index.index_texts
+        input:
+          texts: "{{ texts }}"
+          vectordb_info: "{{ vectordb }}"
+          embed_model_info: "{{ embed }}"
+          chunk_size: 512
+          chunk_overlap: 0
+          replace: true
+        options:
+          retry_policy: {timeout_sec: 120, max_attempts: 1}
+      output:
+        set:
+          - data: "{{ {'skipped': False, 'indexed': [t['metadata']['key'] for t in texts]} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'index_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+            - data: {skipped: false, indexed: []}
+
+    - task_name: delete-docs
+      skip_if: "{{ data is not None or mode != 'delete' }}"
+      activity:
+        type: llama_index.delete_docs
+        input:
+          ids: "{{ doc_ids }}"
+          vectordb_info: "{{ vectordb }}"
+          embed_model_info: "{{ embed }}"
+        options:
+          retry_policy: {timeout_sec: 60, max_attempts: 2}
+      output:
+        set:
+          - data: "{{ {'skipped': False, 'deleted': vkeys} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'delete_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+            - data: {skipped: false, deleted: []}
+
+    - task_name: search-vectors
+      skip_if: "{{ data is not None or mode != 'search' }}"
+      activity:
+        type: llama_index.query
+        input:
+          query: "{{ str(query)[:1000] }}"
+          vectordb_info: "{{ vectordb }}"
+          embed_model_info: "{{ embed }}"
+          top_k: "{{ int(top_k or vcfg.get('top_k') or default_top_k) }}"
+          filters: {user_id: "{{ uid }}"}
+        options:
+          retry_policy: {timeout_sec: 20, max_attempts: 1}
+      output:
+        set:
+          # One hit per key: the best chunk's score.
+          - _nodes: "{{ [n for n in ((_ or {}).get('nodes') or []) if isinstance(n, dict) and (n.get('metadata') or {}).get('user_id') == uid] }}"
+          - data: >-
+              {{ {'skipped': False,
+                  'hits': sorted([{'key': k, 'score': round(max(float(n.get('score') or 0) for n in _nodes if (n.get('metadata') or {}).get('key') == k), 4)}
+                                  for k in set((n.get('metadata') or {}).get('key') for n in _nodes if (n.get('metadata') or {}).get('key'))],
+                                 key=lambda h: (-h['score'], h['key']))} }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'search_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+            - data: {skipped: false, hits: []}

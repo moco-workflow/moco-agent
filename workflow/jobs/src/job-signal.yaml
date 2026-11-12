@@ -1,0 +1,129 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# JOB-SIGNAL — every event the job manager sends (design §6.12, plan-13)
+# ================================================================================
+#
+#   kind            in                                          out
+#   ─────────────── ─────────────────────────────────────────── ──────────────
+#   start_job       agent_id, owner_user_id, job_id, data        {sent: bool}
+#                   (the job entity's boot input)
+#   to_job          agent_id, owner_user_id, job_id,             {sent: bool}
+#                   event_type, data
+#   to_session      agent_id, owner_user_id, session_id,         {sent: bool}
+#                   event_type, data, wake (bool)
+#
+# start_job is start-or-signal on `agent-job-<aid>-<uid>-<job_id>` with
+# entity_workflow job-entity (detached), so a retried start never runs a job twice.
+# to_job is a plain signal: it fails (sent: false) when no entity runs, which is
+# how job-manager cancel knows the entity is gone. to_session with wake: true is
+# start-or-signal on the session entity (a job that finished while its session
+# retired brings it back, and init relays the result); without wake it is a plain
+# signal that is dropped when the session is not running (progress).
+#
+# Its own wfspec so tests can mock it: emit_event tasks cannot be mocked (F53).
+# The entity refs are expressions (see context): a literal ref would close a cycle
+# the CLI bundler refuses (agent-session → job-manager → job-signal → agent-session).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: job-signal
+
+context:
+  valid_kinds: ["start_job", "to_job", "to_session"]
+  # Names, not literal refs: job-entity and agent-session both reach this wfspec
+  # again (through job-manager), and the CLI bundler rejects a literal cycle. They
+  # resolve by name on the deployed stage. agent-session is in another package,
+  # so its name is package-qualified (plan-00 §4).
+  job_entity_wfspec: job-entity
+  session_wfspec: agent-harness-session/agent-session
+  sent: false
+
+input:
+  kind:
+  agent_id:
+  owner_user_id:
+  job_id:
+  session_id:
+  event_type:
+  data: {}
+  wake: false
+
+output:
+  sent: "{{ sent }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-kind
+      raise:
+        if: "{{ kind not in valid_kinds }}"
+        type: error
+        error_type: AbortError
+        message: "job-signal: invalid kind '{{ kind }}'. Must be one of: {{ ', '.join(valid_kinds) }}"
+
+    - task_name: build-target
+      set:
+        - job_workflow_id: "agent-job-{{ agent_id }}-{{ owner_user_id }}-{{ job_id }}"
+        - session_workflow_id: "agent-session-{{ agent_id }}-{{ owner_user_id }}-{{ session_id }}"
+
+    - task_name: start-job-entity
+      skip_if: "{{ kind != 'start_job' }}"
+      emit_event:
+        target_workflow_id: "{{ job_workflow_id }}"
+        topic: agent-job
+        event_type: job_start
+        data: {job_id: "{{ job_id }}"}
+        entity_workflow:
+          ref: "{{ job_entity_wfspec }}"
+          mode: detached
+          input: "{{ data }}"
+      output:
+        set:
+          - sent: true
+      on_error:
+        catch: true
+
+    - task_name: signal-job-entity
+      skip_if: "{{ kind != 'to_job' }}"
+      emit_event:
+        target_workflow_id: "{{ job_workflow_id }}"
+        topic: agent-job
+        event_type: "{{ event_type }}"
+        data: "{{ data }}"
+      output:
+        set:
+          - sent: true
+      on_error:
+        catch: true
+
+    - task_name: wake-session
+      skip_if: "{{ kind != 'to_session' or wake is not True }}"
+      emit_event:
+        target_workflow_id: "{{ session_workflow_id }}"
+        topic: agent-session
+        event_type: "{{ event_type }}"
+        data: "{{ data }}"
+        entity_workflow:
+          ref: "{{ session_wfspec }}"
+          mode: detached
+          input:
+            agent_id: "{{ agent_id }}"
+            session_id: "{{ session_id }}"
+            throwaway: false
+      output:
+        set:
+          - sent: true
+      on_error:
+        catch: true
+
+    - task_name: signal-session
+      skip_if: "{{ kind != 'to_session' or wake is True }}"
+      emit_event:
+        target_workflow_id: "{{ session_workflow_id }}"
+        topic: agent-session
+        event_type: "{{ event_type }}"
+        data: "{{ data }}"
+      output:
+        set:
+          - sent: true
+      on_error:
+        catch: true

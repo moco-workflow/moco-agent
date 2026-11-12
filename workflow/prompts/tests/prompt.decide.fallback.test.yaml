@@ -1,0 +1,46 @@
+test_type: integration-test
+
+# prompt.decide.fallback (plan-01 step 4, design §6.2.3): a rendered qset becomes a
+# JSON task with System One's answer shape, and a schema that pins every key.
+
+wfspec:
+  name: prompt.decide.fallback
+
+test_data:
+  qset: &qset
+    kind: system_one
+    state: "Current message: how do retries work?"
+    keymap: {profile_0: chat, profile_1: rag}
+    questions:
+      ambiguity: {type: score, instructions: "How clear?", criteria: [clear, somewhat, too ambiguous]}
+      needs_context: {type: noul, instructions: "Needs history?"}
+      route: {type: choice, instructions: "Which?", criteria: {profile_0: "Chit-chat.", profile_1: "Docs question."}}
+
+test_cases:
+
+  - id: the-schema-pins-every-key-and-its-allowed-values
+    input: {qset: *qset}
+    expect:
+      output:
+        - response_format: {type: json_object}
+      assert:
+        - "{{ schema['required'] == ['nouls', 'choices', 'scores'] }}"
+        - "{{ schema['properties']['nouls']['required'] == ['needs_context'] }}"
+        - "{{ schema['properties']['nouls']['properties']['needs_context'] == {'type': 'number', 'minimum': 0, 'maximum': 1} }}"
+        - "{{ schema['properties']['choices']['properties']['route'] == {'type': 'string', 'enum': ['profile_0', 'profile_1']} }}"
+        - "{{ schema['properties']['scores']['properties']['ambiguity'] == {'type': 'number', 'minimum': 0, 'maximum': 2} }}"
+
+  - id: the-questions-and-labels-are-spelled-out-and-the-text-fenced
+    input: {qset: *qset}
+    expect:
+      assert:
+        - "{{ messages[1]['content'].startswith('Text:\\n<data>\\nCurrent message: how do retries work?\\n</data>') }}"
+        - "{{ 'needs_context (noul): Needs history?' in messages[1]['content'] }}"
+        - "{{ 'route (choice): Which?\\n  - profile_0: Chit-chat.\\n  - profile_1: Docs question.' in messages[1]['content'] }}"
+        - "{{ 'ambiguity (score): How clear?\\n  0: clear\\n  1: somewhat\\n  2: too ambiguous' in messages[1]['content'] }}"
+
+  - id: a-dict-state-is-serialised-with-sorted-keys
+    input: {qset: {state: {b: 1, a: 2}, questions: {q: {type: noul, instructions: "?"}}}}
+    expect:
+      assert:
+        - "{{ '<data>\\n{\"a\": 2, \"b\": 1}\\n</data>' in messages[1]['content'] }}"

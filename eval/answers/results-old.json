@@ -1,0 +1,150 @@
+{
+ "summary": {
+  "target": "old",
+  "cases": 12,
+  "answer_ok": 0.0,
+  "cited": 0.0,
+  "keyword_coverage": 0.06,
+  "decline_ok": 0.0,
+  "chat_ok": 1.0,
+  "mean_secs": 8.4
+ },
+ "rows": [
+  {
+   "id": "retries",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 10.3,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "child-workflow",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 9.2,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "checkpoint",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 10.3,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "secrets",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 9.2,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "wait-for",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 9.3,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "publish",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 6.7,
+   "cited": false,
+   "keyword_coverage": 0.5,
+   "ok": false
+  },
+  {
+   "id": "expressions",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 7.6,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "runtimes",
+   "kind": "answer",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 7.2,
+   "cited": false,
+   "keyword_coverage": 0.0,
+   "ok": false
+  },
+  {
+   "id": "kafka-v9",
+   "kind": "decline",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 8.7,
+   "ok": false
+  },
+  {
+   "id": "quantum",
+   "kind": "decline",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 8.1,
+   "ok": false
+  },
+  {
+   "id": "hello",
+   "kind": "chat",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 6.9,
+   "ok": true
+  },
+  {
+   "id": "thanks",
+   "kind": "chat",
+   "answer": "I can answer questions about: moco-docs. Web search is turned off, so I can only answer from indexed domains.",
+   "status": null,
+   "route": null,
+   "sources": [],
+   "secs": 6.9,
+   "ok": true
+  }
+ ]
+}

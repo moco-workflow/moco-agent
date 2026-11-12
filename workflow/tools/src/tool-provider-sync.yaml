@@ -1,0 +1,152 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-PROVIDER-SYNC — re-list the tool providers whose sync is due (design §6.16)
+# ================================================================================
+#
+#   in              out
+#   ─────────────── ──────────────────────────────────────────────────────────────
+#   max_providers?  {ok, data: {due: [scope/name], synced: [{provider, status, drift}],
+#                    errors: [{provider, error}]}, error}
+#
+# Started hourly by its schedule (agent-harness.tool_provider_sync, installed by
+# agent-schedules), or by an admin. Idempotent: a synced provider is not due again
+# until its interval has passed.
+#
+# DUE: status ready or failed (a drifted provider waits for an admin's accept/reject),
+# and sync.every_hours (default 24) passed since snapshot.synced_at, else updated_at.
+# Oldest first, at most max_providers per run.
+#
+# AUTHORITY: `tool-provider sync` needs an admin of an agent (access write). Each
+# deployed agent's config is resolved (sequentially, F52); a shared provider syncs
+# through the first agent by id, an agent-scope provider through its own agent. The
+# schedule's creator, the deploying admin, is admin of both (admin_user_ids or as a
+# namespace admin, F48).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-provider-sync
+
+context:
+  agent_ids: []
+  configs: {}
+  scopes: []
+  provider_lists: []
+  due_rows: []
+  synced: []
+  errors: []
+  ok: true
+  error:
+
+input:
+  max_providers: 5
+
+output:
+  ok: "{{ ok }}"
+  data:
+    due: "{{ [r['scope'] + '/' + r['name'] for r in due_rows] }}"
+    synced: "{{ synced }}"
+    errors: "{{ errors }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: list-agents
+      workflow:
+        ref: agent-harness-foundation/agent-registry
+        mode: inline
+        input: {mode: list}
+      output:
+        set:
+          - agent_ids: "{{ sorted(str(a.get('agent_id')) for a in ((((_ or {}).get('data') or {}).get('agents')) or []) if a.get('agent_id')) }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - ok: false
+            - error: "{{ {'code': 'agent_list_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True} }}"
+
+    - task_name: resolve-agent-configs
+      skip_if: "{{ not agent_ids }}"
+      loop:
+        in: "{{ agent_ids }}"
+        foreach: sync_aid
+        # Sequential (F52): parallel iterations whose inline child starts the same
+        # sync grandchild (agent-registry's package-catalog) collide on its workflow id.
+        execute_mode: sequential
+        do:
+          task_name: resolve-agent-config
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input: {mode: resolve, agent_id: "{{ sync_aid }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - configs: >-
+              {{ {a: ((r.get('data') or {}).get('config')) for a, r in zip(agent_ids, _ or [])
+                  if isinstance(r, dict) and r.get('ok') and ((r.get('data') or {}).get('config'))} }}
+          # (agent whose config authorises, scope to list): shared once, then each agent's own.
+          - scopes: "{{ ([[sorted(configs)[0], 'shared']] if configs else []) + [[a, 'agent'] for a in sorted(configs)] }}"
+
+    - task_name: list-providers
+      skip_if: "{{ not scopes }}"
+      loop:
+        in: "{{ scopes }}"
+        foreach: list_scope
+        execute_mode: sequential
+        do:
+          task_name: list-scope-providers
+          workflow:
+            ref: tool-provider
+            mode: inline
+            input: {mode: list, agent_id: "{{ list_scope[0] }}", scope: "{{ list_scope[1] }}", config: "{{ configs[list_scope[0]] }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - provider_lists: >-
+              {{ [[s[0], p] for s, r in zip(scopes, _ or []) if isinstance(r, dict) and r.get('ok')
+                  for p in (((r.get('data') or {}).get('providers')) or [])] }}
+
+    - task_name: pick-due
+      set:
+        - _now: "{{ now().replace(tzinfo=None) }}"
+        - _cands: >-
+            {{ [dict(p, _aid=a, _last=str(((p.get('snapshot') or {}).get('synced_at')) or p.get('updated_at') or p.get('created_at') or ''))
+                for a, p in provider_lists if p.get('status') in ['ready', 'failed']] }}
+        - due_rows#: >-
+            {{ sorted([p for p in _cands
+                       if not p['_last'] or (_now - dt.datetime.fromisoformat(p['_last']).replace(tzinfo=None)).total_seconds()
+                                           >= float(((p.get('sync') or {}).get('every_hours')) or 24) * 3600],
+                      key=lambda p: (p['_last'], p['scope'], p['name']))[:max(0, int(max_providers or 0))] }}
+
+    - task_name: sync-due
+      skip_if: "{{ not due_rows }}"
+      loop:
+        in: "{{ due_rows }}"
+        foreach: due_provider
+        execute_mode: sequential
+        do:
+          task_name: sync-provider
+          workflow:
+            ref: tool-provider
+            mode: inline
+            input:
+              mode: sync
+              agent_id: "{{ due_provider['_aid'] }}"
+              config: "{{ configs[due_provider['_aid']] }}"
+              name: "{{ due_provider['name'] }}"
+              scope: "{{ due_provider['scope'] }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - synced: >-
+              {{ [{'provider': p['scope'] + '/' + p['name'], 'status': ((r.get('data') or {}).get('provider') or {}).get('status'),
+                   'drift': (r.get('data') or {}).get('drift')}
+                  for p, r in zip(due_rows, _ or []) if isinstance(r, dict) and r.get('ok')] }}
+          - errors: >-
+              {{ [{'provider': p['scope'] + '/' + p['name'], 'error': r.get('error') if isinstance(r, dict) else {'message': str(r)[:300]}}
+                  for p, r in zip(due_rows, _ or []) if not (isinstance(r, dict) and r.get('ok'))] }}

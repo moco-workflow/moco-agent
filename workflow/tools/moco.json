@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-harness-tools",
+    "wfspec_package_version": "0.15.0",
+    "wfspec_description": "Agent harness - Tools: registry, policy, selector, executor, dispatch, MCP providers, stats rollup, seed-tools. Part of the agent-harness-* package set; see moco-agent/docs/plan-00-overview.md.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.test.yaml"
+    ]
+}

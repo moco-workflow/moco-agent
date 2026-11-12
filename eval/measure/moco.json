@@ -1,0 +1,10 @@
+{
+    "wfspec_package_name": "agent-harness-measure",
+    "wfspec_package_version": "0.2.1",
+    "wfspec_description": "Phase-0 measurement drivers (M1-M6) for the agent harness; see moco-agent/docs/plan-00a-walking-skeleton.md. Published to a dev stage only, never to production.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": []
+}

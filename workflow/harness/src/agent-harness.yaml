@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-HARNESS — the package's main wfspec: what this harness is
+# ================================================================================
+#
+# `moco publish` requires a wfspec named after the package, and a bare
+# `moco run agent-harness` runs it. It answers "which harness is deployed here,
+# and how do I talk to it" without touching any state:
+#
+#   {harness_version, entry_points, packages, default_agent_id}
+#
+# `harness_version` is the package version in moco.json (a v2 document carries
+# no version of its own, so `__sys_info__.wfspec_version` is the package's).
+# Phase 1's agent-registry checks an agent definition's `harness: ">=0.1 <2.0"`
+# against it (design §5.2).
+#
+# `packages` is the harness's package set (plan-00 §4): one package per module,
+# deployed into the same namespace, each versioned on its own. This package's
+# version is the harness version.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-harness
+
+context:
+  entry_points:
+    chat: agent-harness/agent-cli
+    config: agent-harness-foundation/agent-config
+    admin: agent-harness/agent-admin
+  packages: [agent-harness, agent-harness-admin, agent-harness-foundation, agent-harness-prompts,
+             agent-harness-session, agent-harness-loop, agent-harness-tools, agent-harness-knowledge,
+             agent-harness-memory, agent-harness-jobs, agent-harness-ops]
+  default_agent_id: skeleton
+  info: {}
+
+output: '{{ info }}'
+
+main:
+  task_name: describe
+  set:
+    - info:
+        harness_version: "{{ __sys_info__.get('wfspec_version') }}"
+        entry_points: "{{ entry_points }}"
+        packages: "{{ packages }}"
+        default_agent_id: "{{ default_agent_id }}"

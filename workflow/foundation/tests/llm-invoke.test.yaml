@@ -1,0 +1,374 @@
+test_type: integration-test
+
+# llm-invoke chat, phase 0 (plan-02 steps 1, 2, 6).
+#
+# The model call is mocked by task name (`call-model`, the openai.chat.completions
+# activity). A success mock is the assistant message. A mock cannot raise, so a
+# failure mock is what the task's on_error leaves in `call_result`:
+# {result: error, error_type, error_message}.
+
+wfspec:
+  name: llm-invoke
+
+test_data:
+  models: &models
+    inference:
+      provider: deepseek
+      model: deepseek-v4-pro
+      base_url: "https://api.deepseek.com"
+      apikey_secret_key: "global/DEMO_DEEPSEEK_APIKEY"
+      max_tokens: 1200
+      temperature: 0.2
+    decision: null
+    decision_default_max_tokens: 600
+  models_fb: &models_fb
+    inference:
+      provider: deepseek
+      model: deepseek-v4-pro
+      fallback_model: deepseek-v4-flash
+      base_url: "https://api.deepseek.com"
+      apikey_secret_key: "global/DEMO_DEEPSEEK_APIKEY"
+      max_tokens: 1200
+  rq_schema: &rq_schema
+    type: object
+    properties: {rewritten_query: {type: string, minLength: 1}}
+    required: [rewritten_query]
+    additionalProperties: false
+  nested_schema: &nested_schema
+    type: object
+    required: [nouls, choices, scores]
+    properties:
+      nouls: {type: object, properties: {q: {type: number, minimum: 0, maximum: 1}}}
+      choices: {type: object, properties: {route: {type: string, enum: [profile_0, profile_1]}}}
+      scores: {type: object, properties: {a: {type: number, minimum: 0, maximum: 2}}}
+  messages: &messages
+    - {role: system, content: "You are terse."}
+    - {role: user, content: "ping"}
+
+test_cases:
+
+  # ── Happy path ──────────────────────────────────────────────────────────
+  - id: a-plain-chat-returns-content-in-the-envelope
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {role: assistant, content: "pong", tool_calls: null}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ error is None }}"
+        - "{{ data['content'] == 'pong' }}"
+        - "{{ data['tool_calls'] == [] }}"
+        - "{{ data['model'] == 'deepseek-v4-pro' }}"
+        - "{{ data['parsed'] is None }}"
+        # Estimated from characters, and says so.
+        - "{{ data['usage']['estimated'] == True }}"
+        - "{{ data['usage']['role'] == 'inference' }}"
+        - "{{ data['usage']['tokens_out'] == 1 }}"
+        - "{{ isinstance(data['elapsed_ms'], int) }}"
+
+  - id: tool-calls-are-passed-through
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _:
+          role: assistant
+          content: null
+          tool_calls:
+            - {id: c1, type: function, function: {name: lookup, arguments: "{\"q\": \"x\"}"}}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['content'] == '' }}"
+        - "{{ data['tool_calls'][0]['function']['name'] == 'lookup' }}"
+
+  # ── Role resolution (S13) ───────────────────────────────────────────────
+  # decision: null resolves to the inference model with the low max_tokens.
+  - id: the-decision-role-aliases-inference-with-a-low-max-tokens
+    input: {mode: chat, role: decision, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {content: "ok"}
+    expect:
+      assert:
+        - "{{ data['model'] == 'deepseek-v4-pro' }}"
+        - "{{ data['usage']['max_tokens'] == 600 }}"
+        - "{{ data['usage']['role'] == 'decision' }}"
+
+  - id: a-configured-decision-model-is-used-as-is
+    input:
+      mode: chat
+      role: decision
+      messages: *messages
+      models:
+        inference: {model: big, apikey_secret_key: K, max_tokens: 1200}
+        decision: {model: small, apikey_secret_key: K, max_tokens: 300}
+    mocks:
+      - step_name: call-model
+        _: {content: "ok"}
+    expect:
+      assert:
+        - "{{ data['model'] == 'small' }}"
+        - "{{ data['usage']['max_tokens'] == 300 }}"
+
+  # A call may override max_tokens -- and nothing else.
+  - id: a-call-may-override-max-tokens
+    input: {mode: chat, role: inference, models: *models, messages: *messages, max_tokens: 50}
+    mocks:
+      - step_name: call-model
+        _: {content: "ok"}
+    expect:
+      assert:
+        - "{{ data['usage']['max_tokens'] == 50 }}"
+        - "{{ data['model'] == 'deepseek-v4-pro' }}"
+
+  # ── Error taxonomy: never raise for an expected failure ─────────────────
+  - id: an-authentication-failure-is-auth
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _:
+          result: error
+          error_type: AuthenticationError
+          error_message: "token authentication failure for principal bpi:ldap_user:someone"
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ data is None }}"
+        - "{{ error['code'] == 'auth' }}"
+        - "{{ error['retryable'] == False }}"
+        # The original message is kept, case and all.
+        - "{{ error['message'] == 'token authentication failure for principal bpi:ldap_user:someone' }}"
+
+  - id: a-missing-secret-is-auth
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "secret not found: global/DEMO_DEEPSEEK_APIKEY"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'auth' }}"
+
+  - id: a-missing-endpoint-env-var-is-auth
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: OSError, error_message: "Required environment variable not set: MOCO_LLM_DEFAULT_BASE_URL."}
+    expect:
+      assert:
+        - "{{ error['code'] == 'auth' }}"
+
+  # A gateway that rejects the key's format (seen live with a placeholder key, F70).
+  - id: a-rejected-key-format-is-auth
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: WorkflowRuntimeError, error_message: "Activity execution failed: invalid JWT token format (activity_type=openai.chat.completions)"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'auth' }}"
+
+  - id: a-timeout-is-retryable
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: ActivityError, error_message: "activity StartToClose timeout"}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'timeout' }}"
+        - "{{ error['retryable'] == True }}"
+
+  - id: a-context-length-error-is-context-overflow
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: BadRequestError, error_message: "Error code: 400 - context_length_exceeded"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'context_overflow' }}"
+        - "{{ error['retryable'] == False }}"
+
+  - id: anything-else-is-a-retryable-provider-error
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: InternalServerError, error_message: "Error code: 503"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'provider_error' }}"
+        - "{{ error['retryable'] == True }}"
+
+  # ── Input guards ────────────────────────────────────────────────────────
+  - id: empty-messages-are-invalid-input-and-nothing-is-called
+    input: {mode: chat, role: inference, models: *models, messages: []}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: tool-choice-is-refused-until-phase-2
+    input: {mode: chat, role: inference, models: *models, messages: *messages, tool_choice: none}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_input' }}"
+        - "{{ 'phase 2' in error['message'] }}"
+
+  # Misconfiguration and bugs raise (§11.2).
+  - id: a-role-with-no-model-configured-raises
+    input: {mode: chat, role: inference, models: {inference: null}, messages: *messages}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "llm-invoke: role 'inference' has no model configured (models.inference)"
+
+  - id: an-unknown-role-raises
+    input: {mode: chat, role: classifier, models: *models, messages: *messages}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "llm-invoke: unknown role 'classifier'. Must be one of: inference, decision"
+
+  - id: an-unknown-mode-raises
+    input: {mode: stream, role: inference, models: *models, messages: *messages}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "llm-invoke: invalid mode 'stream'. Must be one of: chat, render_and_chat"
+
+  # ── schema: parse, validate, one repair (plan-02 step 3) ────────────────
+  - id: a-reply-matching-the-schema-is-parsed
+    input: {mode: chat, role: decision, models: *models, messages: *messages, schema: *rq_schema}
+    mocks:
+      - step_name: call-model
+        _: {content: "{\"rewritten_query\": \"moco retry policy\"}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['parsed'] == {'rewritten_query': 'moco retry policy'} }}"
+        - "{{ data['repaired'] == False and data['usage']['calls'] == 1 }}"
+
+  - id: a-json-code-fence-is-tolerated
+    input: {mode: chat, role: decision, models: *models, messages: *messages, schema: *rq_schema}
+    mocks:
+      - step_name: call-model
+        _: {content: "```json\n{\"rewritten_query\": \"x\"}\n```"}
+    expect:
+      assert:
+        - "{{ data['parsed'] == {'rewritten_query': 'x'} and data['repaired'] == False }}"
+
+  - id: an-invalid-reply-gets-one-repair-that-succeeds
+    input: {mode: chat, role: decision, models: *models, messages: *messages, schema: *rq_schema}
+    mocks:
+      - step_name: call-model
+        _: {content: "{\"query\": \"x\"}"}
+      - step_name: repair-model
+        _: {content: "{\"rewritten_query\": \"fixed\"}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['parsed'] == {'rewritten_query': 'fixed'} }}"
+        - "{{ data['repaired'] == True and data['content'] == '{\"rewritten_query\": \"fixed\"}' }}"
+        - "{{ data['usage']['calls'] == 2 }}"
+
+  - id: a-failed-repair-is-invalid-json-with-the-errors
+    input: {mode: chat, role: decision, models: *models, messages: *messages, schema: *rq_schema}
+    mocks:
+      - step_name: call-model
+        _: {content: "not json at all"}
+      - step_name: repair-model
+        _: {content: "{\"rewritten_query\": \"\", \"extra\": 1}"}
+    expect:
+      output:
+        - data: null
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_json' and error['retryable'] == False }}"
+        - "{{ '$.rewritten_query: shorter than 1' in error['message'] and '$.extra: not allowed' in error['message'] }}"
+
+  - id: the-schema-subset-checks-nested-types-enums-and-ranges
+    input: {mode: chat, role: decision, models: *models, messages: *messages, schema: *nested_schema}
+    mocks:
+      - step_name: call-model
+        _: {content: "{\"nouls\": {\"q\": 1.5}, \"choices\": {\"route\": \"profile_9\"}, \"scores\": {\"a\": true}}"}
+      - step_name: repair-model
+        _: {content: "{\"nouls\": {\"q\": 1.5}, \"choices\": {\"route\": \"profile_9\"}, \"scores\": {\"a\": true}}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_json' }}"
+        - "{{ '$.nouls.q: above 1' in error['message'] }}"
+        - "{{ '$.choices.route: not one of' in error['message'] }}"
+        - "{{ '$.scores.a: expected number' in error['message'] }}"
+
+  - id: without-a-schema-nothing-is-parsed
+    input: {mode: chat, role: inference, models: *models, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {content: "{\"a\": 1}"}
+    expect:
+      assert:
+        - "{{ data['parsed'] is None }}"
+
+  # ── fallback_model (plan-02 step 4) ─────────────────────────────────────
+  - id: a-timeout-retries-once-on-the-fallback-model
+    input: {mode: chat, role: inference, models: *models_fb, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: ActivityError, error_message: "activity StartToClose timeout"}
+      - step_name: call-fallback-model
+        _: {content: "from the fallback"}
+    expect:
+      assert:
+        - "{{ ok == True and data['content'] == 'from the fallback' }}"
+        - "{{ data['model'] == 'deepseek-v4-flash' and data['fallback_used'] == True }}"
+        - "{{ data['usage']['calls'] == 2 }}"
+
+  - id: a-failing-fallback-reports-its-own-error
+    input: {mode: chat, role: inference, models: *models_fb, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: InternalServerError, error_message: "Error code: 503"}
+      - step_name: call-fallback-model
+        _: {result: error, error_type: InternalServerError, error_message: "Error code: 502"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'provider_error' and error['message'] == 'Error code: 502' }}"
+
+  - id: an-auth-failure-never-tries-the-fallback
+    input: {mode: chat, role: inference, models: *models_fb, messages: *messages}
+    mocks:
+      - step_name: call-model
+        _: {result: error, error_type: AuthenticationError, error_message: "Error code: 401 - invalid key"}
+      - step_name: call-fallback-model
+        _: {content: "must not be used"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'auth' }}"
+
+  # ── render_and_chat (plan-02 step 5) ────────────────────────────────────
+  - id: render-and-chat-uses-the-prompts-messages-and-schema
+    input: {mode: render_and_chat, role: decision, models: *models, prompt: rewrite, variables: {message: "and that?"}, resolved_refs: {rewrite: {wfspec: agent-harness-prompts/prompt.rewrite, version: "0.2.1"}}}
+    mocks:
+      - step_name: render-prompt
+        _:
+          ok: true
+          data:
+            kind: chat
+            version: "0.2.1"
+            messages: [{role: system, content: "rewrite"}, {role: user, content: "and that?"}]
+            response_format: {type: json_object}
+            schema: *rq_schema
+      - step_name: call-model
+        _: {content: "{\"rewritten_query\": \"moco retries\"}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['parsed'] == {'rewritten_query': 'moco retries'} }}"
+        - "{{ data['prompt_version'] == '0.2.1' }}"
+
+  - id: render-and-chat-refuses-a-question-set
+    input: {mode: render_and_chat, role: decision, models: *models, prompt: route}
+    mocks:
+      - step_name: render-prompt
+        _: {ok: true, data: {kind: system_one, questions: {}}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "llm-invoke: prompt 'route' is not a chat prompt (kind system_one)"

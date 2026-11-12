@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.PENDING — agent-admin's pending-actions area (plan-16 phase 2, plan-12 step 8)
+# ================================================================================
+#   op               in                                   data out
+#   list_pending     —                                    {pending: [row]}  (the caller's, awaiting)
+#   resolve_pending  session_id, decision, feedback?      agent-cli's answer for the resumed turn
+# resolve_pending does NOT call hitl resolve: it sends the session a user_message with
+# an `action` payload through agent-cli, so the UI button and a typed "yes" take the
+# same path inside the entity (§6.11) -- and the caller gets the resumed turn's
+# answer (agent-cli waits for it, ≤ 120 s).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.pending
+
+context:
+  valid_ops: ["list_pending", "resolve_pending"]
+  decisions: ["approve", "approve_session", "reject", "revise", "reply"]
+  res: {}
+
+input:
+  op:
+  agent_id:
+  session_id:
+  decision:
+  feedback:
+
+output:
+  ok: "{{ bool(res.get('ok')) }}"
+  data: "{{ res.get('data') }}"
+  error: "{{ res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.pending: invalid op '{{ op }}'"
+
+    - task_name: list-pending
+      skip_if: "{{ op != 'list_pending' }}"
+      workflow:
+        ref: agent-harness-session/hitl
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: check-decision
+      skip_if: "{{ op != 'resolve_pending' }}"
+      set:
+        - res: >-
+            {{ {} if decision in decisions and session_id else
+               {'ok': False, 'data': None, 'error': {'code': 'invalid_input',
+                'message': 'resolve_pending needs session_id and a decision in ' + ', '.join(decisions), 'retryable': False}} }}
+
+    - task_name: send-decision
+      skip_if: "{{ op != 'resolve_pending' or bool(res) }}"
+      workflow:
+        ref: agent-harness/agent-cli
+        mode: inline
+        input:
+          agent_id: "{{ agent_id }}"
+          session_id: "{{ session_id }}"
+          message: ""
+          action: {decision: "{{ decision }}", feedback: "{{ feedback }}"}
+      output:
+        set:
+          - res: >-
+              {{ {'ok': (_ or {}).get('status') not in ['error', 'busy', None], 'data': _,
+                  'error': None if (_ or {}).get('status') not in ['error', 'busy', None] else
+                           {'code': str((_ or {}).get('status') or 'error'), 'message': str((_ or {}).get('answer') or '')[:300], 'retryable': True}} }}

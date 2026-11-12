@@ -1,0 +1,208 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.SESSIONS — agent-admin's sessions area (plan-16 step 5)
+# ================================================================================
+#   op               in                    data out
+#   list_sessions    limit?, status?       {sessions}
+#   get_session      session_id, page?     {meta, context, turns, next_page}
+#   rename_session   session_id, title     {meta}
+#   delete_session   session_id            {deleted_keys}
+#   submit_feedback  session_id, turn,     {feedback, memory}  (session-store; guests cannot)
+#                    rating: up|down, comment?
+# Through session-store only (P4: never the live entity), except delete_session,
+# which also signals the entity to retire. The entity's late writes then fail,
+# because every session-store write needs the meta row (deleted first here).
+# Sessions are per user: the caller sees only their own (session-store namespaces).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.sessions
+
+context:
+  valid_ops: ["list_sessions", "get_session", "rename_session", "delete_session", "submit_feedback"]
+  ok: false
+  data:
+  error:
+  fb_config: {}
+
+input:
+  op:
+  agent_id:
+  session_id:
+  limit: 50
+  status:
+  page: 0
+  title: ""
+  turn: 0
+  rating:
+  comment: ""
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.sessions: invalid op '{{ op }}'"
+
+    - task_name: op-list
+      skip_if: "{{ op != 'list_sessions' }}"
+      workflow:
+        ref: agent-harness-session/session-store
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", limit: "{{ limit }}", status: "{{ status }}"}
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: op-get
+      skip_if: "{{ op != 'get_session' }}"
+      tasks:
+        - task_name: get-session-rows
+          workflow:
+            ref: agent-harness-session/session-store
+            mode: inline
+            input: {mode: get, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}", parts: [meta, context]}
+          output:
+            set:
+              - got: "{{ _ or {} }}"
+        - task_name: get-session-turns
+          skip_if: "{{ not got.get('ok') }}"
+          workflow:
+            ref: agent-harness-session/session-store
+            mode: inline
+            input: {mode: get_turns, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}", page: "{{ page }}"}
+          output:
+            set:
+              - turns: "{{ (_ or {}).get('data') or {} }}"
+        - task_name: shape-get
+          set:
+            - ok: "{{ bool(got.get('ok')) }}"
+            - error: "{{ got.get('error') }}"
+            - data: >-
+                {{ dict(got['data'], turns=turns.get('turns') or [], next_page=turns.get('next_page'))
+                   if got.get('ok') else None }}
+
+    - task_name: op-rename
+      skip_if: "{{ op != 'rename_session' }}"
+      workflow:
+        ref: agent-harness-session/session-store
+        mode: inline
+        input: {mode: patch_meta, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}", patch: {title: "{{ str(title or '').strip()[:120] }}"}}
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: op-delete
+      skip_if: "{{ op != 'delete_session' }}"
+      tasks:
+        - task_name: delete-config
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input: {mode: resolve, agent_id: "{{ agent_id }}"}
+          output:
+            set:
+              - fb_config: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+        # Its jobs (§6.12): cancel what still runs (the entity writes `cancelled`, or
+        # cancel writes it when the entity is gone), then drop every job row of the
+        # session -- they are keyed job:<id>, outside session:<sid>:*.
+        - task_name: list-session-jobs
+          workflow:
+            ref: agent-harness-jobs/job-manager
+            mode: inline
+            input: {mode: list, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}"}
+          output:
+            set:
+              - session_jobs: "{{ (((_ or {}).get('data') or {}).get('jobs')) or [] }}"
+          on_error:
+            catch: true
+            do:
+              set:
+                - session_jobs: []
+        - task_name: cancel-session-jobs
+          loop:
+            in: "{{ [j.get('job_id') for j in session_jobs if j.get('status') in ['queued', 'running', 'awaiting_input']] }}"
+            foreach: cancel_job_id
+            do:
+              task_name: cancel-session-job
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input: {mode: cancel, agent_id: "{{ agent_id }}", job_id: "{{ cancel_job_id }}", reason: "session deleted"}
+              on_error:
+                catch: true
+        - task_name: delete-session-jobs
+          loop:
+            in: "{{ [j.get('job_id') for j in session_jobs] }}"
+            foreach: delete_job_id
+            do:
+              task_name: delete-session-job
+              workflow:
+                ref: agent-harness-jobs/job-manager
+                mode: inline
+                input: {mode: delete, agent_id: "{{ agent_id }}", job_id: "{{ delete_job_id }}"}
+              on_error:
+                catch: true
+        - task_name: delete-session-rows
+          workflow:
+            ref: agent-harness-session/session-store
+            mode: inline
+            input: {mode: delete, agent_id: "{{ agent_id }}", session_id: "{{ session_id }}", config: "{{ fb_config }}"}
+          output:
+            set:
+              - ok: "{{ (_ or {}).get('ok') }}"
+              - data: "{{ (_ or {}).get('data') }}"
+              - error: "{{ (_ or {}).get('error') }}"
+        # The entity id is agent-cli's: agent-session-<agent_id>-<uid>-<sid>.
+        - task_name: retire-entity
+          skip_if: "{{ not ok }}"
+          emit_event:
+            target_workflow_id: 'agent-session-{{ agent_id }}-{{ __user_info__.get("user_id") }}-{{ session_id }}'
+            topic: agent-session
+            event_type: retire
+            # deleted: the entity must not curate or write an episode from rows that are
+            # gone -- they would outlive the delete as orphans (F62).
+            data: {deleted: true}
+          on_error: {catch: true}
+
+    - task_name: feedback-config
+      skip_if: "{{ op != 'submit_feedback' }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - fb_config: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+
+    - task_name: op-feedback
+      skip_if: "{{ op != 'submit_feedback' }}"
+      workflow:
+        ref: agent-harness-session/session-store
+        mode: inline
+        input:
+          mode: submit_feedback
+          agent_id: "{{ agent_id }}"
+          session_id: "{{ session_id }}"
+          turn: "{{ turn }}"
+          rating: "{{ rating }}"
+          comment: "{{ comment }}"
+          feedback_source: explicit
+          config: "{{ fb_config }}"
+          definition_access: "{{ fb_config.get('access') or {} }}"
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"

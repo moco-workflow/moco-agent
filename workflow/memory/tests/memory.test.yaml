@@ -1,0 +1,286 @@
+test_type: integration-test
+
+# memory facade (plan-07 steps 3, 5-7, design §6.4.2, §6.4.5): recall order and cutoff,
+# conflicted penalty, profile always, episodes gated, agent scope from the snapshot
+# (no agent-namespace list), user-over-agent on a slug collision; record (guest no-op,
+# disabled, started); remember (new / duplicate / after a forget); forget by key and by
+# query (retire + tombstone); feedback; retire_by_session keeps items with other
+# sessions' evidence; record_episode (key, min_turns, switch, guest). memory-store
+# calls are mocked by task name.
+
+wfspec:
+  name: memory
+
+test_data:
+  config: &config {access: {admin_user_ids: []}, memory: {long_term: {enabled: true}}}
+  rows: &rows
+    ok: true
+    data:
+      items:
+        - {key: "mem:lesson:retry-per-attempt", kind: lesson, slug: retry-per-attempt, title: "Retry timeout is per attempt", text: "timeout_sec applies per attempt", tags: [retry], status: active, evidence: [{session_id: s1}, {session_id: s2}], updated_at: "2026-10-10T00:00:00"}
+        - {key: "mem:fact:retry-max", kind: fact, slug: retry-max, title: "Retry max attempts", text: "default retry max_attempts is 3", tags: [retry], status: conflicted, evidence: [{session_id: s1}], updated_at: "2026-10-10T00:00:00"}
+        - {key: "mem:fact:kafka", kind: fact, slug: kafka, title: "Kafka topics", text: "unrelated", tags: [kafka], status: active, evidence: [{session_id: s1}], updated_at: "2026-10-10T00:00:00"}
+        - {key: "mem:profile:helm", kind: profile, slug: helm, title: "Deploys with helm", text: "The user deploys with helm", tags: [helm], status: active, pinned: true, evidence: [{session_id: s3}], updated_at: "2026-10-10T00:00:00"}
+        - {key: "mem:fact:old", kind: fact, slug: old, title: "retry old", text: "retry", status: retired, evidence: []}
+
+test_cases:
+
+  # ── recall ──────────────────────────────────────────────────────────────
+  - id: recall-ranks-by-lexical-weight-and-conflict-and-always-adds-the-profile
+    input: {mode: recall, agent_id: ops, query: "how does the retry timeout work per attempt?", config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+    expect:
+      assert:
+        # retry-max overlaps weakly and is conflicted (-0.2): below the cut; kafka shares
+        # no term; the retired row is never a candidate.
+        - "{{ [i['key'] for i in data['items']] == ['mem:lesson:retry-per-attempt'] and data['items'][0]['scope'] == 'user' }}"
+        - "{{ [p['key'] for p in data['profile']] == ['mem:profile:helm'] and data['episodes'] == [] }}"
+        - "{{ data['used_memory'] == ['mem:lesson:retry-per-attempt', 'mem:profile:helm'] }}"
+
+  - id: agent-scope-comes-from-the-snapshot-and-a-user-item-wins-a-collision
+    input:
+      mode: recall
+      agent_id: ops
+      query: "retry timeout per attempt"
+      config: *config
+      agent_items:
+        - {key: "mem:lesson:retry-per-attempt", kind: lesson, slug: retry-per-attempt, title: "AGENT version", text: "x", status: active, pinned: true, evidence: []}
+        - {key: "mem:lesson:use-backoff", kind: lesson, slug: use-backoff, title: "Use retry backoff", text: "retry with backoff per attempt", status: active, pinned: true, evidence: []}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+    expect:
+      assert:
+        - "{{ [i['title'] for i in data['items'] if i['key'] == 'mem:lesson:retry-per-attempt'] == ['Retry timeout is per attempt'] }}"
+        - "{{ [i['scope'] for i in data['items'] if i['key'] == 'mem:lesson:use-backoff'] == ['agent'] }}"
+
+  - id: nothing-relevant-means-no-items-but-still-the-profile
+    input: {mode: recall, agent_id: ops, query: "zebra giraffe", config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+    expect:
+      assert:
+        - "{{ data['items'] == [] and len(data['profile']) == 1 }}"
+
+  - id: episodes-only-when-the-question-refers-back
+    input: {mode: recall, agent_id: ops, query: "the helm upgrade we discussed", refers_to_past: 0.8, config: *config}
+    mocks:
+      - step_name: list-user-memory
+        _: {ok: true, data: {items: [{key: "mem:episode:s7", kind: episode, slug: s7, title: "Helm upgrade session", text: "upgraded helm chart", status: active, evidence: [{session_id: s7}]}]}}
+    expect:
+      assert:
+        - "{{ [e['key'] for e in data['episodes']] == ['mem:episode:s7'] }}"
+
+  # ── record ──────────────────────────────────────────────────────────────
+  - id: record-starts-the-curator
+    input: {mode: record, agent_id: ops, session_id: s1, exchanges: [{user: a, assistant: b}], config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-curator, _: "wf-123"}
+    expect:
+      output:
+        - ok: true
+        - data: {started: true}
+
+  - id: a-guest-is-never-recorded
+    input: {mode: record, agent_id: ops, session_id: s1, exchanges: [{user: a, assistant: b}], config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: guest}}}
+      - {step_name: spawn-curator, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {started: false}
+
+  - id: record-does-nothing-with-long-term-memory-off
+    input: {mode: record, agent_id: ops, session_id: s1, exchanges: [{user: a, assistant: b}], config: {access: {}, memory: {long_term: {enabled: false}}}}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-curator, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {started: false}
+
+  # ── remember ────────────────────────────────────────────────────────────
+  - id: remember-saves-a-new-pinned-item
+    input: {mode: remember, agent_id: ops, session_id: s1, statement: "I deploy with helm", kind: profile, config: *config}
+    mocks:
+      - {step_name: read-existing, _: {ok: false, error: {code: not_found}}}
+      - {step_name: remember-write, _: "{{ {'ok': True, 'data': {'item': {'key': 'mem:profile:i-deploy-with-helm'}}} }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {key: "mem:profile:i-deploy-with-helm", verdict: new}
+
+  - id: remember-an-existing-item-adds-evidence
+    input: {mode: remember, agent_id: ops, session_id: s1, statement: "I deploy with helm", config: *config}
+    mocks:
+      - {step_name: read-existing, _: {ok: true, data: {item: {key: "mem:fact:i-deploy-with-helm", status: active}}}}
+      - {step_name: remember-write, _: {ok: true, data: {item: {key: "mem:fact:i-deploy-with-helm"}}}}
+    expect:
+      output:
+        - data: {key: "mem:fact:i-deploy-with-helm", verdict: duplicate}
+
+  - id: a-guests-remember-is-refused-by-the-store
+    input: {mode: remember, agent_id: ops, session_id: s1, statement: "x y z", config: *config}
+    mocks:
+      - {step_name: read-existing, _: {ok: false}}
+      - {step_name: remember-write, _: {ok: false, error: {code: forbidden, message: "not allowed"}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  # ── forget ──────────────────────────────────────────────────────────────
+  - id: forget-by-key-retires-and-tombstones
+    input: {mode: forget, agent_id: ops, key: "mem:profile:helm", config: *config}
+    mocks:
+      - {step_name: read-existing, _: {ok: true, data: {item: {key: "mem:profile:helm", title: "Deploys with helm", status: active}}}}
+      - {step_name: retire-forgotten-item, _: {ok: true, data: {item: {key: "mem:profile:helm", status: retired}}}}
+      - {step_name: write-forget-tombstone, _: {ok: true, data: {hash: abc}}}
+    expect:
+      output:
+        - data: {retired: ["mem:profile:helm"]}
+
+  - id: forget-by-query-retires-every-matching-item
+    input: {mode: forget, agent_id: ops, query: "retry timeout attempt", config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: retire-forgotten-item, _: "{{ {'ok': True, 'data': {'item': {'key': forget_row['key']}}} }}"}
+      - {step_name: write-forget-tombstone, _: {ok: true, data: {hash: abc}}}
+    expect:
+      output:
+        - data: {retired: ["mem:lesson:retry-per-attempt"]}
+
+  # ── feedback / retire_by_session ────────────────────────────────────────
+  - id: a-thumbs-down-lowers-support-of-the-used-items
+    input: {mode: feedback, agent_id: ops, used_memory: ["mem:fact:kafka", "mem:fact:kafka"], rating: down, config: *config}
+    mocks:
+      - {step_name: lower-support, _: {ok: true, data: {item: {key: "mem:fact:kafka", negative_feedback: 1}}}}
+    expect:
+      output:
+        - data: {adjusted: ["mem:fact:kafka"]}
+
+  - id: a-thumbs-up-changes-nothing-here
+    input: {mode: feedback, agent_id: ops, used_memory: ["mem:fact:kafka"], rating: up, config: *config}
+    mocks:
+      - {step_name: lower-support, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {adjusted: []}
+
+  - id: retire-by-session-keeps-items-with-other-sessions-evidence
+    input: {mode: retire_by_session, agent_id: ops, session_id: s1, config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: retire-session-item, _: "{{ {'ok': True, 'data': {'item': {'key': session_row['key']}}} }}"}
+    expect:
+      assert:
+        - "{{ sorted(data['retired']) == ['mem:fact:kafka', 'mem:fact:retry-max'] }}"
+
+  # F65: s2 was deleted earlier, so retry-per-attempt (s1, s2) has no live session left.
+  - id: retire-by-session-retires-items-whose-every-session-is-gone
+    input: {mode: retire_by_session, agent_id: ops, session_id: s1, live_session_ids: [s3], config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: retire-session-item, _: "{{ {'ok': True, 'data': {'item': {'key': session_row['key']}}} }}"}
+    expect:
+      assert:
+        - "{{ sorted(data['retired']) == ['mem:fact:kafka', 'mem:fact:retry-max', 'mem:lesson:retry-per-attempt'] }}"
+
+  - id: retire-by-session-keeps-items-a-live-session-is-evidence-for
+    input: {mode: retire_by_session, agent_id: ops, session_id: s1, live_session_ids: [s1, s2, s3], config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: retire-session-item, _: "{{ {'ok': True, 'data': {'item': {'key': session_row['key']}}} }}"}
+    expect:
+      assert:
+        - "{{ sorted(data['retired']) == ['mem:fact:kafka', 'mem:fact:retry-max'] }}"
+
+  # ── record_episode ──────────────────────────────────────────────────────
+  - id: record-episode-starts-the-digest-on-a-key-from-the-session-id
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "User set up retries.", exchanges: [{role: user, content: a}], title: "Retries", upto_turn: 3, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-episode, _: "wf-ep"}
+    expect:
+      output:
+        - ok: true
+        - data: {key: "mem:episode:s-0000000000000662", started: true}
+
+  - id: record-episode-needs-a-session-id
+    input: {mode: record_episode, agent_id: ops, summary: "x", upto_turn: 3, config: *config}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: a-short-session-is-not-an-episode
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "x", upto_turn: 1, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-episode, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {key: null, started: false}
+
+  - id: min-turns-and-the-switch-come-from-config
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "x", upto_turn: 1, config: {access: {}, memory: {long_term: {enabled: true, episodes: {enabled: true, min_turns: 1}}}}}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: admin}}}
+      - {step_name: spawn-episode, _: "wf-ep"}
+    expect:
+      output:
+        - data: {key: "mem:episode:s-0000000000000662", started: true}
+
+  - id: episodes-switched-off-record-nothing
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "x", upto_turn: 5, config: {access: {}, memory: {long_term: {enabled: true, episodes: {enabled: false}}}}}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-episode, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {key: null, started: false}
+
+  - id: a-guest-gets-no-episode
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "x", upto_turn: 5, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: guest}}}
+      - {step_name: spawn-episode, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {key: null, started: false}
+
+  - id: nothing-to-digest-records-nothing
+    input: {mode: record_episode, agent_id: ops, session_id: s1, summary: "", exchanges: [], upto_turn: 5, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: spawn-episode, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {key: null, started: false}
+
+  # ── vector recall (phase 3) ─────────────────────────────────────────────
+  - id: a-vector-hit-without-a-shared-word-is-recalled
+    input:
+      mode: recall
+      agent_id: ops
+      query: "how should I ship to production"
+      config: {access: {admin_user_ids: []}, memory: {long_term: {enabled: true, vector: {enabled: true, min_score: 0.5}}}}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: search-vectors, _: {ok: true, data: {hits: [{key: "mem:fact:kafka", score: 0.4}, {key: "mem:lesson:deploy", score: 0.82}]}}}
+      - step_name: read-vector-item
+        _: {ok: true, data: {item: {key: "mem:lesson:deploy", kind: lesson, slug: deploy, title: "Deploys go through helm", text: "release with helm upgrade", status: active, evidence: [{session_id: s1}], updated_at: "2026-10-10T00:00:00"}}}
+    expect:
+      assert:
+        # deploy (0.82 ≥ 0.5) qualifies with no shared word; kafka's 0.4 does not.
+        - "{{ [i['key'] for i in data['items']] == ['mem:lesson:deploy'] }}"
+
+  - id: vectors-off-leaves-recall-lexical
+    input: {mode: recall, agent_id: ops, query: "how should I ship to production", config: *config}
+    mocks:
+      - {step_name: list-user-memory, _: *rows}
+      - {step_name: search-vectors, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['items'] == [] }}"
+

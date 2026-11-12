@@ -1,0 +1,92 @@
+test_type: integration-test
+
+# tool-stats-rollup (plan-17 step 10, design §6.9.11): figures from fixture audit
+# rows, the failing flag, and retirement of deprecated agent tools past grace.
+# Reads and writes are mocked by task name (one mock answers every iteration).
+
+wfspec:
+  name: tool-stats-rollup
+
+test_data:
+  audit: &audit
+    schema_version: 1
+    entries:
+      - {turn: 1, tool: k8s_list_pods, status: ok, elapsed_ms: 100, ts: "2026-10-11T10:00:00"}
+      - {turn: 2, tool: k8s_list_pods, status: ok, elapsed_ms: 300, truncated: true, ts: "2026-10-11T10:01:00"}
+      - {turn: 3, tool: k8s_list_pods, status: error, elapsed_ms: 200, error: {code: timeout, message: slow}, ts: "2026-10-11T10:02:00"}
+      - {turn: 4, tool: k8s_get_secret, status: needs_approval, ts: "2026-10-11T10:03:00"}
+      - {turn: 5, tool: k8s_get_secret, status: ok, elapsed_ms: 50, approved_by: u1, ts: "2026-10-11T10:04:00"}
+  failing: &failing
+    entries:
+      - {tool: flaky, status: error, elapsed_ms: 10, error: {message: e1}, ts: "2026-10-11T10:00:01"}
+      - {tool: flaky, status: error, elapsed_ms: 10, error: {message: e2}, ts: "2026-10-11T10:00:02"}
+      - {tool: flaky, status: error, elapsed_ms: 10, error: {message: e3}, ts: "2026-10-11T10:00:03"}
+      - {tool: flaky, status: ok, elapsed_ms: 10, ts: "2026-10-11T10:00:04"}
+      - {tool: flaky, status: error, elapsed_ms: 10, error: {message: e5}, ts: "2026-10-11T10:00:05"}
+
+test_cases:
+  - id: stats-are-rolled-up-from-the-audit-rows
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: list-toolcalls, _: "{{ [{'key': 'tool_audit:u1:s1'}, {'key': 'other'}] if stats_aid == 'ops' else 1 / 0 }}"}
+      - {step_name: read-toolcalls, _: *audit}
+      - {step_name: write-stat, _: null}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {}}}}}
+      - {step_name: list-scope-deprecated, _: {ok: true, data: {tools: []}}}
+    expect:
+      assert:
+        - "{{ data['sessions'] == 1 and data['entries'] == 5 and data['tools'] == ['k8s_get_secret', 'k8s_list_pods'] and data['flagged'] == [] }}"
+
+  - id: the-per-tool-figures
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: list-toolcalls, _: [{key: "tool_audit:u1:s1"}]}
+      - {step_name: read-toolcalls, _: *audit}
+      - {step_name: write-stat, _: null}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {}}}}}
+      - {step_name: list-scope-deprecated, _: {ok: true, data: {tools: []}}}
+      - {step_name: retire-tool, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['retired'] == [] }}"
+
+  - id: a-tool-failing-most-calls-is-flagged
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: list-toolcalls, _: [{key: "tool_audit:u1:s1"}]}
+      - {step_name: read-toolcalls, _: *failing}
+      - {step_name: write-stat, _: null}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {}}}}}
+      - {step_name: list-scope-deprecated, _: {ok: true, data: {tools: []}}}
+    expect:
+      assert:
+        - "{{ data['flagged'] == ['flaky'] }}"
+
+  - id: a-deprecated-agent-tool-past-grace-is-retired
+    input: {deprecated_grace_days: 30}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops}]}}}
+      - {step_name: list-toolcalls, _: []}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {admin_user_ids: [admin]}}}}}
+      - step_name: list-scope-deprecated
+        _: {ok: true, data: {tools: [{name: old_pods, scope: agent, status: deprecated, updated_at: "2000-01-01T00:00:00"},
+                                     {name: new_dep, scope: agent, status: deprecated, updated_at: "2999-01-01T00:00:00"}]}}
+      - {step_name: retire-tool, _: {ok: true, data: {tool: {status: retired}}}}
+    expect:
+      assert:
+        - "{{ data['retired'] == ['ops/old_pods'] }}"
+
+  - id: stats-mode-reads-the-rows-and-rolls-nothing-up
+    input: {mode: stats}
+    mocks:
+      - {step_name: list-stat-keys, _: [{key: "tool_stats:k8s_list_pods"}]}
+      - {step_name: read-stat-row, _: {schema_version: 1, name: k8s_list_pods, calls: 3}}
+      - {step_name: list-agents, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {stats: [{schema_version: 1, name: k8s_list_pods, calls: 3}]}

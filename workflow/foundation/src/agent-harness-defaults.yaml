@@ -1,0 +1,340 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-HARNESS-DEFAULTS — the lowest config tier, and the model catalog
+# ================================================================================
+#
+# Data, in a wfspec (design §6.1, S10). Two things live here and nowhere else:
+#
+#   defaults  every config section's default value. An agent definition
+#             (`agent.<agent_id>`) is merged over this field by field by
+#             `agent-config resolve`, so a new default reaches every agent that
+#             does not override it.
+#   catalog   the curated model endpoints (ported from moco-agent's
+#             agent-providers.yaml) plus the capability fields `agent-config
+#             validate` will check in phase 1 (`tools`, `json_mode`, context window).
+#
+# Only `agent-config` reads this wfspec. Nothing else may restate a default -- the
+# old agent had four drifting copies of them, which is why this file exists.
+#
+# Library profiles are `profile.<name>` data wfspecs (plan-03), resolved by
+# agent-registry; nothing about profiles lives here.
+#
+# Secrets are NAMES, never values (P11): `apikey_secret_key` is resolved by the
+# activity itself on every call.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-harness-defaults
+
+context:
+  defaults:
+    # ── models (§6.2.1): code names a role, never a model ─────────────────
+    models:
+      inference:
+        provider: deepseek
+        model: deepseek-v4-pro
+        base_url: "https://api.deepseek.com"
+        apikey_secret_key: "MY_DEEPSEEK_APIKEY"
+        max_tokens: 1200
+        temperature: 0.2
+        fallback_model:
+      # Optional alias (S13): null resolves to `inference` with a low max_tokens.
+      decision:
+      decision_default_max_tokens: 600
+      # System One, self-hosted (moco-systemone; catalog provider laya). Only `decide`
+      # reads it. The classifier is OFF until an endpoint is stated (F70): set
+      # base_url, or worker_default: true to use the worker's TYPESAFE_DEFAULT_BASE_URL
+      # (and TYPESAFE_DEFAULT_MODEL) -- an admin's statement that it names a
+      # self-hosted classifier. Left unstated, the activity would fall back to the
+      # hosted TypeSafe API, which the harness never calls.
+      classifier:
+        model:
+        base_url:
+        apikey_secret_key:
+        worker_default: false
+        enabled: true
+        timeout_sec: 10
+      # The model `knowledge register` embeds a new source with, unless the call
+      # names one. Stored on the source row: changing it affects only new sources.
+      # model_name and base_url null: the embedding activities fall back to
+      # MOCO_LLM_DEFAULT_EMBED_MODEL_NAME and MOCO_LLM_DEFAULT_EMBED_MODEL_BASE_URL (then
+      # MOCO_LLM_DEFAULT_BASE_URL). The source row keeps the nulls, so indexing and
+      # querying both resolve them from the environment -- which must therefore keep
+      # serving the same model, of embed_dim dimensions, for the sources built on it.
+      embedding:
+        model_name:
+        embed_dim: 768
+        base_url:
+        apikey_secret_key:
+
+    # ── access (§6.13): read only by `access authorize` ──────────────────
+    # guest_user_ids are SHARED identities: every guest signs in as one user_id
+    # (and a missing one is "None"), so they chat read-only. denied_user_ids are
+    # refused outright. Admins are admin_user_ids (empty by design: extra admins are
+    # named in the agent definition, where the change is reviewed) plus, with
+    # namespace_admins, every holder of `<ns>:manage_ns` in the namespace owning the
+    # agent package (F48) -- managed with the platform's role tools, groups included.
+    # namespace_admins is definition-only: an agent-tier save could otherwise lock
+    # the namespace admins out of their own agent. agent-config resolve adds the
+    # computed caller_is_namespace_admin / namespace_id keys; no tier may set them.
+    access:
+      denied_user_ids: []
+      guest_user_ids: ["guest", "None", ""]
+      admin_user_ids: []
+      guest_profiles: [chat]
+      namespace_admins: true
+
+    # ── context (§6.6): what the model sees each turn, in priority order ───
+    context:
+      max_context_tokens: 12000
+      providers: [system, pending, jobs, profile_memory, question, recent,
+                  recalled_memory, episodes, summary]
+      recent_item_chars: 1500
+
+    # ── knowledge (§6.5): which shared sources an agent may search ───────
+    knowledge:
+      sources: []
+      allow_user_sources: false
+      top_k_per_source: 4
+      max_chunks: 8
+      # A secret NAME (P11) holding the pgvector connection string, resolved by the
+      # activity. Empty: the llama_index activities fall back to the worker's
+      # MOCO_PGVECTOR_CONN environment variable.
+      pgvector_secret_key: ""
+
+    # ── decisions (§7.3): thresholds, agent tier only; tuned against labelled
+    # sets (§18) before they are trusted ──────────────────────────────────
+    decisions:
+      # PROVISIONAL until the plan-18 classifier evaluation: on local Laya the right
+      # source scored 0.58 and the wrong one 0.49 (plan-09 §8).
+      route:
+        source_min_p: 0.55
+        clarify_min_score: 1.5     # ambiguity scale 0..2
+        min_confidence: 0.5
+        rewrite_min_p: 0.5
+      guard:
+        # PROVISIONAL: on local Laya, benign passages scored ≤ 0.12 and injections
+        # ≥ 0.43 (8 samples, plan-05 §8). Fencing is always on, so a false positive
+        # only drops a passage. The plan-18 evaluation sets the real value.
+        injection_replace_p: 0.35
+        # PROVISIONAL: check_output separated weakly on local Laya (correct 0.58,
+        # wrong 0.52, plan-05 §8). Only gates the "could not verify" note and curation.
+        grounded_min_p: 0.5
+        # PROVISIONAL, unmeasured: check_tool_call escalates an auto call to approval
+        # at this overreach probability (and always when the classifier is down).
+        tool_escalate_p: 0.5
+        # PROVISIONAL, unmeasured: check_input blocks at this injection / harmful
+        # probability (only when guard.input_check is on; it fails open).
+        input_block_p: 0.8
+      tools:
+        # PROVISIONAL, unmeasured: tool-selector keeps a pre-filtered tool when System
+        # One gives it at least this probability (§6.9.8). The plan-18 evaluation sets it.
+        select_min_p: 0.5
+      memory:
+        # PROVISIONAL, unmeasured (plan-07): the curator's gate keeps an exchange at
+        # worth_remembering ≥ gate_min_p; pre-match calls it the same item at
+        # same_min_p and a conflict at conflict_min_p.
+        gate_min_p: 0.5
+        same_min_p: 0.6
+        conflict_min_p: 0.6
+      feedback:
+        # §6.10.5 / open question 8: implicit 👎 (the router's negative_feedback) is
+        # recorded, but changes memory support only when this is true.
+        implicit_enabled: false
+
+    # ── limits (§5.2, §6.10) ───────────────────────────────────────────────
+    # turn_budget_sec stands after phase-0 M4 (~0.6 s harness overhead per turn).
+    limits:
+      turn_budget_sec: 110
+      max_queued_messages: 1
+      # §6.12: non-terminal jobs per session, and how long one job wfspec run may take.
+      max_async_jobs: 1
+      job_timeout_sec: 3600
+      retire_after_idle_sec: 86400
+      retire_throwaway_after_idle_sec: 600
+      # §6.10.5. null = no limit. agent_daily_tokens is enforced by the janitor's
+      # hourly rollup, which sets `paused`; the per-user ones by the session in preparing.
+      cost: {user_daily_tokens: null, user_daily_turns: null, agent_daily_tokens: null}
+      paused: false
+
+    # ── retention (§8.1): agent tier only; the janitor applies it ────────────
+    retention:
+      session_days: 180
+      archived_turns_days: 365
+
+    # ── conversation memory (§6.4.1, §6.10.4) ─────────────────────────────
+    memory:
+      short_term:
+        recent_turns: 6
+      # §6.4: off by default; an agent opts in. kinds may include {kind, hint} for
+      # agent-defined kinds. The curator runs every curate_every_turns answered turns,
+      # early on the router's states_preference signal, on 👍, on the idle stop and
+      # on retire.
+      # vector (phase 3): a derived vector index over the user's memory (memory-vector,
+      # table mem_<agent_id>, the models.embedding model) so recall also finds items
+      # by meaning, not only by shared words. Off by default: it needs the platform's
+      # llama_index.index_texts and an embedding endpoint. min_score is the similarity
+      # an item needs to count without a shared word -- PROVISIONAL: on the dev stage's
+      # 768-dim default model a relevant item scored 0.48 and an unrelated one 0.39.
+      # episodes (phase 3): on the idle stop (and on retire), a session of at least
+      # min_turns answered turns is digested into one `episode` item (re-saved when it
+      # has new turns), brought back when the user refers to an
+      # earlier conversation (the router's refers_to_past). Only with enabled above.
+      long_term:
+        enabled: false
+        kinds: [profile, fact, lesson]
+        curate_every_turns: 4
+        episodes: {enabled: true, min_turns: 2}
+        vector: {enabled: false, top_k: 8, min_score: 0.45}
+        # promotion: users' active facts and lessons are mirrored to a GLOBAL pool
+        # (agent.<id>.memory-pool) that the daily memory-promote reads to propose
+        # agent-wide items. Off by default: every user can read that pool.
+        promotion: false
+
+    # ── session entity internals (not agent-tunable in spirit, but here so
+    #    tests and measurements can shorten them) ─────────────────────────────
+    session:
+      # The checkpoint timer is armed on entry to `idle` and cancelled on exit.
+      # Every idle_tick leaves `idle`, so checkpoint_sec MUST be shorter than
+      # idle_tick_sec or it never fires.
+      # idle_stop_sec: the entity ends (row stays active) once idle this long with
+      # no active job, so the next message boots the deployed harness (F66). The
+      # tick is the same length, so the stop comes one tick after the last turn.
+      idle_tick_sec: 600
+      idle_stop_sec: 600
+      checkpoint_sec: 240
+      # Fixed text for a profile error (§11.2). The turn is still persisted.
+      apology_text: "Sorry, something went wrong while answering that. Please try again."
+      # A turn that failed for a SETUP reason (F70): a model role with no key name, a
+      # key that is not stored, or an endpoint the worker has no default for. Fixed
+      # text, because the model may be what is missing. {role}, {secret}, {hint}.
+      setup_text: "I can't answer yet: my {role} model is not set up. {hint}"
+      setup_hints:
+        no_secret_name: "Choose an API key secret for it in Settings."
+        secret_missing: "Store the API key as the secret {secret} (Settings, or: moco secret upload {secret} <key>), then ask again."
+        env_default: "The worker has no default for it: choose a model and endpoint in Settings, or set the worker's MOCO_LLM_DEFAULT_* variables."
+        auth_failed: "The provider rejected the API key in {secret}: store a valid key, then ask again."
+      # Lower-cased fragments of a model error that mean setup, not an outage.
+      setup_patterns: ["has no model configured", "secret not found", "secretnotfound", "environment variable not set", "authentication",
+                       "token authentication failure", "unauthorized", "invalid api key", "incorrect api key",
+                       "invalid_api_key", "invalid jwt", "invalid token", " 401"]
+      limit_text: "You have reached your daily limit for this assistant. Please try again tomorrow."
+      paused_text: "This assistant is paused for today. Please try again later."
+
+    # ── tools (§6.9): toolsets the agent offers; overrides only tighten (§6.9.7) ──
+    toolsets: []
+    tools:
+      # <tool name>: {permission: auto|approve|deny} -- tool-policy applies the
+      # loosening rule, so an override can never make a write tool auto.
+      overrides: {}
+      # Values a manifest's templates read as `config`: <tool name> over '*' (shared,
+      # e.g. one cluster connection). Names of secrets only, never values.
+      config: {}
+
+    # ── guard (§6.13) ── input_check: run check_input on every message (off by
+    # default); checks: per-call checks, e.g. check_tool_call.
+    guard:
+      input_check: false
+      checks: []
+
+    # ── deployment facts an agent declares (§6.7.1 availability) ─────────────
+    # agent_worker: the `agent` worker type (claude_agent.*) runs in this deployment.
+    deployment:
+      agent_worker: false
+
+    # ── claude (kind: wfspec profiles on the agent worker, §6.8.5) ───────────
+    claude:
+      apikey_secret_key:
+      model:
+      max_turns: 12
+
+    router:
+      default_profile: chat
+      classifier: false
+
+    profiles: [chat]
+
+  # Phase-0 stand-in for `profile.chat` (plan-03). Shape: design §6.8.2.
+  # Ported from moco-agent's agent-providers.yaml (catalog_version 1.0.0), with the
+  # capability fields plan-04 needs. Reference data in phase 0: nothing validates
+  # against it until `agent-config validate` exists.
+  catalog:
+    catalog_version: "1.0.0"
+    providers:
+      - id: deepseek
+        kind: inference
+        label: DeepSeek
+        base_urls: ["https://api.deepseek.com"]
+        apikey_secret_key: "MY_DEEPSEEK_APIKEY"
+        models:
+          - {id: deepseek-v4-pro, label: "DeepSeek v4 Pro", max_tokens: 1200, tools: true, json_mode: true, context_window: 128000}
+          - {id: deepseek-flash, label: "DeepSeek Flash", max_tokens: 1200, tools: true, json_mode: true, context_window: 128000}
+      - id: openai
+        kind: inference
+        label: OpenAI
+        base_urls: ["https://api.openai.com/v1"]
+        apikey_secret_key: "MY_OPENAI_APIKEY"
+        models:
+          - {id: gpt-4o, label: "GPT-4o", max_tokens: 1200, tools: true, json_mode: true, context_window: 128000}
+          - {id: gpt-4o-mini, label: "GPT-4o mini", max_tokens: 1200, tools: true, json_mode: true, context_window: 128000}
+      - id: gemini
+        kind: inference
+        label: Google Gemini
+        base_urls: ["https://generativelanguage.googleapis.com/v1beta/openai/"]
+        apikey_secret_key: "MY_GEMINI_APIKEY"
+        models:
+          - {id: gemini-2.5-flash, label: "Gemini 2.5 Flash", max_tokens: 1200, tools: true, json_mode: true, context_window: 1000000}
+          - {id: gemini-2.5-pro, label: "Gemini 2.5 Pro", max_tokens: 1200, tools: true, json_mode: true, context_window: 1000000}
+      - id: anthropic
+        kind: inference
+        label: "Anthropic (OpenAI-compatible)"
+        base_urls: ["https://api.anthropic.com/v1"]
+        apikey_secret_key: "MY_CLAUDE_APIKEY"
+        models:
+          - {id: claude-opus-5, label: "Claude Opus 5", max_tokens: 1200, tools: true, json_mode: false, context_window: 1000000}
+          - {id: claude-sonnet-5, label: "Claude Sonnet 5", max_tokens: 1200, tools: true, json_mode: false, context_window: 1000000}
+          - {id: claude-haiku-4-5, label: "Claude Haiku 4.5", max_tokens: 1200, tools: true, json_mode: false, context_window: 200000}
+      - id: ollama-embed
+        kind: embedding
+        label: "Ollama (local)"
+        base_urls: ["http://mocopi-4:11434/v1", "http://localhost:11434/v1"]
+        apikey_secret_key: "MY_LLM_TOKEN"
+        models:
+          - {id: nomic-embed-text, label: nomic-embed-text, embed_dim: 768}
+      - id: openai-embed
+        kind: embedding
+        label: OpenAI
+        base_urls: ["https://api.openai.com/v1"]
+        apikey_secret_key: "MY_OPENAI_APIKEY"
+        models:
+          - {id: text-embedding-3-small, label: text-embedding-3-small, embed_dim: 1536}
+          - {id: text-embedding-3-large, label: text-embedding-3-large, embed_dim: 3072}
+      - id: moco-systemone
+        kind: classifier
+        label: "Moco System One (self-hosted)"
+        base_urls: ["http://mocopi-4:8002", "http://localhost:8002"]
+        apikey_secret_key:
+        models:
+          - {id: qwen3:0.6b, label: qwen3:0.6b}
+      - id: typesafe
+        kind: classifier
+        label: "TypeSafe System One"
+        base_urls: ["https://api.typesafe.ai"]
+        apikey_secret_key: MY_TYPESAFE_APIKEY
+        models:
+          - {id: typed-decisions, label: "typed decisions"}
+
+output:
+  defaults: "{{ defaults }}"
+  catalog: "{{ catalog }}"
+  # This package's (agent-harness-foundation's) version, for diagnostics. The
+  # harness version is agent-harness's: config_version uses the DEPLOYED one
+  # that agent-registry load reports.
+  version: "{{ __sys_info__.get('wfspec_version') }}"
+
+# A spec with no `main` task cannot run, so this one sets a throwaway local.
+main:
+  task_name: emit-defaults
+  set:
+    - _loaded: true

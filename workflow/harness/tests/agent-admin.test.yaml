@@ -1,0 +1,70 @@
+test_type: integration-test
+
+# agent-admin (plan-16 steps 4, 8): the op table, old-UI aliases, unknown ops. The
+# areas are mocked by task name (call-agents / -config / -sessions / -knowledge); a
+# sentinel (1 / 0) proves an area was NOT called.
+
+wfspec:
+  name: agent-admin
+
+test_data:
+  sentinel: &sentinel "{{ 1 / 0 }}"
+
+test_cases:
+  - id: an-op-goes-to-its-area
+    input: {op: list_sessions, agent_id: skeleton}
+    mocks:
+      - {step_name: call-sessions, _: {ok: true, data: {sessions: []}, error: null}}
+      - {step_name: call-config, _: *sentinel}
+    expect:
+      output:
+        - ok: true
+        - data: {sessions: []}
+
+  - id: an-old-ui-op-name-and-the-operator-key-are-mapped
+    input: {operator: list_domains, agent_id: skeleton}
+    mocks:
+      - {step_name: call-knowledge, _: {ok: true, data: {sources: [{name: moco-docs}]}, error: null}}
+    expect:
+      output:
+        - data: {sources: [{name: moco-docs}]}
+
+  - id: an-unknown-op-is-an-expected-failure
+    input: {op: format_disk, agent_id: skeleton}
+    mocks:
+      - {step_name: call-agents, _: *sentinel}
+      - {step_name: call-config, _: *sentinel}
+      - {step_name: call-sessions, _: *sentinel}
+      - {step_name: call-knowledge, _: *sentinel}
+    expect:
+      output:
+        - ok: false
+        - error: {code: unknown_op, message: "unknown op 'format_disk'", retryable: false}
+
+  # Phase 3: the old UI's build ops map onto the jobs area (build_id → job_id).
+  - id: an-old-build-approval-becomes-answer-job-with-approve
+    input: {op: approve_build, agent_id: moco-assistant, build_id: job-1}
+    mocks:
+      - step_name: call-jobs
+        _: "{{ {'ok': True, 'data': {'op': the_op, 'decision': old_decisions.get(asked_op), 'job_id': job_id or build_id}, 'error': None} }}"
+    expect:
+      output:
+        - ok: true
+        - data: {op: answer_job, decision: approve, job_id: job-1}
+
+  - id: an-old-build-listing-becomes-list-jobs
+    input: {op: list_builds, agent_id: moco-assistant}
+    mocks:
+      - {step_name: call-jobs, _: "{{ {'ok': True, 'data': {'op': the_op}, 'error': None} }}"}
+      - {step_name: call-sessions, _: *sentinel}
+    expect:
+      output:
+        - data: {op: list_jobs}
+
+  - id: the-default-agent-is-used-without-an-agent-id
+    input: {op: get_config}
+    mocks:
+      - {step_name: call-config, _: {ok: true, data: {config_version: "v"}, error: null}}
+    expect:
+      output:
+        - ok: true

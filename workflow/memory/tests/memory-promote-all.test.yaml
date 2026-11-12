@@ -1,0 +1,36 @@
+test_type: integration-test
+
+# memory-promote-all (plan-17 step 12): every deployed agent with long-term memory and
+# promotion (the opt-in pool) on gets `memory-promote run` with its own config; others
+# are skipped; one failing agent is reported, not raised. The agent list, the config resolves and the runs are mocked.
+
+wfspec:
+  name: memory-promote-all
+
+test_cases:
+  - id: agents-with-promotion-on-are-promoted-the-rest-skipped
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: moco-assistant}, {agent_id: ops-assistant}, {agent_id: skeleton}]}}}
+      - step_name: resolve-agent-config
+        _: "{{ {'ok': True, 'data': {'config': {'memory': {'long_term': {'enabled': True, 'promotion': promote_aid != 'skeleton'}}}, 'resolved_refs': {'memory.merge': {}}}} }}"
+      - step_name: promote-agent
+        _: "{{ {'ok': True, 'data': {'proposed': ['p-' + promote_target], 'expired': []}} if promote_target == 'moco-assistant' else {'ok': False, 'error': {'code': 'forbidden'}} }}"
+    expect:
+      output:
+        - ok: true
+        - data:
+            agents:
+              - {agent_id: moco-assistant, ok: true, proposed: [p-moco-assistant], expired: [], error: null}
+              - {agent_id: ops-assistant, ok: false, proposed: [], expired: [], error: {code: forbidden}}
+            skipped: [skeleton]
+
+  - id: no-agents-means-nothing-to-do
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: []}}}
+      - {step_name: resolve-agent-config, _: "{{ 1 / 0 }}"}
+      - {step_name: promote-agent, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {agents: [], skipped: []}

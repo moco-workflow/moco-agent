@@ -1,0 +1,634 @@
+test_type: integration-test
+
+# tool-registry (plan-10 steps 1-4, design §6.9.3-6): save fills the defaults and
+# always writes a draft, every legal and illegal lifecycle transition, the access
+# check on writes, toolsets and membership. State, access, the package catalogs and
+# the secret list are mocked by task name; check-manifest's rules have their own
+# unit suite (tool-registry.unit.test.yaml).
+
+wfspec:
+  name: tool-registry
+
+test_data:
+  allow: &allow {ok: true, data: {allow: true, reason: ok}}
+  deny: &deny {ok: true, data: {allow: false, reason: not_admin}}
+  # A complete, valid manifest as save writes it (status set per case).
+  pods_draft: &pods_draft
+    schema_version: 1
+    name: k8s_pods
+    version: 1
+    title: List pods
+    description: List the pods in a namespace.
+    scope: shared
+    status: draft
+    origin: authored
+    parameters: {type: object, properties: {namespace: {type: string}}, required: [namespace]}
+    examples: []
+    result: {schema: null, shape: null, max_chars: 8000, sources: null}
+    binding: {activity: {type: k8s.list, input_template: {kind: Pod, namespace: "<args.namespace>"}}}
+    credential: {mode: none, secret_key: null, connect_hint: null}
+    policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false,
+             approval_template: null, limits: {per_turn: 4, per_session: 50},
+             enabled_for: {users: ["*"], denied_users: []}}
+    execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}}
+    tags: [k8s]
+    toolsets: [k8s-readonly]
+    deprecated_by: null
+  pods_enabled: &pods_enabled
+    {schema_version: 1, name: k8s_pods, version: 1, scope: shared, status: enabled, toolsets: [k8s-readonly]}
+  pods_disabled: &pods_disabled
+    {schema_version: 1, name: k8s_pods, version: 1, scope: shared, status: disabled, toolsets: [k8s-readonly]}
+  pods_deprecated: &pods_deprecated
+    {schema_version: 1, name: k8s_pods, version: 2, scope: shared, status: deprecated, deprecated_by: k8s_pods_v2}
+  pods_retired: &pods_retired
+    {schema_version: 1, name: k8s_pods, version: 2, scope: shared, status: retired}
+
+test_cases:
+
+  # ── save ────────────────────────────────────────────────────────────────
+  - id: save-a-new-tool-writes-version-1-as-a-draft-with-defaults
+    input:
+      mode: save
+      name: k8s_pods
+      scope: shared
+      manifest:
+        description: List the pods in a namespace.
+        parameters: {type: object, properties: {namespace: {type: string}}, required: [namespace]}
+        binding: {activity: {type: k8s.list, input_template: {kind: Pod}}}
+        policy: {side_effects: read}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['tool']['status'] == 'draft' and data['tool']['version'] == 1 and data['tool']['origin'] == 'authored' }}"
+        - "{{ data['tool']['policy']['permission'] == 'auto' and data['tool']['policy']['idempotent'] == True }}"
+        - "{{ data['tool']['policy']['limits'] == {'per_turn': 4, 'per_session': 50} and data['tool']['execution']['mode'] == 'sync' }}"
+        - "{{ data['tool']['title'] == 'k8s_pods' and data['tool']['result']['max_chars'] == 8000 and data['tool']['schema_version'] == 1 }}"
+
+  - id: a-write-tool-defaults-to-approve-and-not-idempotent
+    input:
+      mode: save
+      name: k8s_scale
+      scope: shared
+      manifest: {description: Scale a deployment., policy: {side_effects: write}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['policy']['permission'] == 'approve' and data['tool']['policy']['idempotent'] == False }}"
+
+  - id: a-missing-side-effects-defaults-to-approve
+    input: {mode: save, name: mystery, scope: shared, manifest: {description: "?"}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['policy']['permission'] == 'approve' and data['tool']['policy']['side_effects'] is None }}"
+
+  - id: saving-an-enabled-tool-bumps-the-version-and-takes-it-offline
+    input:
+      mode: save
+      name: k8s_pods
+      scope: shared
+      manifest: {description: List pods (v2)., policy: {side_effects: read}}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['version'] == 2 and data['tool']['status'] == 'draft' and data['tool']['description'] == 'List pods (v2).' }}"
+
+  - id: a-deprecated-tool-cannot-be-saved
+    input: {mode: save, name: k8s_pods, scope: shared, manifest: {description: x}}
+    mocks:
+      - {step_name: read-current, _: *pods_deprecated}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "tool k8s_pods is deprecated and cannot be saved", retryable: false}
+
+  - id: save-will-not-replace-a-tool-of-another-origin
+    input: {mode: save, name: k8s_pods, scope: shared, manifest: {description: x, policy: {side_effects: read}, origin: "provider:kube"}}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "tool k8s_pods already exists from authored; it cannot be replaced from provider:kube", retryable: false}
+
+  - id: save-rejects-a-builtin-binding
+    input: {mode: save, name: sneaky, scope: shared, manifest: {description: x, binding: {builtin: {module: knowledge, mode: retrieve}}}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' and 'harness-only' in error['message'] }}"
+
+  - id: save-rejects-a-manifest-for-another-name
+    input: {mode: save, name: k8s_pods, scope: shared, manifest: {name: other, description: x}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: a-non-admin-cannot-save-a-shared-tool
+    input: {mode: save, name: k8s_pods, scope: shared, manifest: {description: x}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *deny}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: forbidden, message: "not allowed to write shared tools (not_admin)", retryable: false}
+
+  - id: an-agent-scope-tool-needs-an-agent-id
+    input: {mode: save, name: k8s_pods, scope: agent, manifest: {description: x}}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "agent_id must match ^[a-z][a-z0-9-]{1,31}$", retryable: false}
+
+  - id: an-agent-scope-tool-is-written-to-the-agent-namespace
+    input: {mode: save, name: k8s_pods, scope: agent, agent_id: ops-assistant, manifest: {description: x, policy: {side_effects: read}}}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['tool']['scope'] == 'agent' }}"
+
+  # ── validate / enable: legal ────────────────────────────────────────────
+  - id: validate-enables-a-valid-draft
+    input: {mode: validate, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_draft}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['tool']['status'] == 'enabled' and data['tool']['version'] == 1 }}"
+
+  - id: validate-reports-every-problem-and-writes-nothing
+    input: {mode: validate, name: k8s_pods, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: k8s_pods, version: 1, scope: shared, status: draft, description: "",
+            binding: {activity: {type: shell.run, input_template: {}}},
+            policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, parameters: {type: object, properties: {}}}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+        - "{{ 'description is required' in error['message'] and 'shell.run is not on the allowlist' in error['message'] }}"
+
+  - id: a-wfspec-binding-must-be-deployed
+    input: {mode: validate, name: jira_search, scope: agent, agent_id: ops-assistant}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: jira_search, version: 1, scope: agent, status: draft, description: Search Jira.,
+            parameters: {type: object, properties: {jql: {type: string}}, required: [jql]},
+            binding: {wfspec: {name: tool.jira-search}},
+            policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: []}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: catalog-agent, _: {package: agent-ops-assistant, version: "0.1.0", wfspecs: [agent.ops-assistant]}}
+      - {step_name: catalog-harness, _: {package: agent-harness-tools, version: "0.4.0", wfspecs: [access]}}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' and 'tool.jira-search is not deployed in agent-harness-tools or agent-ops-assistant' in error['message'] }}"
+
+  - id: a-deployed-wfspec-binding-validates
+    input: {mode: validate, name: jira_search, scope: agent, agent_id: ops-assistant}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: jira_search, version: 1, scope: agent, status: draft, description: Search Jira.,
+            parameters: {type: object, properties: {jql: {type: string}}, required: [jql]},
+            binding: {wfspec: {name: tool.jira-search}},
+            policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: []}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: catalog-agent, _: {package: agent-ops-assistant, version: "0.1.0", wfspecs: [agent.ops-assistant, tool.jira-search]}}
+      - {step_name: catalog-harness, _: {package: agent-harness-tools, version: "0.4.0", wfspecs: [access]}}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['tool']['status'] == 'enabled' }}"
+
+  # tool.run-workflow (workflow providers): its target must be deployed too.
+  - id: a-workflow-tool-target-must-be-deployed
+    input: {mode: validate, name: wf_demo_echo, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: wf_demo_echo, version: 1, scope: shared, status: draft, description: Echo.,
+            parameters: {type: object, properties: {message: {type: string}}, required: [message]},
+            binding: {wfspec: {name: tool.run-workflow, workflow: {ref: demo-tools/demo-echo}, timeout_sec: 60}},
+            policy: {side_effects: none, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 60, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: [], origin: "provider:wf"}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: catalog-harness, _: {package: agent-harness-tools, version: "0.11.0", wfspecs: [tool.run-workflow]}}
+      - {step_name: catalog-target, _: {package: demo-tools, version: null, wfspecs: []}}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' and 'workflow demo-tools/demo-echo is not deployed to you on this stage' in error['message'] }}"
+
+  - id: a-deployed-workflow-tool-validates
+    input: {mode: validate, name: wf_demo_echo, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: wf_demo_echo, version: 1, scope: shared, status: draft, description: Echo.,
+            parameters: {type: object, properties: {message: {type: string}}, required: [message]},
+            binding: {wfspec: {name: tool.run-workflow, workflow: {ref: demo-tools/demo-echo}, timeout_sec: 60}},
+            policy: {side_effects: none, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 60, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: [], origin: "provider:wf"}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: catalog-harness, _: {package: agent-harness-tools, version: "0.11.0", wfspecs: [tool.run-workflow]}}
+      - {step_name: catalog-target, _: {package: demo-tools, version: "1.0.0", wfspecs: [demo-echo, demo-tools]}}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['tool']['status'] == 'enabled' }}"
+
+  - id: a-service-secret-must-exist
+    input: {mode: validate, name: jira_search, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: jira_search, version: 1, scope: shared, status: draft, description: Search Jira.,
+            parameters: {type: object, properties: {}},
+            binding: {activity: {type: http.request, input_template: {method: GET}}},
+            policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: service, secret_key: global/JIRA_TOKEN}, toolsets: []}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: list-global-secrets, _: [OPENAI_KEY]}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' and 'service secret global/JIRA_TOKEN does not exist' in error['message'] }}"
+
+  - id: enable-re-validates-a-disabled-tool
+    input: {mode: enable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_disabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' and 'fails validation' in error['message'] }}"
+
+  # ── lifecycle: legal ────────────────────────────────────────────────────
+  - id: disable-an-enabled-tool
+    input: {mode: disable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['status'] == 'disabled' and data['tool']['version'] == 1 }}"
+
+  - id: deprecate-names-an-enabled-replacement
+    input: {mode: deprecate, name: k8s_pods, scope: shared, by: k8s_pods_v2}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-replacement, _: {schema_version: 1, name: k8s_pods_v2, status: enabled}}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['status'] == 'deprecated' and data['tool']['deprecated_by'] == 'k8s_pods_v2' }}"
+
+  - id: retire-a-deprecated-tool
+    input: {mode: retire, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_deprecated}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['tool']['status'] == 'retired' and data['tool']['deprecated_by'] == 'k8s_pods_v2' }}"
+
+  - id: delete-a-draft-deletes-the-row
+    input: {mode: delete, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_draft}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-row, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {tool: null}
+
+  - id: delete-a-disabled-tool-deletes-the-row
+    input: {mode: delete, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_disabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-row, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {tool: null}
+
+  # ── lifecycle: illegal ──────────────────────────────────────────────────
+  - id: validate-an-enabled-tool-is-invalid-state
+    input: {mode: validate, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "tool k8s_pods: enabled cannot validate", retryable: false}
+
+  - id: enable-an-enabled-tool-is-invalid-state
+    input: {mode: enable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: disable-a-draft-is-invalid-state
+    input: {mode: disable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_draft}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: deprecate-a-disabled-tool-is-invalid-state
+    input: {mode: deprecate, name: k8s_pods, scope: shared, by: k8s_pods_v2}
+    mocks:
+      - {step_name: read-current, _: *pods_disabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-replacement, _: {schema_version: 1, name: k8s_pods_v2, status: enabled}}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: deprecate-without-an-enabled-replacement-is-invalid-input
+    input: {mode: deprecate, name: k8s_pods, scope: shared, by: k8s_pods_v2}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-replacement, _: {schema_version: 1, name: k8s_pods_v2, status: draft}}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' and 'deprecate needs `by`' in error['message'] }}"
+
+  - id: deprecating-a-tool-by-itself-is-invalid-input
+    input: {mode: deprecate, name: k8s_pods, scope: shared, by: k8s_pods}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-replacement, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: retire-an-enabled-tool-is-invalid-state
+    input: {mode: retire, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-retired-tool-cannot-come-back
+    input: {mode: enable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_retired}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: an-enabled-tool-cannot-be-deleted
+    input: {mode: delete, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: delete-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "tool k8s_pods is enabled and can only be deleted as a draft or disabled", retryable: false}
+
+  - id: a-lifecycle-mode-on-an-unknown-tool-is-not-found
+    input: {mode: disable, name: nope, scope: shared}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: authorize-write, _: *allow}
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  - id: a-non-admin-cannot-change-the-lifecycle
+    input: {mode: disable, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: *pods_enabled}
+      - {step_name: authorize-write, _: *deny}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'forbidden' }}"
+
+  # ── get / list ──────────────────────────────────────────────────────────
+  - id: get-returns-the-row-or-not-found
+    input: {mode: get, name: k8s_pods, scope: shared}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      output:
+        - ok: false
+        - error: {code: not_found, message: "no shared tool k8s_pods", retryable: false}
+
+  - id: a-bad-tool-name-is-invalid-input
+    input: {mode: get, name: "Jira-Search", scope: shared}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: list-filters-by-status
+    input: {mode: list, scope: shared, status: disabled}
+    mocks:
+      - {step_name: list-shared-tools, _: [{key: "tool:k8s_pods", topic: tool}]}
+      - {step_name: read-tool-row, _: *pods_enabled}
+    expect:
+      output:
+        - ok: true
+        - data: {tools: []}
+
+  - id: list-both-scopes-lets-an-agent-row-shadow-a-shared-one
+    input: {mode: list, scope: both, agent_id: ops-assistant}
+    mocks:
+      - {step_name: list-shared-tools, _: [{key: "tool:k8s_pods", topic: tool}]}
+      - {step_name: list-agent-tools, _: [{key: "tool:k8s_pods", topic: tool}]}
+      - {step_name: read-tool-row, _: *pods_enabled}
+    expect:
+      assert:
+        - "{{ ok == True and len([t for t in data['tools'] if t.get('origin') != 'builtin']) == 1 }}"
+
+  # ── activity minimum side effects (activity_min_side_effects) ────────────
+  - id: an-activity-tool-below-its-types-minimum-does-not-validate
+    input: {mode: validate, name: db_write, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: db_write, version: 1, scope: shared, status: draft, description: Write to the DB.,
+            parameters: {type: object, properties: {statement: {type: string}}, required: [statement]},
+            binding: {activity: {type: sql.execute, input_template: {connection_string_secret_key: global/DB}, merge_args: true}},
+            policy: {side_effects: read, permission: auto, idempotent: true, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: []}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' and 'activity sql.execute must declare side_effects at least write' in error['message'] }}"
+
+  - id: an-unclassified-allowlisted-activity-must-be-external
+    input: {mode: validate, name: drive_share, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: drive_share, version: 1, scope: shared, status: draft, description: Share a file.,
+            parameters: {type: object, properties: {}},
+            binding: {activity: {type: gdrive.share, input_template: {}}},
+            policy: {side_effects: write, permission: approve, idempotent: false, allow_session_grant: false, limits: {per_turn: 4, per_session: 50}},
+            execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+            result: {max_chars: 8000}, credential: {mode: none}, toolsets: []}
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ 'activity gdrive.share must declare side_effects at least external' in error['message'] }}"
+
+  # A row saved before the rule: every read raises it, and auto becomes approve.
+  - id: a-read-clamps-an-old-row-up-to-its-types-minimum
+    input: {mode: list, scope: shared}
+    mocks:
+      - {step_name: list-shared-tools, _: [{key: "tool:db_write", topic: tool}]}
+      - step_name: read-tool-row
+        _: {schema_version: 1, name: db_write, version: 3, scope: shared, status: enabled, description: Write.,
+            parameters: {type: object, properties: {}}, binding: {activity: {type: sql.execute, input_template: {}}},
+            policy: {side_effects: read, permission: auto, idempotent: true}, toolsets: []}
+    expect:
+      assert:
+        - "{{ [t['policy'] for t in data['tools'] if t['name'] == 'db_write'] == [{'side_effects': 'write', 'permission': 'approve', 'idempotent': True, 'side_effects_raised_from': 'read'}] }}"
+
+  - id: a-get-clamps-too
+    input: {mode: get, name: db_write, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: db_write, version: 3, scope: shared, status: enabled,
+            binding: {activity: {type: sql.execute, input_template: {}}}, policy: {side_effects: none, permission: approve}}
+    expect:
+      assert:
+        - "{{ data['tool']['policy'] == {'side_effects': 'write', 'permission': 'approve', 'side_effects_raised_from': 'none'} }}"
+
+  - id: a-compliant-activity-row-is-read-unchanged
+    input: {mode: get, name: db_read, scope: shared}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, name: db_read, version: 1, scope: shared, status: enabled,
+            binding: {activity: {type: sql.query, input_template: {}}}, policy: {side_effects: external, permission: auto}}
+    expect:
+      assert:
+        - "{{ data['tool']['policy'] == {'side_effects': 'external', 'permission': 'auto'} }}"
+
+  - id: activity-rules-returns-the-allowlist-and-minimums
+    input: {mode: activity_rules}
+    expect:
+      assert:
+        - "{{ ok == True and 'sql.' in data['allowlist'] and data['min_side_effects']['sql.execute'] == 'write' and data['default_min_side_effects'] == 'external' }}"
+
+  # ── toolsets ────────────────────────────────────────────────────────────
+  - id: save-toolset-writes-a-sorted-row
+    input: {mode: save_toolset, scope: shared, toolset: {name: k8s-readonly, description: Read-only k8s, tools: [k8s_pods, k8s_get, k8s_pods], always_offer: [k8s_pods]}}
+    mocks:
+      - {step_name: authorize-toolset-write, _: *allow}
+      - {step_name: write-toolset, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['toolset']['tools'] == ['k8s_get', 'k8s_pods'] and data['toolset']['schema_version'] == 1 }}"
+
+  - id: save-toolset-rejects-bad-names
+    input: {mode: save_toolset, scope: shared, toolset: {name: K8S, tools: []}}
+    mocks:
+      - {step_name: authorize-toolset-write, _: *allow}
+      - {step_name: write-toolset, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: a-non-admin-cannot-save-a-toolset
+    input: {mode: save_toolset, scope: shared, toolset: {name: k8s-readonly, tools: []}}
+    mocks:
+      - {step_name: authorize-toolset-write, _: *deny}
+      - {step_name: write-toolset, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'forbidden' }}"
+
+  - id: members-is-the-union-of-toolset-tools-and-manifest-toolsets
+    input: {mode: members, toolsets: [k8s-readonly, missing]}
+    mocks:
+      - {step_name: list-shared-tools, _: [{key: "tool:k8s_pods", topic: tool}]}
+      - {step_name: list-shared-toolsets, _: [{key: "toolset:k8s-readonly", topic: toolset}]}
+      # Every read returns the same row (one mock per task): k8s_pods, which joins
+      # k8s-readonly through its own `toolsets`, and the toolset row lists k8s_get.
+      - {step_name: read-tool-row, _: *pods_enabled}
+      - {step_name: read-toolset-row, _: {schema_version: 1, name: k8s-readonly, scope: shared, tools: [k8s_get], always_offer: [k8s_pods, gone]}}
+    expect:
+      assert:
+        - "{{ data['toolsets']['k8s-readonly'] == {'found': True, 'members': ['k8s_get', 'k8s_pods'], 'always_offer': ['k8s_pods']} }}"
+        - "{{ data['toolsets']['missing'] == {'found': False, 'members': [], 'always_offer': []} }}"
+        - "{{ [t['name'] for t in data['tools']] == ['k8s_pods'] }}"
+
+  - id: the-harness-builtin-toolset-comes-from-the-catalog
+    input: {mode: members, toolsets: [harness-builtin]}
+    mocks:
+      - {step_name: list-shared-tools, _: []}
+      - {step_name: list-shared-toolsets, _: []}
+    expect:
+      assert:
+        - "{{ data['toolsets']['harness-builtin']['found'] == True and 'knowledge_search' in data['toolsets']['harness-builtin']['members'] }}"
+        - "{{ len(data['tools']) == 6 and all(t['origin'] == 'builtin' and t['status'] == 'enabled' for t in data['tools']) }}"
+
+  - id: a-builtin-wins-over-a-stored-row-of-the-same-name
+    input: {mode: list, scope: shared}
+    mocks:
+      - {step_name: list-shared-tools, _: [{key: "tool:current_time", topic: tool}]}
+      - {step_name: read-tool-row, _: {schema_version: 1, name: current_time, scope: shared, status: enabled, origin: authored}}
+    expect:
+      assert:
+        - "{{ [t['origin'] for t in data['tools'] if t['name'] == 'current_time'] == ['builtin'] }}"

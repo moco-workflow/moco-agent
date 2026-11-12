@@ -1,0 +1,198 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-SCHEDULES — installs the harness's offline jobs as platform schedules (§6.16)
+# ================================================================================
+#
+#   mode      in      out (envelope)
+#   ───────── ─────── ───────────────────────────────────────────────────────────
+#   install   -       {namespace, jobs: [{job, schedule_id, action, error}]}
+#   status    -       {namespace, schedules: [{job, schedule_id, paused, spec, next_fire_times}]}
+#
+# moco has schedules (P13): each job below is one, named `agent-harness.<job>` in the
+# namespace that owns the agent-harness package (read from the deploy DB, as
+# namespace-admin does), running its package-qualified wfspec by name (the jobs
+# live in several agent-harness-* packages, plan-00 §4). A schedule fires
+# whether or not any harness workflow is alive, and each fire runs the job version
+# deployed at that moment -- no entity, no timer, no state row (this replaced the
+# agent-scheduler entity, 2026-10-15).
+#
+# INSTALL is idempotent and keeps operator choices: each job is created with
+# `if_exists: keep` (paused when the table marks it off by default), and a schedule
+# that already existed is then updated WITHOUT `paused`, so a redeploy picks up a new
+# interval / wfspec / input but never re-enables a job an admin paused, nor pauses one
+# they resumed. Pausing, "run now" and history are the platform's (moco UI Schedules,
+# `moco schedule`).
+#
+# AUTHORITY: the caller. Schedules run as their creator, so seed-tools calls this at
+# deploy as the deploying admin -- the identity the janitor's agent-tier pause and
+# memory-promote's proposals need. builtin.schedule.* checks the caller may write the namespace and run the
+# wfspecs; a refusal is a per-job error here, never a raise.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-schedules
+
+context:
+  package_name: agent-harness
+  # job -> {wfspec, spec, enabled, input}; wfspec is package-qualified. Deployment-wide, so it lives here and not
+  # in agent-harness-defaults (per-agent config). `spec` is a schedule spec: cron or
+  # every_sec (moco-core docs/scheduler.md). `enabled` is the state a NEW schedule is
+  # created in; after that the platform's paused flag is the truth.
+  jobs:
+    janitor: {wfspec: agent-harness-ops/agent-janitor, spec: {every_sec: 3600}, enabled: true, input: {}}
+    tool_stats: {wfspec: agent-harness-tools/tool-stats-rollup, spec: {every_sec: 3600}, enabled: true, input: {}}
+    # Hourly CHECK; each source's own refresh.every_hours decides when it re-indexes.
+    knowledge_refresh: {wfspec: agent-harness-knowledge/knowledge-refresh, spec: {every_sec: 3600}, enabled: true, input: {}}
+    # Daily: proposals only -- nothing reaches the agent scope until an admin approves.
+    memory_promote: {wfspec: agent-harness-memory/memory-promote-all, spec: {every_sec: 86400}, enabled: true, input: {}}
+    # Hourly CHECK; each provider's own sync.every_hours decides when it re-lists.
+    tool_provider_sync: {wfspec: agent-harness-tools/tool-provider-sync, spec: {every_sec: 3600}, enabled: true, input: {}}
+    # Off by default: resume it for a self-hosted classifier that unloads when idle.
+    keep_warm: {wfspec: agent-harness-ops/keep-warm, spec: {every_sec: 300}, enabled: false, input: {agent_id: skeleton}}
+  namespace_id:
+  requests: []
+  job_results: []
+  created: {}
+  updated: {}
+  listed: {}
+  ok: false
+  data:
+  error:
+
+input:
+  mode: install
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: check-mode
+      set:
+        - valid#: "{{ mode in ['install', 'status'] }}"
+
+    - task_name: reject-mode
+      skip_if: "{{ valid }}"
+      set:
+        - error: "{{ {'code': 'invalid_mode', 'message': 'mode must be install or status, not ' + str(mode), 'retryable': False} }}"
+
+    - task_name: read-namespace
+      skip_if: "{{ not valid }}"
+      activity:
+        type: builtin.deploy.wfspec.get
+        input:
+          wfspec_name: "{{ package_name }}"
+        options:
+          retry_policy: {timeout_sec: 20, max_attempts: 2}
+      on_error: {catch: true}
+      output:
+        set:
+          - namespace_id#: "{{ _.get('namespace_id') if isinstance(_, dict) else None }}"
+
+    - task_name: reject-namespace
+      skip_if: "{{ not valid or bool(namespace_id) }}"
+      set:
+        - error: "{{ {'code': 'namespace_unknown', 'message': 'no deployed package ' + package_name + ': cannot tell which namespace owns the schedules', 'retryable': True} }}"
+
+    # Named, so the specs are unit-tested without the platform.
+    - task_name: build-requests
+      skip_if: "{{ mode != 'install' or error is not None }}"
+      set:
+        - requests: >-
+            {{ [{'job': job,
+                 'schedule_id': namespace_id + '/' + package_name + '.' + job,
+                 'create': {'namespace': namespace_id, 'name': package_name + '.' + job,
+                            'wfspec_name': spec['wfspec'],
+                            'spec': dict(spec['spec'], paused=not spec.get('enabled', True),
+                                         note='agent-harness job ' + job),
+                            'input_data': spec.get('input') or {}, 'if_exists': 'keep'},
+                 'update': {'namespace': namespace_id, 'name': package_name + '.' + job,
+                            'wfspec_name': spec['wfspec'],
+                            'spec': dict(spec['spec']),
+                            'input_data': spec.get('input') or {}}}
+                for job, spec in sorted(jobs.items())] }}
+
+    - task_name: install
+      skip_if: "{{ not requests }}"
+      loop:
+        in: "{{ requests }}"
+        foreach: req
+        do:
+          tasks:
+            - task_name: reset-job
+              set:
+                - created: {}
+                - updated: {}
+
+            - task_name: create-schedule
+              activity:
+                type: builtin.schedule.create
+                input: "{{ req['create'] }}"
+              output:
+                set:
+                  - created: "{{ _ if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - created: "{{ {'action': 'failed', 'error': _['error_message']} }}"
+
+            # Only a schedule that already existed: carry the table's changes, keep `paused`.
+            - task_name: update-schedule
+              skip_if: "{{ created.get('action') != 'kept' }}"
+              activity:
+                type: builtin.schedule.update
+                input: "{{ req['update'] }}"
+              output:
+                set:
+                  - updated: "{{ {'ok': True} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - updated: "{{ {'ok': False, 'error': _['error_message']} }}"
+
+            - task_name: record-job
+              set:
+                - job_results: >-
+                    {{ job_results + [{'job': req['job'], 'schedule_id': req['schedule_id'],
+                        'action': (created.get('action') if created.get('action') != 'kept'
+                                   else 'updated' if updated.get('ok') else 'update_failed'),
+                        'error': created.get('error') or updated.get('error')}] }}
+
+    - task_name: list-schedules
+      skip_if: "{{ mode != 'status' or error is not None }}"
+      activity:
+        type: builtin.schedule.list
+        input:
+          namespace: "{{ namespace_id }}"
+          max_results: 1000
+      on_error:
+        catch: true
+        do:
+          set:
+            - error: "{{ {'code': 'status_failed', 'message': _['error_message'], 'retryable': True} }}"
+      output:
+        set:
+          - listed: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: shape-report
+      set:
+        - _failed: "{{ [r['job'] for r in job_results if r['action'] in ('failed', 'update_failed')] }}"
+        - error: >-
+            {{ error if error is not None else
+               {'code': 'install_failed', 'message': 'jobs not installed: ' + ', '.join(_failed), 'retryable': True}
+                 if _failed else None }}
+        - ok: "{{ error is None }}"
+        - data: >-
+            {{ None if namespace_id is None else
+               {'namespace': namespace_id, 'jobs': job_results} if mode == 'install' else
+               {'namespace': namespace_id,
+                'schedules': [{'job': s['name'][len(package_name) + 1:], 'schedule_id': s['schedule_id'],
+                               'paused': s.get('paused'), 'spec': s.get('spec'),
+                               'next_fire_times': s.get('next_fire_times') or []}
+                              for s in (listed.get('schedules') or [])
+                              if str(s.get('name', '')).startswith(package_name + '.')]} }}

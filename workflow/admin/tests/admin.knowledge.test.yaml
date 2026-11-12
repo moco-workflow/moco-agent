@@ -1,0 +1,31 @@
+test_type: integration-test
+
+# admin.knowledge: scope names, and check_sitemap's candidate order.
+
+wfspec:
+  name: admin.knowledge
+
+test_cases:
+  - id: check-sitemap-tries-the-url-then-sitemap-xml
+    input: {op: check_sitemap, url: "http://docs.example.com/"}
+    mocks:
+      - {step_name: probe-one, _: {is_sitemap: true, entries: 12}}
+    expect:
+      assert:
+        # The mock answers every probe alike: the first candidate wins.
+        - "{{ ok == True and data['url'] == 'http://docs.example.com/' and data['entries'] == 12 }}"
+        - "{{ len(data['checked']) == 2 and data['checked'][1]['url'] == 'http://docs.example.com/sitemap.xml' }}"
+
+  - id: an-old-ui-scope-name-is-mapped
+    input: {op: get_source, name: moco-docs, scope: global}
+    mocks:
+      - {step_name: op-get, _: {ok: true, data: {source: {name: moco-docs, scope: shared}}, error: null}}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['scope'] == 'shared' }}"
+
+  - id: move-is-not-available-yet
+    input: {op: move_source, name: x}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_available' }}"

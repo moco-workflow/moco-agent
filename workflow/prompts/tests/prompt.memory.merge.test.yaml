@@ -1,0 +1,19 @@
+test_type: integration-test
+
+wfspec:
+  name: prompt.memory.merge
+
+test_cases:
+  - id: notes-are-fenced-with-kind-and-tag-limit
+    input:
+      kind: lesson
+      notes: [{title: "Retry timeout is per attempt", text: "timeout_sec applies per attempt", tags: [retry]}, {title: "timeout per try", text: "each attempt"}]
+      max_tags: 4
+    expect:
+      output:
+        - kind: chat
+        - response_format: {type: json_object}
+      assert:
+        - "{{ 'ONE lesson note' in messages[0]['content'] and 'up to 4 lowercase tags' in messages[0]['content'] }}"
+        - "{{ messages[1]['content'] == '<data>\\n- Retry timeout is per attempt: timeout_sec applies per attempt [retry]\\n- timeout per try: each attempt\\n</data>' }}"
+        - "{{ schema['required'] == ['title', 'text'] }}"

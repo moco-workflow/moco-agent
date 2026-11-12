@@ -1,0 +1,14 @@
+test_type: integration-test
+
+# session-probe: a signal to an entity that does not run fails → alive false. (The
+# alive path needs a running entity: verified on the dev stage, plan-17 §6.)
+
+wfspec:
+  name: session-probe
+
+test_cases:
+  - id: no-entity-means-not-alive
+    input: {agent_id: nobody, owner_user_id: nobody, session_id: no-such-session-xyz}
+    expect:
+      output:
+        - alive: false

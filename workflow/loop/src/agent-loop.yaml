@@ -1,0 +1,996 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-LOOP — run one profile on one request, return the profile contract (§6.8)
+# ================================================================================
+#
+# The harness's inner loop. chat, rag, react and memory are CONFIGURATIONS of this
+# one machine (§6.8.2); there is no strategy field.
+#
+# PHASE 1 (plan-11 steps 2-8): profiles without tools. PHASE 2 (steps 9-15): tools,
+# suspend for approval or a user reply, resume.
+#
+#   start ─┬─ resume ──────────────────────────────▶ resuming ──┬─▶ stepping
+#          │                                                     └─ needs approval again ─▶ done
+#          ├─ retrieval.when: before ─▶ retrieving ─┬─ declined ─────────────────────▶ done (declined)
+#          │                                        ├─ tools ─▶ selecting ─▶ stepping
+#          │                                        └─ no tools ─▶ thinking ─▶ checking ─▶ done
+#          ├─ tools ─▶ selecting ─▶ stepping ─┬─ suspended ─────────────────────────▶ done (needs_approval)
+#          │                                  ├─ steps / time used up ─▶ answering ─▶ checking
+#          │                                  └─ answered ─────────────────────────▶ checking
+#          └─ no tools ─▶ thinking
+#
+#   retrieving  knowledge retrieve over the router's sources (or all / a list, per
+#               the profile), then guard screen_content: every passage neutralised and
+#               fenced, a likely injection replaced. Zero passages with on_empty:
+#               decline → the templated decline_message, and NO model call.
+#   thinking    llm-invoke render_and_chat(profile.loop.model_role, profile.loop.prompt)
+#               over {context_bundle, passages}: prompt.loop or prompt.rag.answer.
+#   selecting   tool-policy resolve over the profile's toolsets (`from_definition` =
+#               config.toolsets; a list is narrowed to config.toolsets), then
+#               tool-selector. No tool offerable → stepping runs as one plain step.
+#   stepping    ONE state holding a sequential loop over the steps left (automatic
+#               state chains cannot revisit a state, P17). Per step:
+#                 think    llm-invoke with the selected openai_tools; no tool_calls →
+#                          the answer
+#                 act      ≤ max_calls_per_step calls, each through tool-executor
+#                          (the rest get a "not run" result); an unknown tool name is
+#                          an error result, not a raise
+#                 observe  every call gets a `tool` message, its content in a <data>
+#                          fence; step += 1
+#               A step that holds an ask_user call suspends on it (kind user_input)
+#               and any call needing approval in that step is dropped with a "not
+#               run" result -- the model asks again after the reply (F20); otherwise
+#               the first call needing approval suspends (kind tool_call) and other
+#               approval calls are dropped the same way. Less than min_step_sec left
+#               before a step → answering.
+#   answering   the forced final call: no tools offered (`tool_choice` must be a
+#               literal, F37, so the tools are omitted instead), forced_final note,
+#               max_tokens ≤ answering_max_tokens. On failure: the last assistant
+#               text, else a fixed message (F14).
+#   resuming    resume {pending_action, decision, feedback, approval_token}: restore
+#               messages, step and the selected tools from pending_action.detail;
+#               re-resolve the policy (a tool's manifest may have changed: the
+#               executor re-validates the call against the CURRENT manifest and its
+#               current permission, so a stricter one applies); then
+#                 approve | approve_session  the held call runs with approval_token
+#                 reject | revise            a declined result (+ the feedback)
+#                 reply (user_input)         the reply is the ask_user result
+#               and stepping continues. A held call that needs approval again
+#               (permission tightened, guard escalated) suspends again.
+#   checking    output_checks (check_output → grounded_p) and the grounding rule:
+#                 passages      grounded = passages > 0 and grounded_p ≥ grounded_min_p
+#                 tool_results  any tool returned ok
+#                 none          false
+#               Below the threshold the answer is kept with a short note, grounded:
+#               false (so it is not curated into memory).
+#
+# ASYNC TOOLS (phase 3, §6.9.9). With `loop.async_tools: true` on the profile, an
+# `execution.mode: async` tool answers async_started + a job_request (tool-executor);
+# the model is told it started, the first job_request is kept (one per turn: later
+# async calls get `unavailable`), and a turn that ends ok ends `async_started`, so the
+# session starts the job (F6). Without the flag such a tool is `unavailable`.
+#
+# pending_action {kind: tool_call|user_input, summary, detail: {call, args_hash,
+# call_version, messages (≤ max_detail_chars, oldest tool results truncated first),
+# step, tools: {selected, openai_tools}, completed_calls}, offer_session_grant,
+# expires_in_sec}. The session stores it through hitl, which assigns the id; hitl
+# resolve builds the approval_token `<id>:<detail.args_hash>`, and on resume the
+# loop checks it against the stored action's id.
+#
+# Contract (§6.8.1). The session treats every profile identically. Expected
+# failures come back as status: error with the code in trace.error -- never raised,
+# so the session can still persist the turn with its apology (§11.2). The budget is
+# enforced by the CALLER, which runs this as a `sync` child with run timeout
+# budget_sec; inside, each model call gets what is left of the budget as its
+# llm-invoke timeout_sec, so a slow model is a clean error, not a killed run. `sources` are the
+# passages the answer cites as [n], or the tool results' sources.
+#
+# Owns no storage (tool-executor writes artifacts). Returns, never performs, anything
+# the Orchestration layer does: pending_action, job_request, and the tool audit
+# records in trace.tool_audit, which the session writes in commit_turn (F33).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-loop
+
+context:
+  # Seeded so the contract is complete on every path.
+  status: error
+  answer: ""
+  sources: []
+  grounded: false
+  grounded_p:
+  pending_action:
+  job_request:
+  handoff:
+  used_memory: []
+  passages: []
+  searched: []
+  all_failed: false
+  # Child results, seeded because their tasks are skipped on some paths.
+  retrieved: {}
+  screened: {}
+  checked: {}
+  usage: {llm_calls: 0, classifier_calls: 0, tool_calls: 0, tokens_in: 0, tokens_out: 0, elapsed_ms: 0}
+  trace: {steps: []}
+  ungrounded_note: "_Note: I could not fully verify this answer against the sources._"
+  # Tools (phase 2).
+  max_calls_per_step: 4
+  min_step_sec: 15
+  answering_max_tokens: 800
+  max_detail_chars: 30000
+  out_of_time_text: "I ran out of time before I could finish this. Please try again, or ask a narrower question."
+  has_tools: false
+  max_steps: 1
+  is_resume: false
+  offerable: []
+  by_name: {}
+  policy: {}
+  selection: {}
+  openai_tools: []
+  selected: []
+  messages: []
+  step: 0
+  tool_audit: []
+  tool_sources: []
+  tool_ok: false
+  turn_tool_counts: {}
+  final: false
+  suspended: false
+  needs_answering: false
+  model_failed: false
+  last_text: ""
+  step_results: []
+  resume_result: {}
+  hook_veto:
+
+input:
+  agent_id:
+  profile: {}
+  query: ""
+  rewritten_query:
+  router: {}
+  context_bundle: {}
+  config: {}
+  resolved_refs: {}
+  resume:
+  budget_sec: 40
+  # Phase 2: for tool-executor (artifacts, audit) and the per-session limits.
+  session_id:
+  turn: 0
+  tool_counts: {}
+
+# The profile contract (§6.8.1), read from the context the states wrote.
+  # {workflow_id, message_id}: the caller asked for progress events (agent-session).
+  progress_to:
+
+output:
+  status: "{{ status }}"
+  answer: "{{ answer }}"
+  sources: "{{ sources }}"
+  grounded: "{{ grounded }}"
+  grounded_p: "{{ grounded_p }}"
+  pending_action: "{{ pending_action }}"
+  job_request: "{{ job_request }}"
+  handoff: "{{ handoff }}"
+  used_memory: "{{ used_memory }}"
+  usage: "{{ dict(usage, tool_calls=len([a for a in tool_audit if isinstance(a, dict) and a.get('status') in ['ok', 'error']])) }}"
+  trace: "{{ dict(trace, tool_audit=tool_audit) if tool_audit else trace }}"
+
+main:
+  task_name: agent-loop
+  state_machine:
+    initial_state: start
+    states:
+
+      - name: start
+        on_enter:
+          task_name: plan-run
+          set:
+            - started_at: "{{ now() }}"
+            - loop_cfg: "{{ (profile or {}).get('loop') or {} }}"
+            - retrieval: "{{ loop_cfg.get('retrieval') or {} }}"
+            - model_role#: "{{ loop_cfg.get('model_role') or 'inference' }}"
+            - prompt_name: "{{ loop_cfg.get('prompt') or 'loop' }}"
+            - search_query: "{{ str(rewritten_query or query or '') }}"
+            - used_memory: "{{ list((context_bundle or {}).get('used_memory') or []) }}"
+            - do_retrieve: "{{ retrieval.get('when') == 'before' }}"
+            - tools_cfg: "{{ loop_cfg.get('tools') or {} }}"
+            - has_tools#: "{{ bool(tools_cfg) }}"
+            - max_steps: "{{ max(1, int(loop_cfg.get('max_steps') or 1)) if has_tools else 1 }}"
+            - is_resume#: "{{ isinstance(resume, dict) and isinstance(resume.get('pending_action'), dict) }}"
+            - wanted_toolsets: >-
+                {{ (lambda spec, mine: list(mine) if spec in [None, 'from_definition'] else [t for t in spec if t in mine])(
+                     tools_cfg.get('toolsets'), list((config or {}).get('toolsets') or [])) if has_tools else [] }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # RETRIEVING — passages, screened; or a decline with no model call.
+      # ════════════════════════════════════════════════════════════════════
+      - name: retrieving
+        on_enter:
+          tasks:
+            - task_name: pick-sources
+              set:
+                - _spec: "{{ retrieval.get('sources') or 'from_router' }}"
+                - wanted: >-
+                    {{ list((router or {}).get('sources') or []) if _spec == 'from_router' else
+                       list(((config or {}).get('knowledge') or {}).get('sources') or []) if _spec == 'all' else
+                       list(_spec) if isinstance(_spec, list) else [] }}
+                # The progress channel (§11.4): best-effort, never read.
+                - progress#: "{{ {'stage': 'searching', 'sources': wanted} }}"
+
+            - task_name: send-progress-searching
+              skip_if: "{{ not progress_to }}"
+              emit_event:
+                target_workflow_id: "{{ progress_to['workflow_id'] }}"
+                topic: agent-session
+                event_type: agent_answer
+                data:
+                  message_id: "{{ progress_to['message_id'] }}"
+                  kind: progress
+                  progress: "{{ progress }}"
+              on_error: {catch: true}
+
+            - task_name: retrieve-passages
+              skip_if: "{{ not wanted }}"
+              workflow:
+                ref: agent-harness-knowledge/knowledge
+                mode: inline
+                input:
+                  mode: retrieve
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  sources: "{{ wanted }}"
+                  query: "{{ search_query }}"
+                  budget_sec: "{{ max(1, int(budget_sec) - int((now() - started_at).total_seconds())) }}"
+              output:
+                set:
+                  - retrieved: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: screen-passages
+              skip_if: "{{ not wanted or not (retrieved.get('passages') or []) }}"
+              workflow:
+                ref: guard
+                mode: inline
+                input:
+                  mode: screen_content
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  items: "{{ retrieved.get('passages') or [] }}"
+                  source: passage
+              output:
+                set:
+                  - screened: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: decide-retrieval
+              set:
+                - passages: "{{ (screened.get('items') or []) if (wanted and (retrieved.get('passages') or [])) else [] }}"
+                - searched: "{{ (retrieved.get('searched') or []) if wanted else [] }}"
+                - declined#: "{{ not passages and retrieval.get('on_empty', 'decline') == 'decline' }}"
+                # Every searched source FAILED (not merely empty): say so instead of "not
+                # found", and keep the error so the session can tell setup from outage (F70).
+                - all_failed: >-
+                    {{ bool(wanted) and not passages and bool(searched)
+                       and set(searched) <= set((retrieved.get('failed') or [])) }}
+                - _catalog: "{{ ', '.join(((config or {}).get('knowledge') or {}).get('sources') or []) or 'no indexed sources' }}"
+                - _claude: "{{ ' You can also ask /claude, which can search the web.' if 'claude' in ((config or {}).get('profiles') or []) else '' }}"
+                - status: "{{ 'declined' if declined else status }}"
+                - answer: >-
+                    {{ (str(loop_cfg.get('unavailable_message') or "I couldn't search {searched} right now. Please try again later.")
+                         .replace('{searched}', ', '.join(searched)) if all_failed
+                        else str(loop_cfg.get('decline_message') or "I couldn't find that in {searched}.")
+                         .replace('{searched}', ', '.join(searched) or 'the sources')
+                         .replace('{catalog}', _catalog) + _claude) if declined else answer }}
+                - usage: >-
+                    {{ dict(usage, classifier_calls=usage['classifier_calls']
+                                   + (len(retrieved.get('passages') or []) if wanted and not screened.get('degraded', True) else 0)) }}
+                - trace: >-
+                    {{ dict(trace, steps=trace['steps'] + [{'state': 'retrieving', 'searched': searched,
+                         'failed': (retrieved.get('failed') or []) if wanted else [],
+                         'passages': len(passages),
+                         'replaced': [p.get('n') for p in passages if p.get('action') == 'replace'],
+                         'screening_degraded': bool(screened.get('degraded')) if passages else None}],
+                         error=({'code': 'retrieval_failed', 'role': 'embedding',
+                                 'message': '; '.join(str(v) for v in (retrieved.get('errors') or {}).values())[:500]}
+                                if all_failed else trace.get('error'))) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # THINKING — one model call over the bundle (and passages).
+      # ════════════════════════════════════════════════════════════════════
+      - name: thinking
+        on_enter:
+          tasks:
+            - task_name: note-thinking
+              set:
+                - progress#: "{{ {'stage': 'thinking'} }}"
+
+            - task_name: send-progress-thinking
+              skip_if: "{{ not progress_to }}"
+              emit_event:
+                target_workflow_id: "{{ progress_to['workflow_id'] }}"
+                topic: agent-session
+                event_type: agent_answer
+                data:
+                  message_id: "{{ progress_to['message_id'] }}"
+                  kind: progress
+                  progress: "{{ progress }}"
+              on_error: {catch: true}
+
+            - task_name: invoke-model
+              workflow:
+                ref: agent-harness-foundation/llm-invoke
+                mode: inline
+                input:
+                  mode: render_and_chat
+                  agent_id: "{{ agent_id }}"
+                  role: "{{ model_role }}"
+                  models: "{{ (config or {}).get('models') or {} }}"
+                  prompt: "{{ prompt_name }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  timeout_sec: "{{ max(1, int(budget_sec) - int((now() - started_at).total_seconds())) }}"
+                  variables:
+                    context_bundle: "{{ context_bundle or {} }}"
+                    passages: "{{ [{'n': p.get('n'), 'text': p.get('text'), 'title': p.get('title'), 'url': p.get('url'), 'source': p.get('source')} for p in passages] }}"
+                    messages: []
+                    tools_offered: false
+              output:
+                set:
+                  - llm_result: "{{ _ or {} }}"
+              # llm-invoke RAISES for a role with no model configured: that is a setup
+              # error the session answers with its setup text (F70), not a crash.
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - llm_result: >-
+                        {{ {'ok': False, 'data': None, 'error': {'code': 'unconfigured' if 'has no model configured' in str(_.get('error_message')) else 'provider_error',
+                                                                  'message': str(_.get('error_message'))[:500], 'role': model_role, 'retryable': False}} }}
+
+            - task_name: read-model-result
+              set:
+                - _ok: "{{ llm_result.get('ok') == True }}"
+                - _data: "{{ (llm_result.get('data') or {}) if _ok else {} }}"
+                - _usage: "{{ _data.get('usage') or {} }}"
+                - status#: "{{ 'ok' if _ok else 'error' }}"
+                - answer: "{{ _data.get('content') or '' }}"
+                - usage: >-
+                    {{ dict(usage, llm_calls=usage['llm_calls'] + int(_usage.get('calls') or 1),
+                            tokens_in=usage['tokens_in'] + int(_usage.get('tokens_in') or 0),
+                            tokens_out=usage['tokens_out'] + int(_usage.get('tokens_out') or 0)) }}
+                - trace: >-
+                    {{ dict(trace,
+                            steps=trace['steps'] + [{'state': 'thinking', 'role': model_role, 'prompt': prompt_name,
+                                                     'model': _data.get('model'), 'elapsed_ms': _data.get('elapsed_ms')}],
+                            error=(None if _ok else (llm_result.get('error') or {'code': 'provider_error', 'message': 'no result'}))) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # CHECKING — output checks and the grounding rule.
+      # ════════════════════════════════════════════════════════════════════
+      - name: checking
+        on_enter:
+          tasks:
+            # guard.<name> extensions in output_checks → guard run_checks (which runs
+            # check_output too); otherwise the built-in check alone.
+            - task_name: run-output-checks
+              skip_if: "{{ status != 'ok' or not any(str(c).startswith('guard.') for c in (loop_cfg.get('output_checks') or [])) }}"
+              workflow:
+                ref: guard
+                mode: inline
+                input:
+                  mode: run_checks
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  checks: "{{ loop_cfg.get('output_checks') or [] }}"
+                  question: "{{ search_query }}"
+                  answer: "{{ answer }}"
+                  passages: "{{ [{'n': p.get('n'), 'text': p.get('text')} for p in passages] }}"
+              output:
+                set:
+                  - checked: "{{ ((_ or {}).get('data') or {}) }}"
+                  - answer: "{{ ((_ or {}).get('data') or {}).get('answer', answer) }}"
+
+            - task_name: check-output
+              skip_if: >-
+                {{ status != 'ok' or 'check_output' not in (loop_cfg.get('output_checks') or [])
+                   or any(str(c).startswith('guard.') for c in (loop_cfg.get('output_checks') or [])) }}
+              workflow:
+                ref: guard
+                mode: inline
+                input:
+                  mode: check_output
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  question: "{{ search_query }}"
+                  answer: "{{ answer }}"
+                  passages: "{{ [{'n': p.get('n'), 'text': p.get('text')} for p in passages] }}"
+              output:
+                set:
+                  - checked: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: apply-grounding
+              set:
+                - _grounding: "{{ loop_cfg.get('grounding') or 'none' }}"
+                - grounded_p: "{{ checked.get('grounded_p') if status == 'ok' and 'check_output' in (loop_cfg.get('output_checks') or []) else None }}"
+                - _min_p: "{{ (((config or {}).get('decisions') or {}).get('guard') or {}).get('grounded_min_p') }}"
+                - grounded#: >-
+                    {{ (status == 'ok' and _grounding == 'passages' and len(passages) > 0
+                        and grounded_p is not None and _min_p is not None and grounded_p >= _min_p)
+                       or (status == 'ok' and _grounding == 'tool_results' and tool_ok) }}
+                # Kept, with a note, when a passages answer could be checked and fell short.
+                - answer: >-
+                    {{ (answer + '\n\n' + ungrounded_note)
+                       if status == 'ok' and _grounding == 'passages' and grounded_p is not None
+                          and _min_p is not None and grounded_p < _min_p else answer }}
+                # The passages the answer cites as [n], in citation order.
+                - _cited: "{{ sorted(set(int(n) for n in re.findall(r'\\[(\\d{1,3})\\]', answer or ''))) }}"
+                - sources: >-
+                    {{ [] if status != 'ok' else
+                       list({json.dumps(t, sort_keys=True, default=str): t for t in tool_sources if isinstance(t, dict)}.values())
+                         if _grounding == 'tool_results' else
+                       [{'title': p.get('title'), 'url': p.get('url'), 'source': p.get('source'), 'n': p.get('n')}
+                        for n in _cited for p in passages if p.get('n') == n and p.get('action') != 'replace'] }}
+                - usage: "{{ dict(usage, classifier_calls=usage['classifier_calls'] + (1 if checked.get('decided_by') == 'system_one' else 0), elapsed_ms=int((now() - started_at).total_seconds() * 1000)) }}"
+                # An async tool started a job (§6.9.9): the session starts it in finalizing.
+                - status: "{{ 'async_started' if status == 'ok' and isinstance(job_request, dict) else status }}"
+                - trace: >-
+                    {{ dict(trace, steps=trace['steps'] + [{'state': 'checking', 'grounded_p': grounded_p,
+                         'answered_p': checked.get('answered_p'), 'check_degraded': checked.get('degraded'),
+                         'cited': _cited, 'verdicts': checked.get('verdicts') or None}]) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # SELECTING — which tools this request is offered (phase 2).
+      # ════════════════════════════════════════════════════════════════════
+      - name: selecting
+        on_enter:
+          tasks:
+            - task_name: resolve-tools
+              skip_if: "{{ not wanted_toolsets }}"
+              workflow:
+                ref: agent-harness-tools/tool-policy
+                mode: inline
+                input:
+                  mode: resolve
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  toolsets: "{{ wanted_toolsets }}"
+                  session_id: "{{ session_id }}"
+              output:
+                set:
+                  - policy: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: select-tools
+              skip_if: "{{ not (policy.get('offerable') or []) }}"
+              workflow:
+                ref: agent-harness-tools/tool-selector
+                mode: inline
+                input:
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  rewritten_query: "{{ search_query }}"
+                  tags: "{{ list((router or {}).get('tags') or []) }}"
+                  offerable: "{{ policy.get('offerable') or [] }}"
+                  always_offer: "{{ policy.get('always_offer') or [] }}"
+                  max_selected: "{{ int(tools_cfg.get('max_selected') or 6) }}"
+              output:
+                set:
+                  - selection: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: read-selection
+              set:
+                - offerable: "{{ policy.get('offerable') or [] }}"
+                - by_name: "{{ {t.get('name'): t for t in offerable} }}"
+                - selected#: "{{ list(selection.get('selected') or []) }}"
+                - openai_tools: "{{ list(selection.get('openai_tools') or []) }}"
+                # A tool that needs the user's secret is not offered; the model is told,
+                # so it can say how to enable it instead of failing mid-loop (§6.9.7).
+                - messages: >-
+                    {{ ([{'role': 'system',
+                          'content': 'Some tools are not available until the user sets them up: '
+                                     + '; '.join(str(n.get('name')) + ' (' + str(n.get('connect_hint')) + ')'
+                                                 for n in (policy.get('needs_credential') or []))
+                                     + '. Tell the user how, if one of them is what they need.'}]
+                        if policy.get('needs_credential') else []) }}
+                - usage: "{{ dict(usage, classifier_calls=usage['classifier_calls'] + (1 if selection.get('decided_by') == 'system_one' else 0)) }}"
+                - trace: >-
+                    {{ dict(trace, steps=trace['steps'] + [{'state': 'selecting', 'toolsets': wanted_toolsets,
+                         'offerable': [t.get('name') for t in offerable],
+                         'needs_credential': [n.get('name') for n in (policy.get('needs_credential') or [])],
+                         'hidden': policy.get('hidden') or [], 'selected': selected,
+                         'decided_by': selection.get('decided_by')}]) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # STEPPING — think / act / observe, one loop iteration per step (P17).
+      # ════════════════════════════════════════════════════════════════════
+      - name: stepping
+        on_enter:
+          tasks:
+            - task_name: step-loop
+              loop:
+                in: "{{ list(range(max(0, max_steps - step))) }}"
+                foreach: k
+                do:
+                  tasks:
+                    - task_name: gate-step
+                      set:
+                        - time_short#: "{{ int(budget_sec) - (now() - started_at).total_seconds() < min_step_sec }}"
+                        - needs_answering: "{{ time_short }}"
+
+                    - task_name: stop-when-time-is-short
+                      raise:
+                        if: "{{ time_short }}"
+                        type: break
+
+                    - task_name: think-step
+                      workflow:
+                        ref: agent-harness-foundation/llm-invoke
+                        mode: inline
+                        input:
+                          mode: render_and_chat
+                          agent_id: "{{ agent_id }}"
+                          role: "{{ model_role }}"
+                          models: "{{ (config or {}).get('models') or {} }}"
+                          prompt: "{{ prompt_name }}"
+                          resolved_refs: "{{ resolved_refs }}"
+                          timeout_sec: "{{ max(1, int(budget_sec) - int((now() - started_at).total_seconds())) }}"
+                          tools: "{{ openai_tools or None }}"
+                          variables:
+                            context_bundle: "{{ context_bundle or {} }}"
+                            passages: "{{ [{'n': p.get('n'), 'text': p.get('text'), 'title': p.get('title'), 'url': p.get('url'), 'source': p.get('source')} for p in passages] }}"
+                            messages: "{{ messages }}"
+                            tools_offered: "{{ bool(openai_tools) }}"
+                      output:
+                        set:
+                          - llm_result: "{{ _ or {} }}"
+                      on_error:
+                        catch: true
+                        do:
+                          set:
+                            - llm_result: >-
+                                {{ {'ok': False, 'data': None, 'error': {'code': 'unconfigured' if 'has no model configured' in str(_.get('error_message')) else 'provider_error',
+                                                                          'message': str(_.get('error_message'))[:500], 'role': model_role, 'retryable': False}} }}
+
+                    - task_name: read-step
+                      set:
+                        - _ok: "{{ llm_result.get('ok') == True }}"
+                        - _data: "{{ (llm_result.get('data') or {}) if _ok else {} }}"
+                        - _usage: "{{ _data.get('usage') or {} }}"
+                        - _content: "{{ str(_data.get('content') or '') }}"
+                        - step_calls#: >-
+                            {{ [{'id': str(c.get('id') or ('call_' + str(step) + '_' + str(i))),
+                                 'name': str(((c.get('function') or {}).get('name')) if isinstance(c.get('function'), dict) else (c.get('name') or '')),
+                                 'arguments': ((c.get('function') or {}).get('arguments')) if isinstance(c.get('function'), dict) else c.get('arguments')}
+                                for i, c in enumerate(_data.get('tool_calls') or []) if isinstance(c, dict)] }}
+                        - final: "{{ not _ok or not step_calls }}"
+                        - model_failed: "{{ not _ok }}"
+                        - status: "{{ 'ok' if _ok else 'error' }}"
+                        - answer: "{{ _content if _ok and not step_calls else answer }}"
+                        - last_text: "{{ _content or last_text }}"
+                        - step_results: []
+                        - messages: >-
+                            {{ messages + ([{'role': 'assistant', 'content': _content or None,
+                                             'tool_calls': [{'id': c['id'], 'type': 'function',
+                                                             'function': {'name': c['name'],
+                                                                          'arguments': c['arguments'] if isinstance(c['arguments'], str)
+                                                                                       else json.dumps(c['arguments'] or {})}}
+                                                            for c in step_calls]}]
+                                           if _ok and step_calls else []) }}
+                        - usage: >-
+                            {{ dict(usage, llm_calls=usage['llm_calls'] + int(_usage.get('calls') or 1),
+                                    tokens_in=usage['tokens_in'] + int(_usage.get('tokens_in') or 0),
+                                    tokens_out=usage['tokens_out'] + int(_usage.get('tokens_out') or 0)) }}
+                        - trace: >-
+                            {{ dict(trace,
+                                    steps=trace['steps'] + [{'state': 'thinking', 'step': step, 'role': model_role, 'prompt': prompt_name,
+                                                             'model': _data.get('model'), 'elapsed_ms': _data.get('elapsed_ms'),
+                                                             'tool_calls': [c['name'] for c in step_calls]}],
+                                    error=(trace.get('error') if _ok else (llm_result.get('error') or {'code': 'provider_error', 'message': 'no result'}))) }}
+
+                    - task_name: stop-when-final
+                      raise:
+                        if: "{{ final }}"
+                        type: break
+
+                    - task_name: act-step
+                      loop:
+                        in: "{{ step_calls[:max_calls_per_step] }}"
+                        foreach: tool_call
+                        do:
+                          tasks:
+                            # Hooks (§5.4): tool.before may veto the call (→ denied).
+                            - task_name: hook-tool-before
+                              skip_if: >-
+                                {{ tool_call['name'] not in by_name
+                                   or not any(isinstance(h, dict) and h.get('event') == 'tool.before' for h in ((config or {}).get('hooks') or [])) }}
+                              workflow:
+                                ref: agent-harness-foundation/hook-runner
+                                mode: inline
+                                input:
+                                  hook_event: tool.before
+                                  payload: {call: "{{ tool_call }}", manifest: "{{ {k: by_name[tool_call['name']].get(k) for k in ['name', 'version', 'policy', 'binding']} }}"}
+                                  hooks: "{{ (config or {}).get('hooks') or [] }}"
+                                  agent_id: "{{ agent_id }}"
+                                  session_id: "{{ session_id }}"
+                              output:
+                                set:
+                                  - hook_veto: "{{ str((_ or {}).get('reason') or 'blocked by a hook') if (_ or {}).get('action') == 'block' else None }}"
+                              on_error:
+                                catch: true
+
+                            - task_name: vetoed-call
+                              skip_if: "{{ hook_veto is None }}"
+                              set:
+                                - call_result: >-
+                                    {{ {'status': 'denied', 'sources': [], 'content': 'denied: ' + hook_veto,
+                                        'audit': {'turn': turn, 'tool': tool_call['name'], 'version': by_name[tool_call['name']].get('version'),
+                                                  'call_id': tool_call['id'], 'status': 'denied',
+                                                  'error': {'code': 'hook_blocked', 'message': hook_veto}, 'ts': now().isoformat()}} }}
+
+                            - task_name: note-call
+                              skip_if: "{{ tool_call['name'] not in by_name or hook_veto is not None }}"
+                              set:
+                                - progress#: "{{ {'stage': 'calling', 'tool': tool_call['name'], 'step': step + 1} }}"
+
+                            - task_name: send-progress-calling
+                              skip_if: "{{ not progress_to or tool_call['name'] not in by_name or hook_veto is not None }}"
+                              emit_event:
+                                target_workflow_id: "{{ progress_to['workflow_id'] }}"
+                                topic: agent-session
+                                event_type: agent_answer
+                                data:
+                                  message_id: "{{ progress_to['message_id'] }}"
+                                  kind: progress
+                                  progress: "{{ progress }}"
+                              on_error: {catch: true}
+
+                            - task_name: execute-call
+                              skip_if: "{{ tool_call['name'] not in by_name or hook_veto is not None }}"
+                              workflow:
+                                ref: agent-harness-tools/tool-executor
+                                mode: inline
+                                input:
+                                  mode: call
+                                  agent_id: "{{ agent_id }}"
+                                  config: "{{ config }}"
+                                  resolved_refs: "{{ resolved_refs }}"
+                                  session_id: "{{ session_id }}"
+                                  turn: "{{ turn }}"
+                                  call: "{{ tool_call }}"
+                                  manifest: "{{ by_name[tool_call['name']] }}"
+                                  question: "{{ search_query }}"
+                                  counts: {turn: "{{ turn_tool_counts }}", session: "{{ tool_counts or {} }}"}
+                                  budget_sec: "{{ max(1, int(budget_sec) - int((now() - started_at).total_seconds())) }}"
+                                  # §6.9.9: an async tool may start a job only where the profile allows
+                                  # it, and only one per turn (max_async_jobs, §6.12).
+                                  allow_async: "{{ loop_cfg.get('async_tools') is True and job_request is None }}"
+                              output:
+                                set:
+                                  - call_result: "{{ ((_ or {}).get('data') or {}) }}"
+
+                            - task_name: unknown-call
+                              skip_if: "{{ tool_call['name'] in by_name }}"
+                              set:
+                                - call_result: >-
+                                    {{ {'status': 'error', 'sources': [],
+                                        'content': 'error: unknown_tool: ' + tool_call['name'] + ' is not one of the offered tools: '
+                                                   + ', '.join(selected),
+                                        'audit': {'turn': turn, 'tool': tool_call['name'], 'version': None, 'call_id': tool_call['id'],
+                                                  'status': 'error', 'error': {'code': 'unknown_tool', 'message': 'not offered'},
+                                                  'ts': now().isoformat()}} }}
+
+                            # Hooks (§5.4, phase 3): tool.after may REPLACE an ok call's content
+                            # (redact it) before the model reads it. No block: the call has run.
+                            - task_name: hook-tool-after
+                              skip_if: >-
+                                {{ call_result.get('status') != 'ok'
+                                   or not any(isinstance(h, dict) and h.get('event') == 'tool.after' for h in ((config or {}).get('hooks') or [])) }}
+                              workflow:
+                                ref: agent-harness-foundation/hook-runner
+                                mode: inline
+                                input:
+                                  hook_event: tool.after
+                                  payload: >-
+                                    {{ {'call': tool_call, 'tool': {'name': tool_call['name'], 'version': (by_name.get(tool_call['name']) or {}).get('version')},
+                                        'content': str(call_result.get('content') or '')} }}
+                                  hooks: "{{ (config or {}).get('hooks') or [] }}"
+                                  agent_id: "{{ agent_id }}"
+                                  session_id: "{{ session_id }}"
+                              output:
+                                set:
+                                  - call_result: "{{ dict(call_result, content=str(((_ or {}).get('payload') or {}).get('content') or '')) }}"
+                              on_error:
+                                catch: true
+
+                            - task_name: count-call
+                              set:
+                                - hook_veto:
+                                - turn_tool_counts: >-
+                                    {{ dict(turn_tool_counts, **{tool_call['name']: int(turn_tool_counts.get(tool_call['name']) or 0) + 1})
+                                       if call_result.get('status') in ['ok', 'error'] else turn_tool_counts }}
+                                - step_results: "{{ step_results + [[tool_call, call_result]] }}"
+                                # Recorded at once, so a second async call in this step is refused.
+                                - job_request: >-
+                                    {{ call_result.get('job_request') if job_request is None and call_result.get('status') == 'async_started'
+                                                                         and isinstance(call_result.get('job_request'), dict) else job_request }}
+
+                    - task_name: observe-step
+                      set:
+                        - _statuses: "{{ [r.get('status') for c, r in step_results] }}"
+                        # F20: ask_user wins; otherwise the first call needing approval.
+                        - _held: >-
+                            {{ _statuses.index('needs_input') if 'needs_input' in _statuses else
+                               _statuses.index('needs_approval') if 'needs_approval' in _statuses else None }}
+                        - _tool_msgs: >-
+                            {{ [{'role': 'tool', 'tool_call_id': c['id'],
+                                 'content': ('not run: only one action can wait for the user at a time; '
+                                             'call it again after the user has answered')
+                                            if r.get('status') in ['needs_input', 'needs_approval'] else
+                                            '<data source="tool:' + c['name'] + '">\n' + str(r.get('content') or '') + '\n</data>'}
+                                for i, (c, r) in enumerate(step_results) if i != _held]
+                               + [{'role': 'tool', 'tool_call_id': c['id'],
+                                   'content': 'not run: at most ' + str(max_calls_per_step) + ' tool calls per step; call it again'}
+                                  for c in step_calls[max_calls_per_step:]] }}
+                        - messages: "{{ messages + _tool_msgs }}"
+                        - step: "{{ step + 1 }}"
+                        - tool_audit: "{{ tool_audit + [r.get('audit') for c, r in step_results if r.get('audit')] }}"
+                        - tool_sources: "{{ tool_sources + [s for c, r in step_results if r.get('status') == 'ok' for s in (r.get('sources') or [])] }}"
+                        - tool_ok: "{{ tool_ok or 'ok' in _statuses }}"
+                        # read_artifact joins the offer once a result was truncated.
+                        - openai_tools: >-
+                            {{ openai_tools + ([{'type': 'function',
+                                                 'function': {'name': 'read_artifact',
+                                                              'description': str(by_name['read_artifact'].get('description') or ''),
+                                                              'parameters': by_name['read_artifact'].get('parameters') or {}}}]
+                                               if any(r.get('artifact_ref') for c, r in step_results)
+                                                  and 'read_artifact' in by_name and 'read_artifact' not in selected else []) }}
+                        - selected: >-
+                            {{ selected + (['read_artifact'] if any(r.get('artifact_ref') for c, r in step_results)
+                                                               and 'read_artifact' in by_name and 'read_artifact' not in selected else []) }}
+                        - suspended#: "{{ _held is not None }}"
+                        - _hr: "{{ step_results[_held][1] if _held is not None else {} }}"
+                        - _pend: "{{ _hr.get('pending') or {} }}"
+                        # ≤ max_detail_chars: the oldest tool results are truncated first.
+                        - _sizes: "{{ [len(json.dumps(m, default=str)) for m in messages] }}"
+                        - _tool_idx: "{{ [i for i, m in enumerate(messages) if m.get('role') == 'tool'] }}"
+                        - _save: "{{ [max(0, len(str(messages[i].get('content') or '')) - 200) for i in _tool_idx] }}"
+                        - _cut: >-
+                            {{ next((n for n in range(len(_tool_idx) + 1) if sum(_sizes) - sum(_save[:n]) <= max_detail_chars),
+                                    len(_tool_idx)) if suspended else 0 }}
+                        - _kept_msgs: >-
+                            {{ [dict(m, content=str(m.get('content') or '')[:200] + ' [truncated]') if i in _tool_idx[:_cut] else m
+                                for i, m in enumerate(messages)] if suspended else [] }}
+                        - pending_action: >-
+                            {{ {'kind': _pend.get('kind'),
+                                'summary': _pend.get('summary'),
+                                'detail': dict(_pend.get('detail') or {}, messages=_kept_msgs, step=step,
+                                               tools={'selected': selected, 'openai_tools': openai_tools},
+                                               completed_calls=[r.get('audit') for i, (c, r) in enumerate(step_results)
+                                                                if i != _held and r.get('status') in ['ok', 'error']]),
+                                'offer_session_grant': bool(_pend.get('offer_session_grant')),
+                                'expires_in_sec': int((((config or {}).get('hitl') or {}).get('approval_timeout_sec')) or 86400)}
+                               if suspended else None }}
+                        - status: "{{ 'needs_approval' if suspended else status }}"
+                        - trace: >-
+                            {{ dict(trace, steps=trace['steps'] + [{'state': 'acting', 'step': step - 1,
+                                 'calls': [{'tool': c['name'], 'status': r.get('status')} for c, r in step_results],
+                                 'dropped': [c['name'] for c in step_calls[max_calls_per_step:]],
+                                 'held': step_results[_held][0]['name'] if _held is not None else None}]) }}
+
+                    - task_name: stop-when-suspended
+                      raise:
+                        if: "{{ suspended }}"
+                        type: break
+
+            - task_name: after-steps
+              set:
+                - needs_answering#: "{{ not final and not suspended and not model_failed }}"
+                - usage: "{{ dict(usage, elapsed_ms=int((now() - started_at).total_seconds() * 1000)) }}"
+
+      # ════════════════════════════════════════════════════════════════════
+      # ANSWERING — the forced final call when steps or time ran out (F14, F37).
+      # ════════════════════════════════════════════════════════════════════
+      - name: answering
+        on_enter:
+          tasks:
+            - task_name: invoke-final
+              workflow:
+                ref: agent-harness-foundation/llm-invoke
+                mode: inline
+                input:
+                  mode: render_and_chat
+                  agent_id: "{{ agent_id }}"
+                  role: "{{ model_role }}"
+                  models: "{{ (config or {}).get('models') or {} }}"
+                  prompt: "{{ prompt_name }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  timeout_sec: "{{ max(1, int(budget_sec) - int((now() - started_at).total_seconds())) }}"
+                  max_tokens: "{{ answering_max_tokens }}"
+                  variables:
+                    context_bundle: "{{ context_bundle or {} }}"
+                    passages: []
+                    messages: "{{ messages }}"
+                    tools_offered: false
+                    forced_final: "{{ step }}"
+              output:
+                set:
+                  - final_result: "{{ _ or {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - final_result: {}
+
+            - task_name: read-final
+              set:
+                - _ok: "{{ final_result.get('ok') == True and bool((final_result.get('data') or {}).get('content')) }}"
+                - _usage: "{{ (final_result.get('data') or {}).get('usage') or {} }}"
+                - status: ok
+                - answer: "{{ str(final_result['data']['content']) if _ok else (last_text or out_of_time_text) }}"
+                - usage: >-
+                    {{ dict(usage, llm_calls=usage['llm_calls'] + (1 if final_result else 0),
+                            tokens_in=usage['tokens_in'] + int(_usage.get('tokens_in') or 0),
+                            tokens_out=usage['tokens_out'] + int(_usage.get('tokens_out') or 0)) }}
+                - trace: "{{ dict(trace, steps=trace['steps'] + [{'state': 'answering', 'step': step, 'fallback': not _ok}]) }}"
+
+      # ════════════════════════════════════════════════════════════════════
+      # RESUMING — the user decided on the pending action (phase 2).
+      # ════════════════════════════════════════════════════════════════════
+      - name: resuming
+        on_enter:
+          tasks:
+            - task_name: restore-run
+              set:
+                - held_action: "{{ resume.get('pending_action') or {} }}"
+                - _detail: "{{ held_action.get('detail') or {} }}"
+                - decision#: "{{ str(resume.get('decision') or '') }}"
+                - messages: "{{ list(_detail.get('messages') or []) }}"
+                - step: "{{ int(_detail.get('step') or 0) }}"
+                - selected: "{{ list((_detail.get('tools') or {}).get('selected') or []) }}"
+                - openai_tools: "{{ list((_detail.get('tools') or {}).get('openai_tools') or []) }}"
+                - held_call: "{{ _detail.get('call') or {} }}"
+                - run_held: >-
+                    {{ held_action.get('kind') == 'tool_call' and decision in ['approve', 'approve_session'] }}
+
+            - task_name: resolve-tools-on-resume
+              skip_if: "{{ not wanted_toolsets }}"
+              workflow:
+                ref: agent-harness-tools/tool-policy
+                mode: inline
+                input:
+                  mode: resolve
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  toolsets: "{{ wanted_toolsets }}"
+                  session_id: "{{ session_id }}"
+              output:
+                set:
+                  - policy: "{{ ((_ or {}).get('data') or {}) }}"
+                  - offerable: "{{ ((_ or {}).get('data') or {}).get('offerable') or [] }}"
+                  - by_name: "{{ {t.get('name'): t for t in (((_ or {}).get('data') or {}).get('offerable') or [])} }}"
+
+            - task_name: run-held-call
+              skip_if: "{{ not run_held or held_call.get('name') not in by_name }}"
+              workflow:
+                ref: agent-harness-tools/tool-executor
+                mode: inline
+                input:
+                  mode: call
+                  agent_id: "{{ agent_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  session_id: "{{ session_id }}"
+                  turn: "{{ turn }}"
+                  call: "{{ held_call }}"
+                  manifest: "{{ by_name[held_call.get('name')] }}"
+                  question: "{{ search_query }}"
+                  counts: {turn: {}, session: "{{ tool_counts or {} }}"}
+                  approval_token: "{{ resume.get('approval_token') }}"
+                  approved_pending_id: "{{ held_action.get('id') }}"
+                  budget_sec: "{{ int(budget_sec) }}"
+                  allow_async: "{{ loop_cfg.get('async_tools') is True and job_request is None }}"
+              output:
+                set:
+                  - resume_result: "{{ ((_ or {}).get('data') or {}) }}"
+
+            - task_name: settle-resume
+              set:
+                - _name: "{{ str(held_call.get('name') or '') }}"
+                - _fb: "{{ str(resume.get('feedback') or '').strip() }}"
+                - _rs: "{{ resume_result.get('status') }}"
+                - suspended#: "{{ run_held and _rs in ['needs_approval', 'needs_input'] }}"
+                - _version_changed: >-
+                    {{ run_held and _name in by_name
+                       and by_name[_name].get('version') != (held_action.get('detail') or {}).get('call_version') }}
+                - _content: >-
+                    {{ ('error: unavailable: tool ' + _name + ' is no longer offered') if run_held and _name not in by_name else
+                       ('<data source="tool:' + _name + '">\n' + str(resume_result.get('content') or '') + '\n</data>') if run_held else
+                       ('declined: the user rejected this call.' + ((' Their feedback: ' + _fb) if _fb else '')) if decision == 'reject' else
+                       ('declined: the user asked for changes before it runs: ' + (_fb or '(no details)')) if decision == 'revise' else
+                       ('<data source="user">\n' + _fb + '\n</data>') if held_action.get('kind') == 'user_input' else
+                       'declined: no decision was given.' }}
+                - messages: >-
+                    {{ messages + ([{'role': 'tool', 'tool_call_id': str(held_call.get('id') or ''), 'content': _content}]
+                                   if not suspended else []) }}
+                - tool_audit: "{{ tool_audit + ([resume_result['audit']] if resume_result.get('audit') else []) }}"
+                - tool_sources: "{{ tool_sources + (list(resume_result.get('sources') or []) if _rs == 'ok' else []) }}"
+                - tool_ok: "{{ _rs == 'ok' }}"
+                - job_request: "{{ resume_result.get('job_request') if _rs == 'async_started' and isinstance(resume_result.get('job_request'), dict) else job_request }}"
+                - status: "{{ 'needs_approval' if suspended else 'ok' }}"
+                - pending_action: >-
+                    {{ {'kind': (resume_result.get('pending') or {}).get('kind'),
+                        'summary': (resume_result.get('pending') or {}).get('summary'),
+                        'detail': dict((resume_result.get('pending') or {}).get('detail') or {}, messages=messages, step=step,
+                                       tools={'selected': selected, 'openai_tools': openai_tools}, completed_calls=[]),
+                        'offer_session_grant': bool((resume_result.get('pending') or {}).get('offer_session_grant')),
+                        'expires_in_sec': int((((config or {}).get('hitl') or {}).get('approval_timeout_sec')) or 86400)}
+                       if suspended else None }}
+                - trace: >-
+                    {{ dict(trace, steps=trace['steps'] + [{'state': 'resuming', 'decision': decision, 'kind': held_action.get('kind'),
+                         'tool': _name or None, 'result': _rs, 'version_changed': bool(_version_changed)}]) }}
+
+      - name: done
+        is_terminal: true
+
+    transitions:
+      - from_state: start
+        to_state: resuming
+        trigger: {condition: "{{ is_resume }}"}
+      - from_state: start
+        to_state: retrieving
+        trigger: {condition: "{{ not is_resume and do_retrieve }}"}
+      - from_state: start
+        to_state: selecting
+        trigger: {condition: "{{ not is_resume and not do_retrieve and has_tools }}"}
+      - from_state: start
+        to_state: thinking
+        trigger: {condition: "{{ not is_resume and not do_retrieve and not has_tools }}"}
+      - from_state: retrieving
+        to_state: done
+        trigger:
+          condition: "{{ declined }}"
+          action:
+            task_name: finish-declined
+            set:
+              - usage: "{{ dict(usage, elapsed_ms=int((now() - started_at).total_seconds() * 1000)) }}"
+      - from_state: retrieving
+        to_state: selecting
+        trigger: {condition: "{{ not declined and has_tools }}"}
+      - from_state: retrieving
+        to_state: thinking
+        trigger: {condition: "{{ not declined and not has_tools }}"}
+      - from_state: selecting
+        to_state: stepping
+        trigger: {}
+      - from_state: resuming
+        to_state: done
+        trigger:
+          condition: "{{ suspended }}"
+          action:
+            task_name: finish-resuspended
+            set:
+              - usage: "{{ dict(usage, elapsed_ms=int((now() - started_at).total_seconds() * 1000)) }}"
+      - from_state: resuming
+        to_state: stepping
+        trigger: {condition: "{{ not suspended }}"}
+      - from_state: stepping
+        to_state: done
+        trigger: {condition: "{{ suspended }}"}
+      - from_state: stepping
+        to_state: answering
+        trigger: {condition: "{{ not suspended and needs_answering }}"}
+      - from_state: stepping
+        to_state: checking
+        trigger: {condition: "{{ not suspended and not needs_answering }}"}
+      - from_state: answering
+        to_state: checking
+        trigger: {}
+      - from_state: thinking
+        to_state: checking
+        trigger: {}
+      - from_state: checking
+        to_state: done
+        trigger: {}

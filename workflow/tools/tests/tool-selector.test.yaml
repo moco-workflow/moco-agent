@@ -1,0 +1,145 @@
+test_type: integration-test
+
+# tool-selector (plan-10 step 6, design §6.9.8): pinned tools count toward the max;
+# at or under the max after the pre-filter → no System One call; nothing above the
+# threshold → top 2; the classifier down → pre-filter order. `decide-tools` is
+# mocked as the whole decide call (its envelope), so the "{{ 1 / 0 }}" mock is the
+# sentinel proving System One was NOT asked.
+
+wfspec:
+  name: tool-selector
+
+test_data:
+  pods: &pods {name: k8s_pods, description: "List the pods in a Kubernetes namespace.", tags: [k8s, pods], parameters: {type: object, properties: {namespace: {type: string}}, required: [namespace]}, examples: [{args: {namespace: staging}, note: "pods in staging"}]}
+  deploy: &deploy {name: k8s_deploy, description: "Get a Kubernetes deployment.", tags: [k8s, deployment]}
+  logs: &logs {name: k8s_logs, description: "Read the logs of a pod.", tags: [k8s, logs]}
+  time: &time {name: current_time, description: "The current date and time."}
+  search: &search {name: knowledge_search, description: "Search the documentation."}
+  jira: &jira {name: jira_search, description: "Search Jira issues."}
+  old: &old {name: k8s_pods_v1, description: "List pods (old).", deprecated: true}
+  artifact: &artifact {name: read_artifact, description: "Read more of a truncated result."}
+
+test_cases:
+
+  - id: nothing-offerable-selects-nothing
+    input: {rewritten_query: "list pods", offerable: [], max_selected: 6}
+    mocks:
+      - {step_name: decide-tools, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {selected: [], openai_tools: [], decided_by: none, trace: {pinned: [], prefiltered: [], probabilities: {}}}
+
+  - id: under-the-max-needs-no-system-one-call
+    input: {rewritten_query: "list the pods in staging", offerable: [*pods, *deploy, *time], max_selected: 6}
+    mocks:
+      - {step_name: decide-tools, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['decided_by'] == 'prefilter' and data['selected'][0] == 'k8s_pods' and len(data['selected']) == 3 }}"
+
+  - id: openai-tools-carry-the-parameters-and-the-first-example
+    input: {rewritten_query: "pods", offerable: [*pods], max_selected: 6}
+    expect:
+      assert:
+        - "{{ data['openai_tools'][0]['type'] == 'function' and data['openai_tools'][0]['function']['name'] == 'k8s_pods' }}"
+        - "{{ data['openai_tools'][0]['function']['parameters']['required'] == ['namespace'] }}"
+        - "{{ data['openai_tools'][0]['function']['description'].endswith('Example arguments: {\"namespace\": \"staging\"}') }}"
+
+  - id: pinned-tools-count-toward-the-max
+    input: {rewritten_query: "list pods", offerable: [*time, *pods, *deploy, *logs], always_offer: [current_time], max_selected: 2}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: true, data: {nouls: {k8s_pods: 0.9, k8s_deploy: 0.2, k8s_logs: 0.6}, decided_by: system_one}}
+    expect:
+      assert:
+        - "{{ data['selected'] == ['current_time', 'k8s_pods'] and data['decided_by'] == 'system_one' }}"
+        - "{{ data['trace']['pinned'] == ['current_time'] }}"
+
+  - id: system-one-keeps-the-tools-above-the-threshold-highest-first
+    input: {rewritten_query: "why is my pod crashing", offerable: [*pods, *deploy, *logs, *jira], max_selected: 3}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: true, data: {nouls: {k8s_pods: 0.7, k8s_deploy: 0.3, k8s_logs: 0.95, jira_search: 0.55}}}
+    expect:
+      assert:
+        - "{{ data['selected'] == ['k8s_logs', 'k8s_pods', 'jira_search'] }}"
+        - "{{ data['trace']['probabilities']['k8s_deploy'] == 0.3 }}"
+
+  - id: nothing-above-the-threshold-keeps-the-top-two
+    input: {rewritten_query: "pods logs", offerable: [*pods, *deploy, *logs, *jira], max_selected: 3}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: true, data: {nouls: {k8s_pods: 0.1, k8s_deploy: 0.1, k8s_logs: 0.2, jira_search: 0.1}}}
+    expect:
+      assert:
+        - "{{ data['decided_by'] == 'threshold_fallback' and data['selected'] == ['k8s_logs', 'k8s_pods'] }}"
+
+  - id: the-classifier-down-falls-back-to-prefilter-order
+    input: {rewritten_query: "pods", offerable: [*pods, *deploy, *logs, *jira], max_selected: 2}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: false, error: {code: unavailable, message: down, retryable: true}}
+    expect:
+      assert:
+        - "{{ data['decided_by'] == 'classifier_down' and data['selected'] == ['k8s_pods', 'jira_search'] }}"
+
+  - id: the-threshold-comes-from-config
+    input: {rewritten_query: "x", offerable: [*pods, *deploy, *logs], max_selected: 2, config: {decisions: {tools: {select_min_p: 0.8}}}}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: true, data: {nouls: {k8s_pods: 0.7, k8s_deploy: 0.85, k8s_logs: 0.6}}}
+    expect:
+      assert:
+        - "{{ data['selected'] == ['k8s_deploy'] }}"
+
+  - id: a-recently-used-tool-gets-a-boost
+    input: {rewritten_query: "documentation", offerable: [*search, *time, *jira], max_selected: 1, recent_tool_use: [jira_search]}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: false, error: {code: unavailable, message: down, retryable: true}}
+    expect:
+      assert:
+        - "{{ data['trace']['prefiltered'][0] == 'jira_search' }}"
+
+  - id: deprecated-tools-are-offered-only-when-pinned
+    input: {rewritten_query: "pods", offerable: [*old, *pods], max_selected: 6}
+    expect:
+      assert:
+        - "{{ data['selected'] == ['k8s_pods'] }}"
+
+  - id: a-pinned-deprecated-tool-is-offered
+    input: {rewritten_query: "pods", offerable: [*old, *pods], always_offer: [k8s_pods_v1], max_selected: 6}
+    expect:
+      assert:
+        - "{{ data['selected'] == ['k8s_pods_v1', 'k8s_pods'] }}"
+
+  - id: read-artifact-is-pinned-when-the-turn-has-an-artifact
+    input: {rewritten_query: "pods", offerable: [*pods, *artifact], has_artifact: true, max_selected: 6}
+    expect:
+      assert:
+        - "{{ data['selected'][0] == 'read_artifact' }}"
+
+  - id: the-prefilter-keeps-at-most-ten
+    input:
+      rewritten_query: "x"
+      max_selected: 3
+      offerable:
+        - {name: t_a}
+        - {name: t_b}
+        - {name: t_c}
+        - {name: t_d}
+        - {name: t_e}
+        - {name: t_f}
+        - {name: t_g}
+        - {name: t_h}
+        - {name: t_i}
+        - {name: t_j}
+        - {name: t_k}
+        - {name: t_l}
+    mocks:
+      - step_name: decide-tools
+        _: {ok: true, data: {nouls: {}}}
+    expect:
+      assert:
+        - "{{ len(data['trace']['prefiltered']) == 10 and 't_k' not in data['trace']['prefiltered'] }}"

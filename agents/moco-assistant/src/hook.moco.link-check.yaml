@@ -1,0 +1,68 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# HOOK.MOCO.LINK-CHECK — flag dead links in an answer (answer.ready, plan-18 step 6)
+# ================================================================================
+#
+# The reference agent's hook (design §5.4): on `answer.ready`, HEAD-check up to
+# max_links distinct http(s) links in the answer, in parallel, 3 s each. A link that
+# answers ≥ 400 is listed in a note appended to the answer (patch `answer`, which
+# the allowlist permits). All links fine, or none → continue. A check that cannot
+# run (timeout, DNS, TLS) is not evidence of a dead link, so only a received 4xx/5xx
+# counts. Never blocks; hook-runner bounds it with timeout_sec.
+#
+# Contract: in {hook_event, payload: {answer, sources}, agent_id, session_id},
+# out {action: continue | patch, patch?: {answer}}.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: hook.moco.link-check
+
+context:
+  max_links: 5
+  checks: []
+  action: continue
+  patch: {}
+
+input:
+  hook_event:
+  payload: {}
+  agent_id:
+  session_id:
+
+output:
+  action: "{{ action }}"
+  patch: "{{ patch }}"
+
+main:
+  tasks:
+    - task_name: find-links
+      set:
+        - answer_text: "{{ str((payload or {}).get('answer') or '') }}"
+        - links#: "{{ list(dict.fromkeys(re.findall(r'https?://[^\\s)\\]>\"\\']+', answer_text)))[:max_links] }}"
+
+    - task_name: check-links
+      skip_if: "{{ not links }}"
+      loop:
+        in: "{{ links }}"
+        foreach: link
+        execute_mode: parallel
+        do:
+          task_name: head-link
+          activity:
+            type: http.request
+            input: {method: HEAD, url: "{{ link }}", follow_redirects: true}
+            options:
+              retry_policy: {timeout_sec: 3, max_attempts: 1}
+          on_error:
+            catch: true
+      output:
+        set:
+          - checks: "{{ [(l, r) for l, r in zip(links, _ or [])] }}"
+
+    - task_name: annotate
+      set:
+        - dead#: >-
+            {{ [l for l, r in checks if isinstance(r, dict) and isinstance(r.get('status_code'), int) and r['status_code'] >= 400] }}
+        - action: "{{ 'patch' if dead else 'continue' }}"
+        - patch: >-
+            {{ {'answer': answer_text + '\n\n_Note: these links did not respond: ' + ', '.join(dead) + '_'} if dead else {} }}

@@ -1,0 +1,354 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# JOB-ENTITY — one async job as a detached entity (design §6.12, plan-13)
+# ================================================================================
+#
+# Workflow id `agent-job-<agent_id>-<user_id>-<job_id>`, started by job-manager
+# start (job-signal start_job: start-or-signal, so a retried start never runs a job
+# twice). It is the ONLY live writer of its job row, through job-manager report.
+#
+#   init ──[row queued]──▶ running ──[needs input]──▶ awaiting ──job_reply──▶ running
+#     │                      │                          ├──job_cancel──▶ done (cancelled)
+#     └──[else]──▶ done      └──[finished / refused]──▶ done        └──expired──▶ done (cancelled)
+#
+# THE JOB WFSPEC follows the profile contract (§6.8.1), so a `kind: wfspec` profile
+# can be its own job body: input {agent_id, profile, query, job_input, job_id,
+# session_id, config, resolved_refs, budget_sec, resume}; output {status, answer,
+# sources, artifacts?, pending_action?, progress?}. status ok / declined →
+# completed; needs_approval with a pending_action → awaiting_input (the session
+# opens it as a pending action and the user's reply comes back as job_reply, which
+# re-runs the wfspec with `resume: {pending_action, decision, feedback}`, as a
+# profile is resumed); anything else, a raise, or the run timeout
+# (`limits.job_timeout_sec`, default 3600) → failed. The wfspec may report progress
+# itself (job-manager report, to: running) -- it acts for this entity.
+#
+# A REPORT THE ROW REFUSES (the job was cancelled directly while this entity was
+# thought gone) stops the entity: the row, not this workflow, is the truth.
+#
+# CANCEL arrives as job_cancel. While the wfspec runs, the event waits in the
+# signal buffer (P17): a cancel takes effect at the next wait for input, and a run
+# that finishes first completes the job.
+#
+# Events (topic agent-job)
+#   in   job_start {job_id}                 the start-or-signal (no-op once running)
+#        job_reply {decision, feedback, pending_action}
+#        job_cancel {reason}
+#        ping {}                            liveness probe (the janitor)
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: job-entity
+
+context:
+  default_job_timeout_sec: 3600
+  # How often an awaiting job checks whether its pending action has expired.
+  expiry_check_sec: 3600
+  default_ttl_sec: 86400
+  config: {}
+  profiles: {}
+  resolved_refs: {}
+  cfg_ok: false
+  row: {}
+  start_ok: false
+  run_result: {}
+  outcome:
+  report_ok: false
+  report_result: {}
+  resume_input:
+  pending_action:
+  expires_at: ""
+  overdue: false
+  stop_reason: ""
+  # A job row written before the harness split (0.9.x) names tool-job bare; it
+  # lives in another package now, so a bare name would not resolve here.
+  legacy_wfspecs: {tool-job: agent-harness-tools/tool-job}
+  run_wfspec:
+
+input:
+  agent_id:
+  job_id:
+  session_id:
+  profile:
+  wfspec:
+  job_input: {}
+
+output:
+  job_id: "{{ job_id }}"
+  outcome: "{{ outcome }}"
+  stop_reason: "{{ stop_reason }}"
+
+main:
+  task_name: job-entity
+  state_machine:
+    initial_state: init
+    event_source_topic: agent-job
+
+    states:
+
+      # ════════════════════════════════════════════════════════════════════
+      # INIT — config, the row, and the queued → running report.
+      # ════════════════════════════════════════════════════════════════════
+      - name: init
+        on_enter:
+          tasks:
+            - task_name: load-config
+              workflow:
+                ref: agent-harness-foundation/agent-config
+                mode: inline
+                input: {mode: resolve, agent_id: "{{ agent_id }}"}
+              output:
+                set:
+                  - cfg_ok: "{{ isinstance(_, dict) and _.get('ok') is True }}"
+                  - config: "{{ (_.get('data') or {}).get('config') or {} if isinstance(_, dict) else {} }}"
+                  - profiles: "{{ (_.get('data') or {}).get('profiles') or {} if isinstance(_, dict) else {} }}"
+                  - resolved_refs: "{{ (_.get('data') or {}).get('resolved_refs') or {} if isinstance(_, dict) else {} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - cfg_ok: false
+
+            - task_name: read-row
+              workflow:
+                ref: job-manager
+                mode: inline
+                input: {mode: get, agent_id: "{{ agent_id }}", job_id: "{{ job_id }}"}
+              output:
+                set:
+                  - row: "{{ (((_ or {}).get('data') or {}).get('job')) or {} }}"
+              on_error:
+                catch: true
+
+            - task_name: decide-start
+              set:
+                # Only a queued row starts: anything else is a duplicate start or a
+                # job cancelled before its entity ran.
+                - start_ok#: "{{ row.get('status') == 'queued' and cfg_ok }}"
+                - start_to: "{{ 'running' if start_ok else ('failed' if row.get('status') == 'queued' else None) }}"
+                - stop_reason: "{{ '' if start_ok else ('config_unresolvable' if row.get('status') == 'queued' else 'not_queued:' + str(row.get('status'))) }}"
+
+            - task_name: report-start
+              skip_if: "{{ start_to is None }}"
+              workflow:
+                ref: job-manager
+                mode: inline
+                input:
+                  mode: report
+                  agent_id: "{{ agent_id }}"
+                  job_id: "{{ job_id }}"
+                  session_id: "{{ session_id }}"
+                  to: "{{ start_to }}"
+                  progress: "{{ {'message': 'started'} if start_ok else None }}"
+                  error_info: "{{ None if start_ok else {'code': 'config_unresolvable', 'message': 'cannot resolve the agent config'} }}"
+              output:
+                set:
+                  - start_ok: "{{ start_ok and (_ or {}).get('ok') is True }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - start_ok: false
+
+      # ════════════════════════════════════════════════════════════════════
+      # RUNNING — the job wfspec, then one report of how it ended.
+      # ════════════════════════════════════════════════════════════════════
+      - name: running
+        on_enter:
+          tasks:
+            - task_name: prepare-run
+              set:
+                - job_timeout_sec#: "{{ int(((config.get('limits') or {}).get('job_timeout_sec')) or default_job_timeout_sec) }}"
+                - _ji: "{{ job_input if isinstance(job_input, dict) else {} }}"
+                - job_query: "{{ str(_ji.get('query') or '') }}"
+                - run_wfspec: "{{ legacy_wfspecs.get(str(wfspec), wfspec) }}"
+
+            - task_name: run-job
+              workflow:
+                ref: "{{ run_wfspec }}"
+                mode: sync
+                input:
+                  agent_id: "{{ agent_id }}"
+                  profile: "{{ profiles.get(profile) or {'name': profile} }}"
+                  query: "{{ job_query }}"
+                  job_input: "{{ job_input or {} }}"
+                  job_id: "{{ job_id }}"
+                  session_id: "{{ session_id }}"
+                  config: "{{ config }}"
+                  resolved_refs: "{{ resolved_refs }}"
+                  budget_sec: "{{ max(30, job_timeout_sec - 10) }}"
+                  resume: "{{ resume_input }}"
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ job_timeout_sec }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - run_result: "{{ _ if isinstance(_, dict) else {'status': 'error', 'error': {'code': 'job_failed', 'message': 'the job returned ' + str(_)[:300]}} }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - run_result: "{{ {'status': 'error', 'error': {'code': 'job_failed', 'message': str(_.get('error_message'))[:500]}} }}"
+
+            - task_name: classify-run
+              set:
+                - _status: "{{ run_result.get('status') }}"
+                - _pa: "{{ run_result.get('pending_action') if isinstance(run_result.get('pending_action'), dict) else None }}"
+                - outcome#: >-
+                    {{ 'completed' if _status in ['ok', 'declined'] else
+                       'awaiting_input' if _status == 'needs_approval' and _pa else 'failed' }}
+                - pending_action: "{{ _pa if outcome == 'awaiting_input' else None }}"
+                - _ttl: "{{ int((_pa or {}).get('expires_in_sec') or ((config.get('hitl') or {}).get('approval_timeout_sec')) or default_ttl_sec) }}"
+                - expires_at: "{{ (now() + dt.timedelta(seconds=_ttl)).isoformat() if outcome == 'awaiting_input' else '' }}"
+                - run_error: >-
+                    {{ None if outcome != 'failed' else
+                       (run_result.get('error') if isinstance(run_result.get('error'), dict) else
+                        ((run_result.get('trace') or {}).get('error') if isinstance((run_result.get('trace') or {}).get('error'), dict) else
+                         {'code': 'job_failed', 'message': 'the job ended with status ' + str(_status)})) }}
+                - resume_input:
+
+            - task_name: report-run
+              workflow:
+                ref: job-manager
+                mode: inline
+                input:
+                  mode: report
+                  agent_id: "{{ agent_id }}"
+                  job_id: "{{ job_id }}"
+                  session_id: "{{ session_id }}"
+                  to: "{{ outcome }}"
+                  result: "{{ run_result if outcome == 'completed' else None }}"
+                  error_info: "{{ run_error }}"
+                  pending_action: "{{ dict(pending_action, expires_at=expires_at) if pending_action else None }}"
+              output:
+                set:
+                  - report_result: "{{ _ or {} }}"
+                  - report_ok#: "{{ (_ or {}).get('ok') is True }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - report_ok#: false
+
+            - task_name: note-run-end
+              set:
+                - stop_reason: >-
+                    {{ stop_reason if outcome == 'awaiting_input' and report_ok else
+                       outcome if report_ok else 'report_refused:' + str(((report_result.get('error') or {}).get('code'))) }}
+
+      # ════════════════════════════════════════════════════════════════════
+      # AWAITING — the pending action is the session's to show; wait for the reply.
+      # ════════════════════════════════════════════════════════════════════
+      - name: awaiting
+        timers:
+          - name: expiry
+            timeout_sec: "{{ expiry_check_sec }}"
+            max_timeout_attempts: 10000
+
+      - name: done
+        is_terminal: true
+
+    transitions:
+
+      - from_state: init
+        to_state: running
+        trigger:
+          condition: "{{ start_ok }}"
+
+      - from_state: init
+        to_state: done
+        trigger:
+          condition: "{{ not start_ok }}"
+
+      - from_state: running
+        to_state: awaiting
+        trigger:
+          condition: "{{ outcome == 'awaiting_input' and report_ok }}"
+
+      - from_state: running
+        to_state: done
+        trigger:
+          condition: "{{ not (outcome == 'awaiting_input' and report_ok) }}"
+
+      - from_state: awaiting
+        to_state: running
+        trigger:
+          event_type: job_reply
+          action:
+            task_name: take-reply
+            set:
+              - _d: "{{ event.get('data') or {} }}"
+              - resume_input: >-
+                  {{ {'pending_action': _d.get('pending_action') or pending_action,
+                      'decision': _d.get('decision'), 'feedback': _d.get('feedback')} }}
+
+      - from_state: awaiting
+        to_state: done
+        trigger:
+          event_type: job_cancel
+          action:
+            tasks:
+              - task_name: take-cancel
+                set:
+                  - cancel_reason: "{{ str((event.get('data') or {}).get('reason') or 'cancelled') }}"
+                  - outcome: cancelled
+                  - stop_reason: cancelled
+              - task_name: report-cancelled
+                workflow:
+                  ref: job-manager
+                  mode: inline
+                  input:
+                    mode: report
+                    agent_id: "{{ agent_id }}"
+                    job_id: "{{ job_id }}"
+                    session_id: "{{ session_id }}"
+                    to: cancelled
+                    error_info: {code: cancelled, message: "{{ cancel_reason }}"}
+                on_error:
+                  catch: true
+
+      - from_state: awaiting
+        to_state: done
+        trigger:
+          event_type: sys.timer.expiry
+          condition: >-
+            {{ bool(expires_at) and now().replace(tzinfo=None) > dt.datetime.fromisoformat(expires_at).replace(tzinfo=None) }}
+          action:
+            tasks:
+              - task_name: take-expiry
+                set:
+                  - outcome: cancelled
+                  - stop_reason: expired
+              - task_name: report-expired
+                workflow:
+                  ref: job-manager
+                  mode: inline
+                  input:
+                    mode: report
+                    agent_id: "{{ agent_id }}"
+                    job_id: "{{ job_id }}"
+                    session_id: "{{ session_id }}"
+                    to: cancelled
+                    error_info: {code: expired, message: "nobody answered the job's question in time"}
+                on_error:
+                  catch: true
+
+      # Liveness probe and duplicate starts: internal, the timers run on.
+      - from_state: awaiting
+        to_state:
+        trigger:
+          event_type: ping
+          action:
+            task_name: answer-ping
+            set:
+              - _pinged: true
+
+      - from_state: awaiting
+        to_state:
+        trigger:
+          event_type: job_start
+          action:
+            task_name: ignore-restart
+            set:
+              - _restarted: true

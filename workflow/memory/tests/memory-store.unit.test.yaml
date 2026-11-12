@@ -1,0 +1,45 @@
+test_type: unit-test
+
+# memory-store pick-evictions (plan-07 step 2, design §6.4.4): support counts DISTINCT
+# sessions (three entries from one session count once), pinned items are never
+# evicted, negative feedback lowers support.
+
+wfspec:
+  name: memory-store
+
+test_groups:
+  - step_name: pick-evictions
+    test_cases:
+      - id: many-entries-from-one-session-count-once
+        input:
+          proceed: true
+          check_caps: true
+          mode: enforce_caps
+          sc: user
+          mkey: null
+          now_iso: "2026-10-11T00:00:00"
+          caps: {user: 1, user_episode: 200, agent: 500}
+          cap_rows:
+            - {key: "mem:fact:one-session", status: active, pinned: false, updated_at: "2026-10-10T00:00:00", evidence: [{session_id: s1, turn: 1}, {session_id: s1, turn: 2}, {session_id: s1, turn: 3}]}
+            - {key: "mem:fact:two-sessions", status: active, pinned: false, updated_at: "2026-10-10T00:00:00", evidence: [{session_id: s1}, {session_id: s2}]}
+        expect:
+          assert:
+            - "{{ evicted == ['mem:fact:one-session'] }}"
+
+      - id: pinned-beats-support-and-negative-feedback-lowers-it
+        input:
+          proceed: true
+          check_caps: true
+          mode: enforce_caps
+          sc: user
+          mkey: null
+          now_iso: "2026-10-11T00:00:00"
+          caps: {user: 1, user_episode: 200, agent: 500}
+          cap_rows:
+            - {key: "mem:fact:pinned", status: active, pinned: true, updated_at: "2026-10-10T00:00:00", evidence: []}
+            - {key: "mem:fact:disliked", status: active, pinned: false, negative_feedback: 3, updated_at: "2026-10-10T00:00:00", evidence: [{session_id: s1}, {session_id: s2}]}
+            - {key: "mem:fact:plain", status: active, pinned: false, updated_at: "2026-10-10T00:00:00", evidence: [{session_id: s1}]}
+        expect:
+          assert:
+            # 3 active, cap 1 → two evicted, never the pinned one; weakest first
+            - "{{ evicted == ['mem:fact:disliked', 'mem:fact:plain'] }}"

@@ -1,0 +1,138 @@
+test_type: integration-test
+
+# memory-curator (plan-07 step 4, design §6.4.6 as refined in the curator's header).
+# EXIT CHECK (§19 phase 2): a repeated lesson dedups with NO chat-model call -- the
+# `extract-candidates` mock is the sentinel that it never ran. Also: every gate stop,
+# new and conflicted saves, a duplicate key from extraction, tombstones (forget →
+# not relearned), the classifier down. System One (decide) and every memory-store
+# call are mocked by task name.
+
+wfspec:
+  name: memory-curator
+
+test_data:
+  config: &config
+    memory: {long_term: {enabled: true, kinds: [profile, fact, lesson]}}
+    decisions: {memory: {gate_min_p: 0.5, same_min_p: 0.6, conflict_min_p: 0.6}, guard: {grounded_min_p: 0.5}}
+    access: {admin_user_ids: []}
+  lesson_exchange: &lesson_exchange
+    - {turn: 7, user: "So the retry timeout_sec is per attempt, not total?", assistant: "Yes: timeout_sec applies to each attempt.", grounded_p: 0.9}
+  gate_keep: &gate_keep {ok: true, data: {results: [{ok: true, data: {nouls: {worth_remembering: 0.9, user_stated: 0.2}, choices: {kind: lesson}}}]}}
+  gate_drop: &gate_drop {ok: true, data: {results: [{ok: true, data: {nouls: {worth_remembering: 0.1, user_stated: 0.1}, choices: {kind: fact}}}]}}
+  existing_lesson: &existing_lesson
+    ok: true
+    data:
+      items:
+        - {key: "mem:lesson:retry-timeout-is-per-attempt", kind: lesson, title: "Retry timeout is per attempt", text: "timeout_sec applies to each attempt", tags: [retry, timeout], status: active}
+  no_items: &no_items {ok: true, data: {items: []}}
+  no_tombstones: &no_tombstones {ok: true, data: {hashes: []}}
+
+test_cases:
+
+  # ── the exit check ──────────────────────────────────────────────────────
+  - id: a-repeated-lesson-dedups-with-no-chat-model-call
+    input: {agent_id: ops, session_id: s9, exchanges: *lesson_exchange, trigger: periodic, config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: *gate_keep}
+      - {step_name: list-memory, _: *existing_lesson}
+      - {step_name: list-tombstones, _: *no_tombstones}
+      - {step_name: match-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.92, conflict_0: 0.05}}}]}}}
+      - {step_name: add-evidence, _: {ok: true, data: {item: {key: "mem:lesson:retry-timeout-is-per-attempt"}}}}
+      - {step_name: extract-candidates, _: "{{ 1 / 0 }}"}
+      - {step_name: save-candidate, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {stopped_at: deduped, kept: 1, deduped: ["mem:lesson:retry-timeout-is-per-attempt"], saved: [], conflicted: [], dropped_tombstoned: [], extract_called: false}
+
+  # ── gate ────────────────────────────────────────────────────────────────
+  - id: nothing-worth-remembering-stops-at-the-gate
+    input: {agent_id: ops, session_id: s9, exchanges: *lesson_exchange, config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: *gate_drop}
+      - {step_name: list-memory, _: "{{ 1 / 0 }}"}
+      - {step_name: extract-candidates, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['stopped_at'] == 'gate' and data['kept'] == 0 and data['extract_called'] == False }}"
+
+  - id: an-ungrounded-assistant-claim-is-not-kept
+    input: {agent_id: ops, session_id: s9, exchanges: [{turn: 1, user: "what is x?", assistant: "x is y", grounded_p: 0.2}], config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: *gate_keep}
+      - {step_name: list-memory, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['stopped_at'] == 'gate' }}"
+
+  - id: the-classifier-down-learns-nothing
+    input: {agent_id: ops, session_id: s9, exchanges: *lesson_exchange, config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: {ok: true, data: {results: [{ok: false, error: {code: unavailable}}]}}}
+      - {step_name: extract-candidates, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['stopped_at'] == 'gate' }}"
+
+  - id: long-term-memory-off-does-nothing
+    input: {agent_id: ops, session_id: s9, exchanges: *lesson_exchange, config: {memory: {long_term: {enabled: false}}}}
+    mocks:
+      - {step_name: gate-exchanges, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['stopped_at'] == 'disabled' }}"
+
+  # ── extract + verdict ───────────────────────────────────────────────────
+  - id: a-new-user-stated-preference-is-extracted-and-saved
+    input: {agent_id: ops, session_id: s9, exchanges: [{role: user, content: "I always deploy with helm"}, {role: assistant, content: "Got it."}], config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {worth_remembering: 0.9, user_stated: 0.95}, choices: {kind: profile}}}]}}}
+      - {step_name: list-memory, _: *no_items}
+      - {step_name: list-tombstones, _: *no_tombstones}
+      - {step_name: match-exchanges, _: "{{ 1 / 0 }}"}
+      - {step_name: extract-candidates, _: {ok: true, data: {parsed: {items: [{kind: profile, title: "Deploys with helm", text: "The user deploys with helm.", tags: [helm, deploy]}]}}}}
+      - {step_name: save-candidate, _: {ok: true, data: {item: {key: "mem:profile:deploys-with-helm", status: active}}}}
+    expect:
+      assert:
+        - "{{ data['stopped_at'] == 'written' and data['saved'] == ['mem:profile:deploys-with-helm'] and data['extract_called'] == True }}"
+
+  - id: a-contradiction-is-saved-conflicted
+    input: {agent_id: ops, session_id: s9, exchanges: [{turn: 3, user: "Actually the retry timeout is total, not per attempt", assistant: "Thanks, noted.", grounded_p: 0.1}], config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {worth_remembering: 0.9, user_stated: 0.9}, choices: {kind: lesson}}}]}}}
+      - {step_name: list-memory, _: *existing_lesson}
+      - {step_name: list-tombstones, _: *no_tombstones}
+      - {step_name: match-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.2, conflict_0: 0.85}}}]}}}
+      - {step_name: add-evidence, _: "{{ 1 / 0 }}"}
+      - {step_name: extract-candidates, _: {ok: true, data: {parsed: {items: [{kind: lesson, title: "Retry timeout is total", text: "x", tags: [retry]}]}}}}
+      - {step_name: save-candidate, _: "{{ {'ok': True, 'data': {'item': dict(candidate_item, key='mem:lesson:' + candidate_item['slug'])}} }}"}
+    expect:
+      assert:
+        - "{{ data['conflicted'] == ['mem:lesson:retry-timeout-is-total'] }}"
+
+  - id: forgotten-then-said-again-is-not-relearned
+    input: {agent_id: ops, session_id: s9, exchanges: [{role: user, content: "I deploy with helm"}, {role: assistant, content: "Noted."}], config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {worth_remembering: 0.9, user_stated: 0.95}, choices: {kind: profile}}}]}}}
+      - {step_name: list-memory, _: *no_items}
+      # the hash of "deploys with helm" (memory forget tombstoned it)
+      - {step_name: list-tombstones, _: {ok: true, data: {hashes: ["0f88e957d41d856e05a85d5fe019a2a3"]}}}
+      - {step_name: extract-candidates, _: {ok: true, data: {parsed: {items: [{kind: profile, title: "Deploys with HELM", text: "x"}]}}}}
+      - {step_name: save-candidate, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['saved'] == [] and data['dropped_tombstoned'] == ['Deploys with HELM'] }}"
+
+  - id: an-extracted-candidate-with-an-existing-key-adds-evidence
+    input: {agent_id: ops, session_id: s9, exchanges: [{turn: 4, user: "I use helm for deploys", assistant: "OK", grounded_p: 0.9}], config: *config}
+    mocks:
+      - {step_name: gate-exchanges, _: *gate_keep}
+      - {step_name: list-memory, _: {ok: true, data: {items: [{key: "mem:lesson:deploys-with-helm", kind: lesson, title: "Deploys with helm", tags: [helm], status: active}]}}}
+      - {step_name: list-tombstones, _: *no_tombstones}
+      - {step_name: match-exchanges, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.3, conflict_0: 0.1}}}]}}}
+      - {step_name: extract-candidates, _: {ok: true, data: {parsed: {items: [{kind: lesson, title: "Deploys with helm", text: "x"}]}}}}
+      - {step_name: save-candidate, _: "{{ 1 / 0 }}"}
+      - {step_name: add-evidence-extracted, _: {ok: true, data: {}}}
+    expect:
+      assert:
+        - "{{ data['deduped'] == ['mem:lesson:deploys-with-helm'] and data['saved'] == [] }}"

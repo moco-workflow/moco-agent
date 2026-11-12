@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KEEP-WARM — one tiny System One call so a self-hosted classifier stays loaded
+# ================================================================================
+#
+#   in         out
+#   ────────── ──────────────────────
+#   agent_id   {ok, elapsed_ms, decided_by}
+#
+# A scheduled job (every 5 min), installed PAUSED (§6.16): a local Laya unloads its
+# model when idle, and the next turn's routing then pays the load. One decide over
+# qset.guard.input with a fixed message, with the agent's resolved models, so it
+# warms exactly the endpoint the turns use. Its answer is discarded.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: keep-warm
+
+context:
+  cfg: {}
+  refs: {}
+  result: {}
+
+input:
+  agent_id: skeleton
+
+output:
+  ok: "{{ result.get('ok') == True }}"
+  elapsed_ms: "{{ (result.get('data') or {}).get('elapsed_ms') }}"
+  decided_by: "{{ (result.get('data') or {}).get('decided_by') }}"
+
+main:
+  tasks:
+    - task_name: resolve-config
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - cfg: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+          - refs: "{{ (((_ or {}).get('data') or {}).get('resolved_refs')) or {} }}"
+    - task_name: warm-classifier
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide
+          agent_id: "{{ agent_id }}"
+          qset: guard.input
+          variables: {message: "hello"}
+          resolved_refs: "{{ refs }}"
+          models: "{{ cfg.get('models') or {} }}"
+          fallback: none
+      output:
+        set:
+          - result: "{{ _ or {} }}"
+      on_error:
+        catch: true

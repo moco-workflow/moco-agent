@@ -1,0 +1,31 @@
+test_type: integration-test
+
+# admin.memory (plan-16 phase 2): ops map to memory modes with the resolved config.
+
+wfspec:
+  name: admin.memory
+
+test_cases:
+  - id: list-memory-maps-to-memory-list
+    input: {op: list_memory, agent_id: moco}
+    mocks:
+      - {step_name: resolve-config, _: {ok: true, data: {config: {access: {}}}}}
+      - {step_name: call-memory, _: "{{ {'ok': True, 'data': {'items': [{'key': 'mem:fact:x'}]}} }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {items: [{key: "mem:fact:x"}]}
+
+  - id: forget-memory-maps-to-memory-forget
+    input: {op: forget_memory, agent_id: moco, query: "staging cluster"}
+    mocks:
+      - {step_name: resolve-config, _: {ok: true, data: {config: {}}}}
+      - {step_name: call-memory, _: {ok: true, data: {retired: ["mem:fact:staging"]}}}
+    expect:
+      output:
+        - data: {retired: ["mem:fact:staging"]}
+
+  - id: an-unknown-op-is-a-bug
+    input: {op: wipe_memory, agent_id: moco}
+    expect:
+      error: {error_type: AbortError, error_message: null}

@@ -1,0 +1,60 @@
+test_type: integration-test
+
+# memory-vector (design §6.4.5, P2, phase 3): off → skipped and nothing called; upsert
+# writes `<user>|<key>` documents with {user_id, kind, key} metadata into mem_<agent>;
+# search filters on the caller and keeps the best chunk per key; delete by key; a
+# failing index is ok: false, never a raise. The llama_index activities are mocked.
+
+wfspec:
+  name: memory-vector
+
+test_data:
+  on: &on {memory: {long_term: {vector: {enabled: true, top_k: 5}}}, models: {embedding: {model_name: m, embed_dim: 8}}, knowledge: {pgvector_secret_key: ""}}
+
+test_cases:
+  - id: off-means-skipped-and-no-call
+    input: {mode: upsert, agent_id: ops-assistant, config: {memory: {long_term: {}}}, items: [{key: "mem:fact:a", title: t, text: x}]}
+    mocks:
+      - {step_name: index-texts, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {skipped: true, indexed: [], deleted: [], hits: []}
+
+  - id: upsert-writes-user-keyed-documents-into-the-agent-table
+    input: {mode: upsert, agent_id: ops-assistant, config: *on, items: [{key: "mem:fact:helm", kind: fact, title: "Deploys with helm", text: "uses helm 3", tags: [helm]}, {key: "not-a-key", title: x}]}
+    mocks:
+      - step_name: index-texts
+        _: "{{ {'ok': vectordb['table_name'] == 'mem_ops_assistant' and texts[0]['id'].endswith('|mem:fact:helm') and texts[0]['metadata']['kind'] == 'fact' and len(texts) == 1} }}"
+    expect:
+      assert:
+        - "{{ ok == True and data == {'skipped': False, 'indexed': ['mem:fact:helm']} }}"
+
+  - id: search-keeps-the-best-chunk-per-key-and-only-the-callers
+    input: {mode: search, agent_id: ops, config: *on, query: "how do I deploy"}
+    mocks:
+      - step_name: search-vectors
+        _: >-
+          {{ {'nodes': [{'score': 0.8, 'metadata': {'user_id': uid, 'key': 'mem:fact:helm'}},
+                        {'score': 0.6, 'metadata': {'user_id': uid, 'key': 'mem:fact:helm'}},
+                        {'score': 0.7, 'metadata': {'user_id': uid, 'key': 'mem:lesson:k8s'}},
+                        {'score': 0.99, 'metadata': {'user_id': 'someone-else', 'key': 'mem:fact:secret'}}]} }}
+    expect:
+      assert:
+        - "{{ data['hits'] == [{'key': 'mem:fact:helm', 'score': 0.8}, {'key': 'mem:lesson:k8s', 'score': 0.7}] }}"
+
+  - id: delete-by-key
+    input: {mode: delete, agent_id: ops, config: *on, keys: ["mem:fact:helm"]}
+    mocks:
+      - {step_name: delete-docs, _: "{{ {'ids': doc_ids} }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['deleted'] == ['mem:fact:helm'] }}"
+
+  - id: a-failing-index-is-reported-not-raised
+    input: {mode: search, agent_id: ops, config: *on, query: "q"}
+    mocks:
+      - {step_name: search-vectors, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'search_failed' and data['hits'] == [] }}"

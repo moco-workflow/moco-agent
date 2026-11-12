@@ -1,0 +1,158 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M3 — builtin.state.list_states latency by row count (plan-00a step 8)
+# ================================================================================
+#
+# Decides: the recall caps (§6.4.3, §6.4.5) and whether agent-scope memory must be
+# cached by the session (F16).
+#
+# Seeds `mem:fact:<n>` rows (topic memory) into a SCRATCH, user-scoped namespace up
+# to each size in `sizes`, and after each size times `repeats` list_states calls
+# with the key_pattern recall would use -- once returning all rows (limit = size)
+# and once with limit 50. The namespace is deleted at the end.
+#
+# Writes real rows, but only ever into `agent-harness.measure-*` under the
+# caller's own user id (in_global_ns: false); anything else is refused. Run on the
+# dev stage so the timings include Temporal's activity round trip.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m3-list-states
+
+context:
+  timings: []
+  m3_result: {}
+
+input:
+  sizes: [50, 200, 500, 1000]
+  repeats: 5
+  namespace: agent-harness.measure-m3
+  cleanup: true
+
+output: '{{ m3_result }}'
+
+functions:
+  timed-list:
+    input:
+      namespace:
+      limit:
+    output:
+      ms: "{{ ms }}"
+      returned: "{{ returned }}"
+    main:
+      tasks:
+        - task_name: t0
+          set:
+            - started: "{{ now() }}"
+        - task_name: list
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key_pattern: "mem:fact:*"
+              topic_pattern: memory
+              limit: "{{ limit }}"
+              order_by: last_update_time
+              order_direction: desc
+            options:
+              retry_policy:
+                timeout_sec: 60
+                max_attempts: 1
+          output:
+            set:
+              - returned: "{{ len(_ or []) }}"
+        - task_name: t1
+          set:
+            - ms: "{{ int((now() - started).total_seconds() * 1000) }}"
+
+main:
+  tasks:
+    - task_name: refuse-non-scratch-namespace
+      raise:
+        if: "{{ not str(namespace).startswith('agent-harness.measure-') }}"
+        type: error
+        error_type: AbortError
+        message: "M3 only writes to agent-harness.measure-* namespaces"
+
+    - task_name: plan
+      set:
+        - _sizes: "{{ sorted(int(s) for s in sizes) }}"
+        # Seed each size's new rows, then measure; rows carry over.
+        - steps: >-
+            {{ [{'size': s, 'seed_from': ([0] + _sizes)[i], 'limits': [s, 50] if s > 50 else [s]}
+                for i, s in enumerate(_sizes)] }}
+    - task_name: per-size
+      loop:
+        in: "{{ steps }}"
+        foreach: step
+        do:
+          tasks:
+            - task_name: seed
+              loop:
+                in: "{{ list(range(step['seed_from'], step['size'])) }}"
+                foreach: item
+                execute_mode: parallel
+                join_type: all
+                do:
+                  task_name: seed-row
+                  activity:
+                    type: builtin.state.set_state
+                    input:
+                      in_global_ns: false
+                      namespace: "{{ namespace }}"
+                      key: "{{ 'mem:fact:%05d' % item }}"
+                      topic: memory
+                      value:
+                        schema_version: 1
+                        kind: fact
+                        text: "{{ 'measurement row ' + str(item) + ' about moco retries and timeouts' }}"
+                        tags: [moco, measurement]
+            - task_name: measure
+              loop:
+                in: "{{ [{'size': step['size'], 'limit': l, 'run': r} for l in step['limits'] for r in range(int(repeats))] }}"
+                foreach: item
+                do:
+                  task_name: timed
+                  workflow:
+                    function: timed-list
+                    input:
+                      namespace: "{{ namespace }}"
+                      limit: "{{ item['limit'] }}"
+                  output:
+                    set:
+                      - t: "{{ dict(item, ms=_.get('ms'), returned=_.get('returned'), ok=True) }}"
+                    data:
+                      t: '{{ t }}'
+                  on_error:
+                    catch: true
+                    do:
+                      set:
+                        - t: "{{ dict(item, ms=None, returned=None, ok=False) }}"
+      output:
+        as: timings
+
+    - task_name: drop-scratch-namespace
+      skip_if: '{{ not cleanup }}'
+      activity:
+        type: builtin.state.delete_namespace
+        input:
+          in_global_ns: false
+          namespace: "{{ namespace }}"
+
+    - task_name: summarise
+      set:
+        # per-size: [seed outputs, [ {t: ...}, ... ]]
+        - _rows: >-
+            {{ [m['t'] for step in (timings or []) if isinstance(step, list) and len(step) == 2
+                for m in (step[1] or []) if isinstance(m, dict) and m.get('t')] }}
+        - m3_result:
+            measurement: M3
+            by_size_and_limit: >-
+              {{ [(lambda ms: {'size': s, 'limit': l, 'calls': len(ms),
+                               'p50_ms': ms[len(ms) // 2] if ms else None,
+                               'max_ms': ms[-1] if ms else None,
+                               'returned': ([r['returned'] for r in _rows if r['size'] == s and r['limit'] == l] or [None])[0]})(
+                     sorted(r['ms'] for r in _rows if r['size'] == s and r['limit'] == l and r['ok']))
+                  for s, l in sorted(set((r['size'], r['limit']) for r in _rows))] }}
+            rows: "{{ _rows }}"

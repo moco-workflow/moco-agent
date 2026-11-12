@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.REACT — library profile: a tool-calling loop (§5.3, §6.8.3)
+# ================================================================================
+# Gated by requires.tools: it is never offered until the agent has at least one
+# enabled tool (plan-10, phase 2). Present now so definitions can list it.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.react
+
+context:
+  profile:
+    name: react
+    kind: loop
+    mode: sync
+    route_description: "A request that needs live data or an action through one of the available tools."
+    examples: ["list the pods in the staging namespace", "what is the status of deployment web?"]
+    requires: {tools: true}
+    needs_rewrite: true
+    budget_sec: 90
+    estimated_sec: 30
+    loop:
+      model_role: inference
+      prompt: loop
+      retrieval: {when: none}
+      tools: {toolsets: from_definition, max_selected: 6}
+      max_steps: 6
+      output_checks: []
+      grounding: tool_results
+    wfspec:
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

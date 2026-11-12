@@ -1,0 +1,157 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ACCESS — deterministic authorization (design §6.13, plan-04 step 1)
+# ================================================================================
+#
+#   mode       in                                        data out
+#   ────────── ───────────────────────────────────────── ──────────────────
+#   authorize  action, resource?, scope?, definition_access   {allow, reason}
+#   identify   definition_access                              {role: denied|guest|user|admin}
+#
+# FOUNDATION and pure: no storage, no model, no child workflow. Every owner's write
+# modes call it (agent-config save, memory-store, source-registry, hitl, ...), and
+# so do the router and tool policy for `use_profile` / `call_tool`. It lives below
+# them all, so no owner has to call upward (F5, F24).
+#
+# The caller is never trusted for identity: the user is __user_info__.user_id,
+# read here (§4.3). `definition_access` is the resolved config's `access` section
+# (agent-config resolve), so its defaults live in agent-harness-defaults only.
+#
+#   action       resource                   scope
+#   ──────────── ────────────────────────── ─────────────────────────
+#   chat         —                          —
+#   use_profile  profile name               —
+#   read         —                          user | session | agent | shared
+#   write        —                          user | session | agent | shared
+#   feedback     —                          —
+#   call_tool    {side_effects}             —
+#   admin        —                          —
+#
+# Rules, first match wins -- a deny always beats an allow, so config can tighten
+# but never loosen (§6.13):
+#   denied_user   the user is in denied_user_ids: nothing at all
+#   guest_*       the user is in guest_user_ids (a SHARED identity: every guest signs
+#                 in as one user_id, so a guest write would change every guest's
+#                 data): chat; read; only guest_profiles; call_tool only with
+#                 side_effects none; no write, no feedback, no admin
+#   not_admin     write at agent/shared scope, and admin, need admin_user_ids
+#                 or caller_is_namespace_admin
+#   ok            otherwise
+#
+# ADMINS come from two sources (F48): the `admin_user_ids` list, and the optional
+# boolean `caller_is_namespace_admin`, which agent-config resolve computes for the
+# caller from platform RBAC (namespace-admin) after every tier is merged, so no
+# tier can supply it. Only `is True` counts: absent, null or a string is not an
+# admin, and a config resolved by an older harness authorises as before.
+#
+# An unknown action or scope is a BUG in the caller and raises. A missing
+# `definition_access` list is invalid input (ok: false): failing open on a
+# half-resolved config is exactly what this module exists to prevent.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: access
+
+context:
+  valid_modes: ["authorize", "identify"]
+  valid_actions: ["chat", "use_profile", "read", "write", "feedback", "call_tool", "admin"]
+  valid_scopes: ["user", "session", "agent", "shared"]
+  scoped_actions: ["read", "write"]
+  shared_scopes: ["agent", "shared"]
+  required_lists: ["denied_user_ids", "guest_user_ids", "admin_user_ids", "guest_profiles"]
+  # Seeded so the output is bound on the invalid-input path.
+  ok: false
+  data:
+  error:
+
+input:
+  mode: authorize
+  agent_id:
+  action:
+  resource:
+  scope:
+  definition_access: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "access: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-unknown-action
+      raise:
+        if: "{{ mode == 'authorize' and action not in valid_actions }}"
+        type: error
+        error_type: AbortError
+        message: "access: invalid action '{{ action }}'. Must be one of: {{ ', '.join(valid_actions) }}"
+
+    - task_name: reject-bad-scope
+      raise:
+        if: "{{ mode == 'authorize' and ((action in scoped_actions) != (scope in valid_scopes) or (action not in scoped_actions and scope is not None)) }}"
+        type: error
+        error_type: AbortError
+        message: "access: action '{{ action }}' with scope '{{ scope }}': read/write need one of {{ ', '.join(valid_scopes) }}, other actions none"
+
+    # Identity comes from the platform, never from an input. str() so a missing
+    # user_id is "None", which guest_user_ids lists by default.
+    - task_name: identify-caller
+      set:
+        - uid#: '{{ str(__user_info__.get("user_id")) }}'
+
+    - task_name: check-definition-access
+      set:
+        - _acc: "{{ definition_access if isinstance(definition_access, dict) else {} }}"
+        - _missing: "{{ [k for k in required_lists if not isinstance(_acc.get(k), list)] }}"
+        - valid#: "{{ not _missing }}"
+        - error: >-
+            {{ None if valid else
+               {'code': 'invalid_input',
+                'message': 'definition_access lacks list(s): ' + ', '.join(_missing),
+                'retryable': False} }}
+
+    # THE decision. A named task over `uid`, so every rule is unit-tested without
+    # __user_info__ (tests cannot set it).
+    # The caller's role by the same lists `authorize` uses (deny beats admin). For
+    # profile availability and the router, which must know a guest from a user.
+    - task_name: identify-role
+      skip_if: "{{ not valid or mode != 'identify' }}"
+      set:
+        - _acc: "{{ definition_access }}"
+        - role#: >-
+            {{ 'denied' if uid in [str(u) for u in _acc['denied_user_ids']] else
+               'guest' if uid in [str(u) for u in _acc['guest_user_ids']] else
+               'admin' if uid in [str(u) for u in _acc['admin_user_ids']]
+                          or _acc.get('caller_is_namespace_admin') is True else 'user' }}
+        - ok: true
+        - data: "{{ {'role': role} }}"
+
+    - task_name: decide-access
+      skip_if: "{{ not valid or mode != 'authorize' }}"
+      set:
+        - _acc: "{{ definition_access }}"
+        - _guest: "{{ uid in [str(u) for u in _acc['guest_user_ids']] }}"
+        - _admin: >-
+            {{ (not _guest) and (uid in [str(u) for u in _acc['admin_user_ids']]
+                                 or _acc.get('caller_is_namespace_admin') is True) }}
+        - _effects: "{{ (resource or {}).get('side_effects') if isinstance(resource, dict) else None }}"
+        - reason#: >-
+            {{ 'denied_user' if uid in [str(u) for u in _acc['denied_user_ids']] else
+               ('guest_read_only' if action == 'write' else
+                'guest_no_feedback' if action == 'feedback' else
+                'guest_profile' if action == 'use_profile' and resource not in _acc['guest_profiles'] else
+                'guest_side_effects' if action == 'call_tool' and _effects != 'none' else
+                'not_admin' if action == 'admin' else 'ok') if _guest else
+               'not_admin' if not _admin and (action == 'admin' or (action == 'write' and scope in shared_scopes)) else
+               'ok' }}
+        - ok: true
+        - data: "{{ {'allow': reason == 'ok', 'reason': reason} }}"

@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SOURCE.PGVECTOR — the built-in retriever: one pgvector source (design §6.5.2)
+# ================================================================================
+#
+#   in (retriever contract)              out
+#   ──────────────────────────────────── ────────────────────────────────────────
+#   query, top_k, config, budget_sec     {passages: [{text, title, url, score,
+#                                                     metadata}]}
+#   config = {table_name, embed_model_info, pgvector_secret_key?}
+#   (an empty pgvector_secret_key means the worker's MOCO_PGVECTOR_CONN)
+#
+# Ported from the old agent's rag-domain-query. `knowledge retrieve` runs one of
+# these per source as a `sync` child with on_error, so a source with a dropped table
+# or a dead embedding endpoint fails alone (§4.3: sync is for failure isolation and
+# its own timeout); a failure here simply raises.
+#
+# The embedding model MUST be the one the table was indexed with, which is why the
+# source row carries embed_model_info. Passages are sorted by score here, where
+# scores are comparable (one table, one model); `knowledge retrieve` interleaves
+# sources round-robin instead of sorting across them. Secrets by name only (P11).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: source.pgvector
+
+input:
+  query: ""
+  top_k: 4
+  config: {}
+  budget_sec: 10
+
+context:
+  passages: []
+
+output:
+  passages: "{{ passages }}"
+
+main:
+  tasks:
+    - task_name: reject-misconfigured-source
+      raise:
+        if: "{{ not ((config or {}).get('table_name') and (config or {}).get('embed_model_info')) }}"
+        type: error
+        error_type: AbortError
+        message: "source.pgvector: config needs table_name and embed_model_info"
+
+    - task_name: query-table
+      activity:
+        type: llama_index.query
+        input:
+          query: "{{ query }}"
+          vectordb_info:
+            connection_string_secret_key: "{{ config.get('pgvector_secret_key') }}"
+            table_name: "{{ config['table_name'] }}"
+          embed_model_info: "{{ config['embed_model_info'] }}"
+          top_k: "{{ int(top_k) }}"
+          response_mode: retrieve
+        options:
+          # A backstop: the caller's sync run timeout, min(10 s, budget), is the bound.
+          retry_policy: {timeout_sec: 30, max_attempts: 1}
+      output:
+        set:
+          - passages: >-
+              {{ sorted([{'text': str(n.get('text') or ''),
+                          'title': str((n.get('metadata') or {}).get('title') or (n.get('metadata') or {}).get('file_name') or ''),
+                          'url': (n.get('metadata') or {}).get('source_url'),
+                          'score': float(n.get('score') or 0.0),
+                          'metadata': n.get('metadata') or {}}
+                         for n in ((_ or {}).get('nodes') or []) if isinstance(n, dict) and n.get('text')],
+                        key=lambda p: p['score'], reverse=True) }}

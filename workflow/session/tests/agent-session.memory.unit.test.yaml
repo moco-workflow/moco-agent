@@ -1,0 +1,61 @@
+test_type: unit-test
+
+# agent-session, phase 3: long-term memory at retire (plan-07 step 8, design §6.4.6).
+# Its own suite so the others stay under moco test's 300 s request timeout.
+#
+#   plan-episode   record an episode only with long-term memory on, for a non-guest,
+#                  non-throwaway session, and only when turns were added since the last
+#                  one (meta.episode_upto_turn); never after the session was deleted (F62)
+
+wfspec:
+  name: agent-session
+
+test_data:
+  config: &config
+    memory: {long_term: {enabled: true}}
+
+test_groups:
+  - step_name: plan-episode
+    test_cases:
+      - id: a-session-with-new-turns-is-due
+        input: {config: *config, role: user, meta: {throwaway: false}, turn_count: 4}
+        expect:
+          assert:
+            - "{{ episode_due == True and episode_started == False }}"
+
+      - id: nothing-new-since-the-last-episode
+        input: {config: *config, role: user, meta: {episode_upto_turn: 4}, turn_count: 4}
+        expect:
+          assert:
+            - "{{ episode_due == False }}"
+
+      - id: turns-after-the-last-episode-make-it-due-again
+        input: {config: *config, role: admin, meta: {episode_upto_turn: 4}, turn_count: 6}
+        expect:
+          assert:
+            - "{{ episode_due == True }}"
+
+      - id: a-throwaway-session-is-not-an-episode
+        input: {config: *config, role: user, meta: {throwaway: true}, turn_count: 4}
+        expect:
+          assert:
+            - "{{ episode_due == False }}"
+
+      - id: a-guest-is-not-recorded
+        input: {config: *config, role: guest, meta: {}, turn_count: 4}
+        expect:
+          assert:
+            - "{{ episode_due == False }}"
+
+      - id: long-term-memory-off-records-nothing
+        input: {config: {memory: {long_term: {enabled: false}}}, role: user, meta: {}, turn_count: 4}
+        expect:
+          assert:
+            - "{{ episode_due == False }}"
+
+      - id: a-deleted-session-records-no-episode
+        input: {config: *config, role: user, meta: {}, turn_count: 4, session_deleted: true}
+        expect:
+          assert:
+            - "{{ episode_due == False }}"
+

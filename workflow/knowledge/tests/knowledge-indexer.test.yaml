@@ -1,0 +1,136 @@
+test_type: integration-test
+
+# knowledge-indexer (plan-06 step 6): index, then record ready | failed through
+# source-registry; refresh (phase 3) builds the shadow table, then swaps or discards it.
+# The row read, the index run, the registry writes and the drop are mocked.
+
+wfspec:
+  name: knowledge-indexer
+
+test_data:
+  row: &row
+    ok: true
+    data: {source: {name: moco-docs, status: indexing, table_name: kb_moco_docs, embed_model_info: {model_name: m, embed_dim: 8}}}
+  refreshing_row: &refreshing_row
+    ok: true
+    data: {source: {name: moco-docs, status: ready, table_name: kb_moco_docs, refreshing: {table_name: kbr_moco_docs, started_at: "2026-10-16T10:00:00"}, embed_model_info: {model_name: m, embed_dim: 8}}}
+  recorded: &recorded {ok: true, data: {source: {status: ready}}, error: null}
+
+test_cases:
+  - id: chunks-indexed-means-ready
+    input: {name: moco-docs, index_sources: [{kind: site, url: "http://x"}], pgvector_secret_key: K}
+    mocks:
+      - {step_name: read-source, _: *row}
+      - {step_name: run-index, _: {node_count: 120, document_count: 30, failed_sources: [], per_source: [{kind: site, node_count: 120}]}}
+      - {step_name: record-verdict, _: *recorded}
+    expect:
+      output:
+        - status: ready
+        - node_count: 120
+        - error: null
+
+  - id: zero-chunks-is-failed-with-the-reasons
+    input: {name: moco-docs, index_sources: [{kind: site, url: "http://x"}], pgvector_secret_key: K}
+    mocks:
+      - {step_name: read-source, _: *row}
+      - {step_name: run-index, _: {node_count: 0, failed_sources: [{source: "http://x", error: "404"}], per_source: []}}
+      - {step_name: record-verdict, _: *recorded}
+    expect:
+      output:
+        - status: failed
+        - error: "Indexed 0 chunks. 1 source(s) failed: http://x (404)"
+
+  # A mock cannot raise: a list where the output expects a dict fails the task and
+  # drives the real on_error path.
+  - id: a-failing-run-is-failed-not-lost
+    input: {name: moco-docs, index_sources: [{kind: nope}], pgvector_secret_key: K}
+    mocks:
+      - {step_name: read-source, _: *row}
+      - {step_name: run-index, _: [1]}
+      - {step_name: record-verdict, _: *recorded}
+    expect:
+      assert:
+        - "{{ status == 'failed' and node_count == 0 and bool(error) }}"
+
+  - id: a-source-that-is-not-indexing-is-refused
+    input: {name: moco-docs, pgvector_secret_key: K}
+    mocks:
+      - {step_name: read-source, _: {ok: true, data: {source: {name: moco-docs, status: ready}}}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "knowledge-indexer: source moco-docs (shared) is ready, not indexing"
+
+  - id: an-unrecorded-verdict-raises
+    input: {name: moco-docs, index_sources: [], pgvector_secret_key: K}
+    mocks:
+      - {step_name: read-source, _: *row}
+      - {step_name: run-index, _: {node_count: 5}}
+      - {step_name: record-verdict, _: {ok: false, data: null, error: {code: forbidden}}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  # ── refresh: build beside the serving table, then swap or discard ───────
+  - id: a-refresh-indexes-the-shadow-table-swaps-and-drops-the-old-one
+    input: {name: moco-docs, refresh: true, target_table: kbr_moco_docs, index_sources: [{kind: site, url: "http://x"}]}
+    mocks:
+      - {step_name: read-source, _: *refreshing_row}
+      - {step_name: run-index, _: "{{ {'node_count': 140, 'table_name': index_table} }}"}
+      - {step_name: record-verdict, _: "{{ 1 / 0 }}"}
+      - {step_name: record-refresh, _: {ok: true, data: {source: {table_name: kbr_moco_docs}}}}
+      - {step_name: drop-replaced-table, _: null}
+    expect:
+      output:
+        - status: ready
+        - node_count: 140
+        - table_name: kbr_moco_docs
+        - dropped: {table_name: kb_moco_docs, ok: true}
+
+  - id: a-failed-refresh-drops-the-shadow-and-keeps-the-source
+    input: {name: moco-docs, refresh: true, target_table: kbr_moco_docs, index_sources: [{kind: site, url: "http://x"}]}
+    mocks:
+      - {step_name: read-source, _: *refreshing_row}
+      - {step_name: run-index, _: {node_count: 0, failed_sources: [{source: "http://x", error: "404"}]}}
+      - {step_name: record-refresh, _: {ok: true, data: {source: {table_name: kb_moco_docs}}}}
+      - {step_name: drop-replaced-table, _: null}
+    expect:
+      output:
+        - status: failed
+        - error: "Indexed 0 chunks. 1 source(s) failed: http://x (404)"
+        - dropped: {table_name: kbr_moco_docs, ok: true}
+
+  - id: a-refresh-overtaken-by-a-reindex-discards-its-table
+    input: {name: moco-docs, refresh: true, target_table: kbr_moco_docs, index_sources: [{kind: site, url: "http://x"}]}
+    mocks:
+      - {step_name: read-source, _: *refreshing_row}
+      - {step_name: run-index, _: {node_count: 140}}
+      - {step_name: record-refresh, _: {ok: false, data: null, error: {code: invalid_state, message: "source moco-docs is no longer refreshing into kbr_moco_docs"}}}
+      - {step_name: drop-replaced-table, _: null}
+    expect:
+      output:
+        - status: failed
+        - error: "refresh discarded: source moco-docs is no longer refreshing into kbr_moco_docs"
+        - dropped: {table_name: kbr_moco_docs, ok: true}
+
+  - id: a-failed-drop-is-reported-not-raised
+    input: {name: moco-docs, refresh: true, target_table: kbr_moco_docs, index_sources: [{kind: site, url: "http://x"}]}
+    mocks:
+      - {step_name: read-source, _: *refreshing_row}
+      - {step_name: run-index, _: {node_count: 140}}
+      - {step_name: record-refresh, _: {ok: true, data: {source: {}}}}
+      - {step_name: drop-replaced-table, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ status == 'ready' and dropped['table_name'] == 'kb_moco_docs' and dropped['ok'] == False }}"
+
+  - id: a-refresh-into-another-table-than-the-row-names-is-refused
+    input: {name: moco-docs, refresh: true, target_table: kb_moco_docs}
+    mocks:
+      - {step_name: read-source, _: *refreshing_row}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "knowledge-indexer: source moco-docs (shared) is not refreshing into kb_moco_docs"
+

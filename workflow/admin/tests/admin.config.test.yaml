@@ -1,0 +1,60 @@
+test_type: integration-test
+
+# admin.config: get_config adds the caller's role and each tier's own sections for
+# the UI; the other ops pass agent-config's data through.
+
+wfspec:
+  name: admin.config
+
+test_cases:
+  - id: get-config-adds-role-tiers-and-user-settable
+    input: {op: get_config, agent_id: skeleton}
+    mocks:
+      - step_name: call-config
+        _:
+          ok: true
+          data:
+            config: {access: {admin_user_ids: [a]}, persona_text: "p"}
+            profiles: {rag: {}, chat: {}}
+            config_version: "v"
+            tiers: {agent: {}, user: {persona_text: "p"}}
+            user_settable: [persona_text]
+          error: null
+      - {step_name: identify-caller, _: {ok: true, data: {role: admin}, error: null}}
+    expect:
+      assert:
+        - "{{ ok == True and data['role'] == 'admin' and data['profiles'] == ['chat', 'rag'] }}"
+        - "{{ data['tiers']['user'] == {'persona_text': 'p'} and data['user_settable'] == ['persona_text'] }}"
+
+  - id: get-config-failure-skips-identify
+    input: {op: get_config, agent_id: skeleton}
+    mocks:
+      - {step_name: call-config, _: {ok: false, data: null, error: {code: invalid_input}}}
+      - {step_name: identify-caller, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - error: {code: invalid_input}
+
+  - id: save-config-passes-data-through
+    input: {op: save_config, agent_id: skeleton, scope: user, patch: {persona_text: "x"}}
+    mocks:
+      - {step_name: call-config, _: {ok: true, data: {config_version: "v2"}, error: null}}
+      - {step_name: identify-caller, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {config_version: "v2"}
+
+  # get_readiness (F70): model-readiness over the resolved config.
+  - id: get-readiness-checks-the-resolved-config
+    input: {op: get_readiness, agent_id: moco-assistant}
+    mocks:
+      - {step_name: call-config, _: {ok: true, data: {config: {models: {inference: {apikey_secret_key: MY_LLM_TOKEN}}}, profiles: {}, config_version: v1}, error: null}}
+      - {step_name: identify-caller, _: "{{ 1 / 0 }}"}
+      - step_name: check-readiness
+        _: "{{ {'ok': True, 'data': {'ready': False, 'roles': {'inference': {'status': 'missing', 'saw': res['data']['config']['models']['inference']['apikey_secret_key']}}}, 'error': None} }}"
+    expect:
+      output:
+        - ok: true
+        - data: {ready: false, roles: {inference: {status: missing, saw: MY_LLM_TOKEN}}}

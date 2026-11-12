@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SESSION-PROBE — is this session's entity running? (session-housekeep, plan-17 step 4)
+# ================================================================================
+#
+#   in                                 out
+#   ────────────────────────────────── ───────────────
+#   agent_id, owner_user_id, session_id {alive: bool}
+#
+# A `ping` signal to `agent-session-<aid>-<uid>-<sid>` WITHOUT entity_workflow (so it
+# never starts one): it fails when no entity runs. A live entity takes it as an
+# internal no-op in idle (agent-session's answer-ping) or buffers it mid-turn.
+# Its own wfspec so session-housekeep's tests can mock it: emit_event tasks cannot be mocked.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: session-probe
+
+context:
+  alive: false
+
+input:
+  agent_id:
+  owner_user_id:
+  session_id:
+
+output:
+  alive: "{{ alive }}"
+
+main:
+  task_name: ping-entity
+  emit_event:
+    target_workflow_id: "agent-session-{{ agent_id }}-{{ owner_user_id }}-{{ session_id }}"
+    topic: agent-session
+    event_type: ping
+    data: {from: session-probe}
+  output:
+    set:
+      - alive: true
+  on_error:
+    catch: true
+    do:
+      set:
+        - alive: false

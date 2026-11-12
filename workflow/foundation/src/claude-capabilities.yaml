@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# CLAUDE-CAPABILITIES — which offerable tools a claude run may use (design §6.9.12)
+# ================================================================================
+#
+#   in                      out
+#   ─────────────────────── ──────────────────────────────────────────────────────
+#   offerable (tool-policy) {moco_tools: [activity type], mcp_servers: {name: {type, url}},
+#                            mcp_tools: [mcp__<server>__<tool>], trace: {tools, excluded}}
+#
+# PURE. claude_agent runs its own tool loop, so tool-executor cannot mediate each
+# call; this bridge decides what the run may reach at all. A tool is bridged only
+# when ALL hold:
+#   effective_permission auto   an approve tool cannot pause a claude run
+#   credential.mode != user     a run cannot carry a per-user secret safely
+#   binding activity | mcp      wfspec and builtin bindings have no claude form
+#   no fixed input              an activity-provider tool whose admin fixed part of the
+#                               input (merge_args + input_template) is not bridged:
+#                               claude would get the raw activity without those values
+# The trace records every bridged tool with its version (the audit shows what a run
+# COULD call, though single calls are not audited here) and why the others were not.
+#
+# CAVEAT (design §6.9.12): claude_agent's `moco_tools` are raw ACTIVITY TYPES. A
+# bridged `k8s.list` reaches claude without the manifest's input_template, result
+# shape or limits -- claude may call that activity with any input the activity
+# accepts, under the user's identity. Bridge only toolsets whose activities are safe
+# to expose in full. MCP tools keep their server and tool name.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: claude-capabilities
+
+input:
+  offerable: []
+
+output:
+  moco_tools: "{{ moco_tools }}"
+  mcp_servers: "{{ mcp_servers }}"
+  mcp_tools: "{{ mcp_tools }}"
+  trace: "{{ trace }}"
+
+main:
+  task_name: bridge-tools
+  set:
+    - _tools: "{{ [t for t in (offerable or []) if isinstance(t, dict) and t.get('name')] }}"
+    - _why: >-
+        {{ {t['name']: ('not auto' if t.get('effective_permission') != 'auto' else
+                        'user credential' if (t.get('credential') or {}).get('mode') == 'user' else
+                        'binding has no claude form' if not any(k in (t.get('binding') or {}) for k in ['activity', 'mcp']) else
+                        'fixed input' if ((t.get('binding') or {}).get('activity') or {}).get('merge_args') is True
+                                         and ((t.get('binding') or {}).get('activity') or {}).get('input_template') else None)
+            for t in _tools} }}
+    - _ok: "{{ [t for t in _tools if _why[t['name']] is None] }}"
+    - moco_tools: "{{ sorted(set(str(t['binding']['activity']['type']) for t in _ok if 'activity' in t['binding'])) }}"
+    - _server: "{{ {t['name']: re.sub(r'[^a-z0-9_]', '_', str((t['binding']['mcp'].get('provider') or t['name'])).lower()) for t in _ok if 'mcp' in t['binding']} }}"
+    - mcp_servers: "{{ {_server[t['name']]: {'type': 'http', 'url': t['binding']['mcp']['endpoint']} for t in _ok if 'mcp' in t['binding']} }}"
+    - mcp_tools: "{{ sorted('mcp__' + _server[t['name']] + '__' + str(t['binding']['mcp']['tool_name']) for t in _ok if 'mcp' in t['binding']) }}"
+    - trace:
+        tools: "{{ [{'name': t['name'], 'version': t.get('version')} for t in _ok] }}"
+        excluded: "{{ [{'name': n, 'reason': r} for n, r in _why.items() if r is not None] }}"

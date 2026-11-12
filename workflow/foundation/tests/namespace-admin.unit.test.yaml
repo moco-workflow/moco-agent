@@ -1,0 +1,96 @@
+test_type: unit-test
+
+# namespace-admin (F48, design §6.13). `decide-lookup` is the guard (unit-tested
+# because a test cannot set __user_info__ / __sys_info__); `lookup` runs the two
+# deploy-DB reads, mocked by task name. A failing read is driven with a mock that
+# fails to evaluate (`{{ 1 / 0 }}`): the caught error leaves the seeded result.
+
+wfspec:
+  name: namespace-admin
+
+test_groups:
+
+  - step_name: decide-lookup
+    test_cases:
+      - id: a-user-on-a-stage-is-looked-up
+        input: {stage: dev, uid: ada, package_name: agent-skeleton, exclude_user_ids: [guest]}
+        expect:
+          assert:
+            - "{{ lookup == True }}"
+      - id: no-stage-means-no-lookup
+        input: {stage: null, uid: ada, package_name: agent-skeleton, exclude_user_ids: []}
+        expect:
+          assert:
+            - "{{ lookup == False }}"
+      - id: a-missing-user-id-is-never-looked-up
+        input: {stage: dev, uid: "None", package_name: agent-skeleton, exclude_user_ids: []}
+        expect:
+          assert:
+            - "{{ lookup == False }}"
+      - id: an-excluded-user-is-never-looked-up
+        input: {stage: dev, uid: guest, package_name: agent-skeleton, exclude_user_ids: [mallory, guest]}
+        expect:
+          assert:
+            - "{{ lookup == False }}"
+      - id: no-package-means-no-lookup
+        input: {stage: dev, uid: ada, package_name: "", exclude_user_ids: []}
+        expect:
+          assert:
+            - "{{ lookup == False }}"
+
+  - step_name: lookup
+    test_cases:
+      - id: a-manage-ns-holder-is-an-admin
+        input: {lookup: true, uid: ada, package_name: agent-skeleton, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: {name: agent-skeleton, namespace_id: team-a, owner: bob}}
+          - {step_name: check-namespace-admin, _: {has_privilege: true}}
+        expect:
+          assert:
+            - "{{ namespace_id == 'team-a' and is_admin == True }}"
+
+      - id: anyone-else-is-not
+        input: {lookup: true, uid: ada, package_name: agent-skeleton, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: {name: agent-skeleton, namespace_id: team-a}}
+          - {step_name: check-namespace-admin, _: {has_privilege: false}}
+        expect:
+          assert:
+            - "{{ namespace_id == 'team-a' and is_admin == False }}"
+
+      - id: an-unknown-package-skips-the-privilege-check
+        input: {lookup: true, uid: ada, package_name: agent-nope, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: null}
+          # a sentinel that would show: `1 / 0` would be swallowed by on_error catch
+          - {step_name: check-namespace-admin, _: {has_privilege: true}}
+        expect:
+          assert:
+            - "{{ namespace_id is None and is_admin == False }}"
+
+      - id: a-failing-namespace-read-is-not-an-admin
+        input: {lookup: true, uid: ada, package_name: agent-skeleton, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: "{{ 1 / 0 }}"}
+          - {step_name: check-namespace-admin, _: {has_privilege: true}}
+        expect:
+          assert:
+            - "{{ namespace_id is None and is_admin == False }}"
+
+      - id: a-failing-privilege-check-is-not-an-admin
+        input: {lookup: true, uid: ada, package_name: agent-skeleton, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: {name: agent-skeleton, namespace_id: team-a}}
+          - {step_name: check-namespace-admin, _: "{{ 1 / 0 }}"}
+        expect:
+          assert:
+            - "{{ namespace_id == 'team-a' and is_admin == False }}"
+
+      - id: a-non-boolean-answer-is-not-an-admin
+        input: {lookup: true, uid: ada, package_name: agent-skeleton, privilege: manage_ns, namespace_id: null, is_admin: false}
+        mocks:
+          - {step_name: read-owning-namespace, _: {name: agent-skeleton, namespace_id: team-a}}
+          - {step_name: check-namespace-admin, _: {has_privilege: "yes"}}
+        expect:
+          assert:
+            - "{{ is_admin == False }}"

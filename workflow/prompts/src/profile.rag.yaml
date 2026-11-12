@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.RAG — library profile: retrieve, then one cited answer (§5.3, §6.8.2)
+# ================================================================================
+# Ported from the old agent's rag-qa-agent behaviour: retrieval before the call,
+# citations required, and a decline with no model call when nothing is retrieved.
+# requires.sources keeps it off the router's list until a source is ready.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.rag
+
+context:
+  profile:
+    name: rag
+    kind: loop
+    mode: sync
+    route_description: "A question that one of the indexed sources could answer."
+    examples: ["how do retries work?", "where is the timeout for an activity configured?"]
+    requires: {sources: true}
+    needs_rewrite: true
+    budget_sec: 90
+    estimated_sec: 40
+    loop:
+      model_role: inference
+      prompt: rag.answer
+      retrieval: {when: before, sources: from_router, on_empty: decline}
+      tools:
+      max_steps: 1
+      output_checks: [check_output]
+      grounding: passages
+      decline_message: "I couldn't find that in {searched}. I can answer questions about {catalog}."
+    wfspec:
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

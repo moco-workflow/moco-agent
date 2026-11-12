@@ -1,0 +1,800 @@
+test_type: unit-test
+
+# agent-session, phase 0 (plan-00a §6, plan-14 §6).
+#
+# The body is an event-driven state machine; a test cannot inject events, and an
+# integration run would sit in `idle` forever. So -- as in the old agent -- every
+# decision lives in a named step and is tested here step by step:
+#
+#   classify-message   accept / busy / error          (message_id correlation, queue)
+#   prepare-turn       budget_sec, context bundle
+#   finalize-turn      transcript entries, apology, conversation memory, answer event
+#   end-turn           turn numbering, write_failed
+#   decide-tick        retire / throwaway retire / idle stop
+#   restore-session    rehydration, reactivation
+#   plan-resume        a pending reply: resume / expired / stale / bad decision (phase 2)
+#   finish-pending     the stored action in the answer, or an error if it was not stored
+#
+# The children (agent-config, session-store, run-profile, the version probe) are
+# covered by their own suites; the deployed walk-through is recorded in plan-00a.
+
+wfspec:
+  name: agent-session
+
+test_data:
+  config: &config
+    session: {idle_tick_sec: 300, checkpoint_sec: 240, apology_text: "SORRY"}
+    limits: {turn_budget_sec: 110, max_queued_messages: 1, retire_after_idle_sec: 86400, retire_throwaway_after_idle_sec: 600}
+    memory: {short_term: {recent_turns: 2}}
+    persona_text: "You are terse."
+
+test_groups:
+
+  # ── classify-message: correlation and the depth-1 queue ─────────────────
+  # Turn A ran 10:00:00-10:01:00. Timestamps decide whether a message queued
+  # behind it, and behind how many turns.
+  - step_name: classify-message
+    test_cases:
+
+      - id: an-action-without-text-is-accepted-and-carried
+        input:
+          config: *config
+          inbound: {message: "", action: {decision: approve}, message_id: m9, caller_workflow_id: cli-9, sent_at: "2026-09-28T10:05:00"}
+          last_turn_started_at: ""
+          last_turn_ended_at: ""
+          last_activity_at: ""
+        expect:
+          assert:
+            - "{{ accept == True and turn_ctx['action'] == {'decision': 'approve'} }}"
+
+      - id: a-message-sent-while-idle-is-accepted
+        input:
+          config: *config
+          inbound: {message: "hi", message_id: m1, caller_workflow_id: cli-1, sent_at: "2026-09-28T10:05:00"}
+          last_turn_started_at: "2026-09-28T10:00:00"
+          last_turn_ended_at: "2026-09-28T10:01:00"
+          last_activity_at: "2026-09-28T10:01:00"
+        expect:
+          assert:
+            - "{{ accept == True }}"
+            - "{{ was_queued == False }}"
+            - "{{ turn_ctx['message_id'] == 'm1' }}"
+            - "{{ turn_ctx['caller_workflow_id'] == 'cli-1' }}"
+            - "{{ turn_ctx['message'] == 'hi' }}"
+            - "{{ last_activity_at != '2026-09-28T10:01:00' }}"
+
+      - id: the-first-message-of-a-session-is-accepted
+        input:
+          config: *config
+          inbound: {message: "hi", message_id: m1, caller_workflow_id: cli-1, sent_at: "2026-09-28T10:05:00"}
+          last_turn_started_at: ""
+          last_turn_ended_at: ""
+          last_activity_at: ""
+        expect:
+          assert:
+            - "{{ accept == True }}"
+
+      # Sent during turn A: it waited behind one turn. Depth 1 allows it.
+      - id: one-message-queued-behind-a-turn-is-accepted
+        input:
+          config: *config
+          inbound: {message: "and?", message_id: m2, caller_workflow_id: cli-2, sent_at: "2026-09-28T10:00:30"}
+          last_turn_started_at: "2026-09-28T10:00:00"
+          last_turn_ended_at: "2026-09-28T10:01:00"
+          last_activity_at: "2026-09-28T10:01:00"
+        expect:
+          assert:
+            - "{{ accept == True }}"
+            - "{{ was_queued == True }}"
+
+      # Sent during turn A, picked up only after turn B (the other queued
+      # message) ended: it waited behind two turns. Answered busy, with ITS
+      # message_id, to ITS caller.
+      - id: a-message-queued-behind-two-turns-is-busy-with-its-own-message-id
+        input:
+          config: *config
+          inbound: {message: "and also?", message_id: m3, caller_workflow_id: cli-3, sent_at: "2026-09-28T10:00:40"}
+          last_turn_started_at: "2026-09-28T10:01:00"
+          last_turn_ended_at: "2026-09-28T10:01:50"
+          last_activity_at: "2026-09-28T10:01:50"
+        expect:
+          assert:
+            - "{{ accept == False }}"
+            - "{{ reject_status == 'busy' }}"
+            - "{{ reject_message_id == 'm3' }}"
+            - "{{ reject_caller == 'cli-3' }}"
+            - "{{ turn_ctx == {} }}"
+            # A rejected message does not count as activity.
+            - "{{ last_activity_at == '2026-09-28T10:01:50' }}"
+
+      - id: with-queue-depth-0-any-queued-message-is-busy
+        input:
+          config:
+            session: {idle_tick_sec: 300, checkpoint_sec: 240}
+            limits: {max_queued_messages: 0}
+          inbound: {message: "and?", message_id: m2, caller_workflow_id: cli-2, sent_at: "2026-09-28T10:00:30"}
+          last_turn_started_at: "2026-09-28T10:00:00"
+          last_turn_ended_at: "2026-09-28T10:01:00"
+          last_activity_at: "2026-09-28T10:01:00"
+        expect:
+          assert:
+            - "{{ accept == False }}"
+            - "{{ reject_status == 'busy' }}"
+
+      - id: an-empty-message-is-an-error-not-a-turn
+        input:
+          config: *config
+          inbound: {message: "   ", message_id: m1, caller_workflow_id: cli-1, sent_at: "2026-09-28T10:05:00"}
+          last_turn_started_at: ""
+          last_turn_ended_at: ""
+          last_activity_at: ""
+        expect:
+          assert:
+            - "{{ accept == False }}"
+            - "{{ reject_status == 'error' }}"
+
+      # Without a message_id nobody could ever be matched to the answer (P16).
+      - id: a-message-without-message-id-is-an-error
+        input:
+          config: *config
+          inbound: {message: "hi", caller_workflow_id: cli-1, sent_at: "2026-09-28T10:05:00"}
+          last_turn_started_at: ""
+          last_turn_ended_at: ""
+          last_activity_at: ""
+        expect:
+          assert:
+            - "{{ accept == False }}"
+            - "{{ reject_status == 'error' }}"
+
+  # ── prepare-turn: the budget (§6.10.3) ──────────────────────────────────
+  - step_name: prepare-turn
+    test_cases:
+      - id: the-routed-profile-sets-the-budget
+        input:
+          config: *config
+          profiles: {chat: {name: chat, budget_sec: 40}, rag: {name: rag, budget_sec: 90}}
+          router_result: {route: rag}
+          turn_ctx: {message: "q", received_at: "{{ now().isoformat() }}"}
+        expect:
+          assert:
+            - "{{ profile['name'] == 'rag' and 88 <= budget_sec <= 90 }}"
+
+      - id: a-route-that-is-not-a-profile-falls-back-to-the-default
+        input:
+          config: {limits: {turn_budget_sec: 110}, router: {default_profile: chat}}
+          profiles: {chat: {name: chat, budget_sec: 40}}
+          router_result: {route: pending_reply}
+          turn_ctx: {message: "q", received_at: "{{ now().isoformat() }}"}
+        expect:
+          assert:
+            - "{{ profile['name'] == 'chat' and budget_sec == 40 }}"
+
+      # A message that waited in the buffer has spent some of the turn budget.
+      - id: time-spent-waiting-shrinks-the-budget
+        input:
+          config: *config
+          profile: {name: chat, budget_sec: 90}
+          turn_ctx: {message: "q", received_at: "{{ (now() - dt.timedelta(seconds=50)).isoformat() }}"}
+          recent: []
+        expect:
+          assert:
+            # min(90, 110 - 50) = 60, give or take the test's own runtime.
+            - "{{ 58 <= budget_sec <= 60 }}"
+
+      - id: the-budget-never-drops-below-5-seconds
+        input:
+          config: *config
+          profile: {name: chat, budget_sec: 90}
+          turn_ctx: {message: "q", received_at: "{{ (now() - dt.timedelta(seconds=300)).isoformat() }}"}
+          recent: []
+        expect:
+          assert:
+            - "{{ budget_sec == 5 }}"
+
+  # ── finalize-turn ───────────────────────────────────────────────────────
+  - step_name: finalize-turn
+    test_cases:
+      - id: an-answered-turn-is-recorded-and-remembered
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: "d0.1.0+a0.1.0"
+          budget_sec: 40
+          last_turn_started_at: "2026-09-28T10:00:01"
+          turn_count: 2
+          title: "first question"
+          recent: [{role: user, content: "a"}, {role: assistant, content: "b"}, {role: user, content: "c"}, {role: assistant, content: "d"}]
+          turn_ctx: {message: "q3", message_id: m3, caller_workflow_id: "agent-harness/agent-cli:None:u1:abc", sent_at: "2026-09-28T09:59:59.500000", received_at: "2026-09-28T10:00:00"}
+          result:
+            status: ok
+            answer: "a3"
+            sources: []
+            usage: {llm_calls: 1, tokens_in: 20, tokens_out: 5}
+        expect:
+          assert:
+            - "{{ turn_no == 3 }}"
+            - "{{ turn_status == 'ok' }}"
+            - "{{ [e['role'] for e in turn_entries] == ['user', 'assistant'] }}"
+            - "{{ all(e['turn'] == 3 and e['message_id'] == 'm3' for e in turn_entries) }}"
+            - "{{ turn_entries[1]['content'] == 'a3' and turn_entries[1]['route'] == 'chat' }}"
+            - "{{ turn_entries[1]['workflow_id'] == 'agent-harness/agent-cli:None:u1:abc' and 'workflow_id' not in turn_entries[0] }}"
+            # recent_turns 2: the oldest exchange falls off -- and goes to the compactor.
+            - "{{ [m['content'] for m in new_recent] == ['c', 'd', 'q3', 'a3'] }}"
+            - "{{ [m['content'] for m in compaction_exchanges] == ['a', 'b'] }}"
+            # An existing title is kept.
+            - "{{ title == 'first question' }}"
+            - "{{ meta_patch['usage'] == {'turns': 1, 'llm_calls': 1, 'classifier_calls': 0, 'tool_calls': 0, 'tokens_in': 20, 'tokens_out': 5} }}"
+            - "{{ meta_patch['config_version'] == 'd0.1.0+a0.1.0' }}"
+            - "{{ {k: v for k, v in answer_event.items() if k != 'timing'} == {'message_id': 'm3', 'session_id': 's1', 'turn': 3, 'status': 'ok', 'answer': 'a3', 'sources': [], 'route': 'chat', 'setup': None} }}"
+            # M4 timings: sent 09:59:59.5 -> received 10:00:00 = 500ms in the buffer.
+            - "{{ answer_event['timing']['wait_ms'] == 500 }}"
+            - "{{ answer_event['timing']['budget_sec'] == 40 }}"
+            - "{{ isinstance(answer_event['timing']['run_ms'], int) and isinstance(answer_event['timing']['turn_ms'], int) }}"
+
+      # A clarify question joins the conversation and is recorded with route clarify.
+      - id: a-clarify-turn-is-recorded-and-remembered
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: "v"
+          budget_sec: 40
+          turn_count: 0
+          title: ""
+          recent: []
+          router_result: {route: clarify}
+          turn_ctx: {message: "retries?", message_id: m1, sent_at: "2026-09-28T10:00:00", received_at: "2026-09-28T10:00:00"}
+          result: {status: clarify, answer: "Is this (a) chat, or (b) docs?", sources: []}
+        expect:
+          assert:
+            - "{{ turn_status == 'clarify' and turn_route == 'clarify' }}"
+            - "{{ turn_entries[1]['route'] == 'clarify' and answer_event['route'] == 'clarify' }}"
+            - "{{ [m['content'] for m in new_recent] == ['retries?', 'Is this (a) chat, or (b) docs?'] }}"
+            - "{{ compaction_exchanges == [] }}"
+
+      # §11.2: profile error -> fixed apology, turn still persisted, and the
+      # apology is kept out of the model's conversation memory.
+      - id: a-failed-turn-gets-the-apology-and-is-not-remembered
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: "v"
+          budget_sec: 40
+          last_turn_started_at: "2026-09-28T10:00:01"
+          turn_count: 0
+          title: ""
+          recent: []
+          turn_ctx: {message: "a question that is rather longer than sixty characters, to be clamped", message_id: m1, received_at: "2026-09-28T10:00:00"}
+          result: {status: error, answer: "", trace: {error: {code: timeout}}}
+        expect:
+          assert:
+            - "{{ turn_status == 'error' }}"
+            - "{{ turn_answer == 'SORRY' }}"
+            - "{{ answer_event['answer'] == 'SORRY' }}"
+            - "{{ turn_entries[1]['status'] == 'error' }}"
+            - "{{ new_recent == [] }}"
+            # The first message titles a new session, clamped to 60 chars.
+            - "{{ title == 'a question that is rather longer than sixty characters, to b…' }}"
+
+      # A profile that returns garbage is an error, not a crash.
+      - id: a-malformed-profile-result-is-an-error
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: "v"
+          budget_sec: 40
+          last_turn_started_at: "2026-09-28T10:00:01"
+          turn_count: 0
+          title: "t"
+          recent: []
+          turn_ctx: {message: "q", message_id: m1, received_at: "2026-09-28T10:00:00"}
+          result: {status: "weird", answer: "x"}
+        expect:
+          assert:
+            - "{{ turn_status == 'error' }}"
+            - "{{ turn_answer == 'SORRY' }}"
+
+      - id: ok-with-an-empty-answer-is-an-error
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: "v"
+          budget_sec: 40
+          last_turn_started_at: "2026-09-28T10:00:01"
+          turn_count: 0
+          title: "t"
+          recent: []
+          turn_ctx: {message: "q", message_id: m1, received_at: "2026-09-28T10:00:00"}
+          result: {status: ok, answer: ""}
+        expect:
+          assert:
+            - "{{ turn_status == 'error' }}"
+
+      # Phase 2: a suspended profile -> the approval prompt; remembered; audit counted.
+      - id: a-needs-approval-turn-answers-with-the-approval-prompt
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: react}
+          config_version: "v"
+          budget_sec: 40
+          last_turn_started_at: "2026-09-28T10:00:01"
+          turn_count: 1
+          title: "t"
+          recent: []
+          tool_counts: {k8s_pods: 2}
+          turn_ctx: {message: "scale web to 3", message_id: m2, received_at: "2026-09-28T10:00:00"}
+          result:
+            status: needs_approval
+            answer: ""
+            sources: []
+            pending_action: {kind: tool_call, summary: "Scale web to 3 replicas?", detail: {args_hash: abc}, offer_session_grant: true, expires_in_sec: 3600}
+            trace: {tool_audit: [{tool: k8s_pods, status: ok}, {tool: k8s_scale, status: needs_approval}]}
+        expect:
+          assert:
+            - "{{ turn_status == 'needs_approval' and pa_present == True }}"
+            - "{{ turn_answer.startswith('I need your approval to continue: Scale web to 3 replicas?') and 'yes for this session' in turn_answer }}"
+            - "{{ [m['content'] for m in new_recent] == ['scale web to 3', turn_answer] }}"
+            - "{{ len(turn_audit) == 2 and tool_counts == {'k8s_pods': 3} }}"
+
+      - id: an-ask-user-turn-answers-with-the-question
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: react}
+          config_version: "v"
+          budget_sec: 40
+          turn_count: 1
+          title: "t"
+          recent: []
+          turn_ctx: {message: "scale it", message_id: m2, received_at: "2026-09-28T10:00:00"}
+          result: {status: needs_approval, answer: "", pending_action: {kind: user_input, summary: "Which deployment?"}}
+        expect:
+          assert:
+            - "{{ turn_answer == 'Which deployment?' and turn_status == 'needs_approval' }}"
+
+  # ── end-turn ────────────────────────────────────────────────────────────
+  - step_name: end-turn
+    test_cases:
+      - id: a-committed-turn-advances-the-count
+        input:
+          turn_no: 3
+          new_recent: [{role: user, content: q}]
+          commit_result: {ok: true, data: {turn_count: 3, duplicate: false}, error: null}
+        expect:
+          assert:
+            - "{{ turn_count == 3 }}"
+            - "{{ write_failed == False }}"
+            - "{{ turn_ctx == {} and result == {} }}"
+            - "{{ last_turn_ended_at != '' }}"
+
+      # The answer is already delivered; a lost write is flagged, and the turn
+      # count still advances so numbers stay monotonic.
+      - id: a-failed-write-is-flagged-and-the-count-still-advances
+        input:
+          turn_no: 3
+          new_recent: []
+          commit_result: {result: error, error_message: "db down"}
+        expect:
+          assert:
+            - "{{ write_failed == True }}"
+            - "{{ turn_count == 3 }}"
+
+  # ── decide-tick: retire, throwaway retire, idle stop (F66) ────────────────
+  - step_name: decide-tick
+    test_cases:
+      - id: a-recent-session-stays
+        input:
+          config: *config
+          meta: {throwaway: false}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=120)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == False }}"
+            - "{{ stop_due == False }}"
+            - "{{ tick_stop_reason == '' }}"
+
+      - id: a-named-session-retires-after-retire-after-idle-sec
+        input:
+          config: *config
+          meta: {throwaway: false}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=86401)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == True }}"
+            - "{{ stop_due == False }}"
+            - "{{ tick_stop_reason == 'idle_timeout' }}"
+
+      # F25: a throwaway session retires after 600s; a named one stops instead.
+      - id: a-throwaway-session-retires-after-the-short-timeout
+        input:
+          config: *config
+          meta: {throwaway: true}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=601)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == True }}"
+            - "{{ stop_due == False }}"
+            - "{{ tick_stop_reason == 'throwaway_idle_timeout' }}"
+
+      # F66: the idle stop ends the entity, the row stays active.
+      - id: a-named-session-stops-after-idle-stop-sec-without-retiring
+        input:
+          config: *config
+          meta: {throwaway: false}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=601)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ retire_due == False }}"
+            - "{{ stop_due == True }}"
+            - "{{ tick_stop_reason == 'idle_stop' }}"
+
+      - id: idle-stop-sec-comes-from-the-config
+        input:
+          meta: {throwaway: false}
+          config: {session: {idle_stop_sec: 1200}, limits: {retire_after_idle_sec: 86400}}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=601)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ stop_due == False }}"
+
+      - id: a-session-just-under-idle-stop-sec-stays
+        input:
+          config: *config
+          meta: {throwaway: false}
+          last_activity_at: "{{ (now() - dt.timedelta(seconds=590)).isoformat() }}"
+        expect:
+          assert:
+            - "{{ stop_due == False and retire_due == False }}"
+
+  # ── restore-session: rehydration ────────────────────────────────────────
+  - step_name: restore-session
+    test_cases:
+      - id: a-resumed-session-rehydrates-its-conversation
+        input:
+          stored_meta: {status: active, turn_count: 4, title: "t", throwaway: false}
+          stored_context: {recent: [{role: user, content: "a"}, {role: assistant, content: "b"}]}
+          reactivated: null
+        expect:
+          assert:
+            - "{{ turn_count == 4 }}"
+            - "{{ title == 't' }}"
+            - "{{ len(recent) == 2 }}"
+            - "{{ meta['status'] == 'active' }}"
+
+      - id: a-retired-session-comes-back-active
+        input:
+          stored_meta: {status: retired, turn_count: 4, title: "t"}
+          stored_context: {recent: []}
+          reactivated: {ok: true, data: {meta: {status: active, turn_count: 4, title: "t"}}, error: null}
+        expect:
+          assert:
+            - "{{ meta['status'] == 'active' }}"
+            - "{{ turn_count == 4 }}"
+
+      - id: a-new-session-starts-empty
+        input:
+          stored_meta: {status: active, turn_count: 0, title: "", throwaway: true}
+          stored_context: {}
+          reactivated: null
+        expect:
+          assert:
+            - "{{ turn_count == 0 }}"
+            - "{{ recent == [] }}"
+            - "{{ meta['throwaway'] == True }}"
+
+  # ── apply-compacted: a summary is applied only when newer (§6.10.6) ──────
+  - step_name: apply-compacted
+    test_cases:
+      - id: a-newer-summary-is-applied
+        input: {summary: "old", summary_upto_turn: 3, compacted_data: {summary: "new", upto_turn: 5}}
+        expect:
+          assert:
+            - "{{ compaction_newer == True and summary == 'new' and summary_upto_turn == 5 }}"
+      - id: an-older-summary-is-ignored
+        input: {summary: "newer", summary_upto_turn: 7, compacted_data: {summary: "stale", upto_turn: 5}}
+        expect:
+          assert:
+            - "{{ compaction_newer == False and summary == 'newer' and summary_upto_turn == 7 }}"
+      - id: an-empty-summary-is-ignored
+        input: {summary: "s", summary_upto_turn: 1, compacted_data: {summary: "", upto_turn: 9}}
+        expect:
+          assert:
+            - "{{ compaction_newer == False and summary == 's' }}"
+
+  # ── plan-resume (phase 2): what a reply to the pending action does ───────
+  - step_name: plan-resume
+    test_cases:
+      - id: a-resolved-reply-resumes-the-profile-that-suspended
+        input:
+          profiles: {react: {name: react}, chat: {name: chat}}
+          profile: {name: chat}
+          pending: {id: pa-s1-2, kind: tool_call, profile: react}
+          resolve_result: {ok: true, data: {resume: {pending_action: {id: pa-s1-2}, decision: approve, approval_token: "pa-s1-2:abc"}}}
+        expect:
+          assert:
+            - "{{ resume_input['approval_token'] == 'pa-s1-2:abc' and profile == {'name': 'react'} and pending is None and result == {} }}"
+
+      - id: a-late-reply-runs-nothing-and-says-so
+        input:
+          profiles: {react: {name: react}}
+          profile: {name: chat}
+          pending: {id: pa-s1-2, kind: tool_call, profile: react}
+          resolve_result: {ok: false, error: {code: expired, message: late}}
+        expect:
+          assert:
+            - "{{ resume_input is None and pending is None and result['answer'].startswith('That request expired') and profile == {'name': 'chat'} }}"
+
+      - id: a-stale-reply-clears-the-action
+        input:
+          profiles: {}
+          profile: {name: chat}
+          pending: {id: pa-s1-2, kind: tool_call, profile: react}
+          resolve_result: {ok: false, error: {code: invalid_state, message: resolved}}
+        expect:
+          assert:
+            - "{{ resume_input is None and pending is None and result['answer'] == 'There is nothing waiting for an answer any more.' }}"
+
+      - id: a-choice-that-is-not-offered-keeps-the-action-waiting
+        input:
+          profiles: {}
+          profile: {name: chat}
+          pending: {id: pa-s1-2, kind: tool_call, profile: react}
+          resolve_result: {ok: false, error: {code: invalid_input, message: "decision must be one of approve, reject, revise"}}
+        expect:
+          assert:
+            - "{{ resume_input is None and pending['id'] == 'pa-s1-2' and 'not available' in result['answer'] }}"
+
+  # ── finish-pending (phase 2): the stored action reaches the caller ───────
+  - step_name: finish-pending
+    test_cases:
+      - id: a-stored-action-goes-into-the-answer-and-meta
+        input:
+          turn_status: needs_approval
+          turn_answer: "I need your approval to continue: Scale?"
+          pa_present: true
+          pending:
+          open_result: {ok: true, data: {pending: {id: pa-s1-2, kind: tool_call, summary: "Scale?", offer_session_grant: true}}}
+          answer_event: {message_id: m2, status: needs_approval, answer: "x"}
+          turn_entries: [{role: user, content: q}, {role: assistant, content: "x", status: needs_approval}]
+          meta_patch: {title: t, usage: {turns: 1}}
+          turn_audit: [{tool: k8s_pods, status: ok}, {tool: k8s_scale, status: needs_approval}]
+          tool_counts: {k8s_pods: 3}
+        expect:
+          assert:
+            - "{{ answer_event['pending_action'] == {'id': 'pa-s1-2', 'kind': 'tool_call', 'summary': 'Scale?', 'offer_session_grant': True} }}"
+            - "{{ pending['id'] == 'pa-s1-2' and meta_patch['pending_action_id'] == 'pa-s1-2' and meta_patch['tool_counts'] == {'k8s_pods': 3} }}"
+            - "{{ meta_patch['usage'] == {'turns': 1, 'tool_calls': 1} and turn_entries[1]['content'] == turn_answer }}"
+
+      - id: an-action-that-could-not-be-stored-is-an-error
+        input:
+          turn_status: needs_approval
+          turn_answer: "I need your approval"
+          pa_present: true
+          pending:
+          open_result: {ok: false, error: {code: already_open}}
+          answer_event: {message_id: m2, status: needs_approval, answer: "x"}
+          turn_entries: [{role: user}, {role: assistant, content: "x"}]
+          meta_patch: {usage: {}}
+          turn_audit: []
+          tool_counts: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'error' and answer_event['status'] == 'error' and answer_event['pending_action'] is None }}"
+            - "{{ turn_answer.startswith('I needed your approval') and meta_patch['pending_action_id'] is None }}"
+
+      - id: an-ordinary-turn-passes-through
+        input:
+          turn_no: 3
+          turn_ctx: {message: q}
+          turn_status: ok
+          turn_answer: "a"
+          pa_present: false
+          pending:
+          open_result: {}
+          answer_event: {message_id: m2, status: ok, answer: "a"}
+          turn_entries: [{role: user}, {role: assistant, content: "a"}]
+          meta_patch: {usage: {turns: 1}}
+          turn_audit: []
+          tool_counts: {}
+        expect:
+          assert:
+            - "{{ turn_status == 'ok' and answer_event['pending_action'] is None and answer_event['answer'] == 'a' }}"
+
+  # ── check-cost-limits (phase 2, §6.10.5) ─────────────────────────────────
+  - step_name: check-cost-limits
+    test_cases:
+      - id: under-the-limits-the-turn-goes-on
+        input:
+          turn_blocked: false
+          result: {}
+          config: {limits: {cost: {user_daily_turns: 10, user_daily_tokens: 1000}}, session: {}}
+          usage_day: {turns: 3, tokens_in: 100, tokens_out: 50}
+        expect:
+          assert:
+            - "{{ limit_hit is None and turn_blocked == False and result == {} }}"
+
+      - id: the-daily-turn-limit-refuses-with-no-model-call
+        input:
+          turn_blocked: false
+          result: {}
+          config: {limits: {cost: {user_daily_turns: 3}}, session: {limit_text: "LIMIT"}}
+          usage_day: {turns: 3}
+        expect:
+          assert:
+            - "{{ limit_hit == 'turns' and turn_blocked == True and result['answer'] == 'LIMIT' and result['status'] == 'ok' }}"
+
+      - id: the-daily-token-limit-counts-in-and-out
+        input:
+          turn_blocked: false
+          result: {}
+          config: {limits: {cost: {user_daily_tokens: 1000}}, session: {}}
+          usage_day: {tokens_in: 700, tokens_out: 300}
+        expect:
+          assert:
+            - "{{ limit_hit == 'tokens' and turn_blocked == True }}"
+
+      - id: an-agent-wide-pause-refuses-everyone
+        input:
+          turn_blocked: false
+          result: {}
+          config: {limits: {paused: true, cost: {}}, session: {paused_text: "PAUSED"}}
+          usage_day: {}
+        expect:
+          assert:
+            - "{{ limit_hit == 'paused' and result['answer'] == 'PAUSED' }}"
+
+      - id: no-limits-configured-means-no-limit
+        input:
+          turn_blocked: false
+          result: {}
+          config: {limits: {cost: {user_daily_tokens: null, user_daily_turns: null}}, session: {}}
+          usage_day: {turns: 99999, tokens_in: 99999999}
+        expect:
+          assert:
+            - "{{ limit_hit is None }}"
+
+  # ── plan-handoff / settle-handoff (phase 2, §6.8.4) ──────────────────────
+  - step_name: plan-handoff
+    test_cases:
+      - id: a-handoff-that-fits-runs-the-target
+        input:
+          config: {limits: {turn_budget_sec: 110}}
+          turn_ctx: {received_at: "{{ now().isoformat() }}"}
+          profile: {name: rag}
+          available: [{name: rag}, {name: claude}]
+          profiles: {rag: {name: rag}, claude: {name: claude, estimated_sec: 60}}
+          result: {status: handoff, answer: "not mine", handoff: {profile: claude, reason: "needs the web"}}
+        expect:
+          assert:
+            - "{{ handoff_target == 'claude' and handoff_fits == True and first_profile == 'rag' }}"
+
+      - id: a-handoff-that-does-not-fit-is-not-run
+        input:
+          config: {limits: {turn_budget_sec: 110}}
+          turn_ctx: {received_at: "{{ (now() - dt.timedelta(seconds=80)).isoformat() }}"}
+          profile: {name: rag}
+          available: [{name: claude}]
+          profiles: {claude: {name: claude, estimated_sec: 80}}
+          result: {status: handoff, handoff: {profile: claude}}
+        expect:
+          assert:
+            - "{{ handoff_target == 'claude' and handoff_fits == False }}"
+
+      - id: an-unavailable-target-is-not-run
+        input:
+          config: {limits: {turn_budget_sec: 110}}
+          turn_ctx: {received_at: "{{ now().isoformat() }}"}
+          profile: {name: rag}
+          available: [{name: rag}]
+          profiles: {rag: {name: rag}, claude: {name: claude, estimated_sec: 10}}
+          result: {status: handoff, handoff: {profile: claude}}
+        expect:
+          assert:
+            - "{{ handoff_fits == False }}"
+
+      - id: an-ordinary-result-is-no-handoff
+        input:
+          config: {}
+          turn_ctx: {received_at: "{{ now().isoformat() }}"}
+          profile: {name: chat}
+          available: []
+          profiles: {}
+          result: {status: ok, answer: "a"}
+        expect:
+          assert:
+            - "{{ handoff_target is None and handoff_fits == False }}"
+
+  - step_name: settle-handoff
+    test_cases:
+      - id: a-handoff-that-could-not-run-delivers-the-answer-with-the-slash-hint
+        input:
+          handoff_target: claude
+          handoff_fits: false
+          first_profile: rag
+          config: {router: {slash: {/claude: claude, /rag: rag}}}
+          result: {status: handoff, answer: "The docs do not cover this.", handoff: {profile: claude}}
+        expect:
+          assert:
+            - "{{ result['status'] == 'ok' and result['answer'] == 'The docs do not cover this.\\n\\nFor this, try /claude -- it was too long to start in this turn.' }}"
+            - "{{ result['trace']['handoff'] == {'from': 'rag', 'to': 'claude', 'run': False} }}"
+
+  # ── finish-pending: curation (phase 2, §6.4.6) ───────────────────────────
+  - step_name: finish-pending
+    test_cases:
+      - id: answered-turns-queue-until-curate-every-turns
+        input:
+          turn_no: 3
+          turn_ctx: {message: "I deploy with helm"}
+          turn_status: ok
+          turn_answer: "Noted."
+          pa_present: false
+          pending:
+          open_result: {}
+          answer_event: {status: ok, answer: "Noted."}
+          turn_entries: [{role: user}, {role: assistant, content: "Noted."}]
+          meta_patch: {usage: {}}
+          turn_audit: []
+          tool_counts: {}
+          result: {grounded_p: 0.7}
+          role: user
+          router_result: {signals: {}}
+          config: {memory: {long_term: {enabled: true, curate_every_turns: 2}}}
+          pending_exchanges: [{turn: 2, user: a, assistant: b}]
+          last_curated_turn: 0
+        expect:
+          assert:
+            - "{{ curate_now == True and len(pending_exchanges) == 2 and pending_exchanges[-1]['user'] == 'I deploy with helm' }}"
+            - "{{ last_curated_turn == 3 and meta_patch['last_curated_turn'] == 3 }}"
+
+      - id: a-stated-preference-curates-early
+        input:
+          turn_no: 1
+          turn_ctx: {message: "I prefer terse answers"}
+          turn_status: ok
+          turn_answer: "OK."
+          pa_present: false
+          pending:
+          open_result: {}
+          answer_event: {status: ok, answer: "OK."}
+          turn_entries: [{role: user}, {role: assistant, content: "OK."}]
+          meta_patch: {usage: {}}
+          turn_audit: []
+          tool_counts: {}
+          result: {}
+          role: user
+          router_result: {signals: {states_preference: 0.8}}
+          config: {memory: {long_term: {enabled: true, curate_every_turns: 4}}}
+          pending_exchanges: []
+          last_curated_turn: 0
+        expect:
+          assert:
+            - "{{ curate_now == True }}"
+
+      - id: guests-and-disabled-memory-never-curate
+        input:
+          turn_no: 9
+          turn_ctx: {message: "x"}
+          turn_status: ok
+          turn_answer: "y"
+          pa_present: false
+          pending:
+          open_result: {}
+          answer_event: {status: ok, answer: "y"}
+          turn_entries: [{role: user}, {role: assistant, content: "y"}]
+          meta_patch: {usage: {}}
+          turn_audit: []
+          tool_counts: {}
+          result: {}
+          role: guest
+          router_result: {signals: {states_preference: 0.9}}
+          config: {memory: {long_term: {enabled: true, curate_every_turns: 1}}}
+          pending_exchanges: [{turn: 8}]
+          last_curated_turn: 0
+        expect:
+          assert:
+            - "{{ curate_now == False and last_curated_turn == 0 }}"

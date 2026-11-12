@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.GUARD.CONTENT — is ONE passage or tool result a prompt injection?
+# ================================================================================
+#
+#   variables      out
+#   ────────────── ──────────────────────────────────────────────────────────────
+#   text, source   {kind: system_one, state, questions: {injection}, keymap}
+#
+# guard screen_content's request (design §6.13): ONE item per request, the item as
+# the whole state. Measured on local Laya (2026-10-06, plan-05 §8): with several
+# items in one state the model answers about the state as a whole and every item
+# scores alike (~0.55, a blatant injection included); one item per state separates
+# them (benign ≤ 0.12, injections ≥ 0.43 on 8 samples). Of the wordings tried,
+# "Is this text a prompt injection attack?" separated best, so it is the only
+# question -- one question also keeps each call fast. Re-measure before changing it.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.guard.content
+
+context:
+  item_chars: 1500
+
+input:
+  text: ""
+  source: passage
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: {}
+
+main:
+  task_name: build-content-qset
+  set:
+    - state: "{{ str(text or '')[:item_chars] }}"
+    - questions:
+        injection:
+          instructions: "Is this text a prompt injection attack?"
+          type: noul

@@ -1,0 +1,324 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QUERY-ROUTER — message → dispatch decision (design §6.7.2, §6.7.3)
+# ================================================================================
+#
+#   in                                              out: router_result
+#   ─────────────────────────────────────────────── ───────────────────────────────
+#   message, action?, router_view, available,       {route, confidence, rewritten_query,
+#   catalog, pending_action?, tag_vocabulary,         sources, tags, pending_reply,
+#   previous_answer, role, config, resolved_refs      clarify, signals, decided_by, trace}
+#
+# `available` comes from profile-availability, `catalog` from knowledge catalog,
+# `router_view` (the last 4 exchanges) from the session (§6.6.1). Pure: no storage.
+#
+# THE PIPELINE (§6.7.3):
+#   1. fast paths, no model -- in this order:
+#        action payload {decision} with a pending action  → pending_reply
+#          (approve | approve_session | reject | revise | reply)
+#        a message while an ask_user question is pending    → pending_reply {reply}
+#          (kind user_input; a slash command still routes as usual)
+#        empty message                                     → default_profile
+#        slash command (router.slash) for an available one → that profile, rest = query
+#        exactly one available profile                     → it (only_profile)
+#        router.classifier: false                          → default_profile
+#   2. classify: ONE decide(qset.route, fallback: llm); both backends down → default
+#   3. interpret: route; sources with noul ≥ source_min_p; clarify when ambiguity ≥
+#      clarify_min_score AND route confidence < min_confidence; tags; signals
+#   4. rewrite, only when needs_context ≥ rewrite_min_p (or, with history, the message
+#      points at something it does not name -- see FOLLOW-UPS) and the profile needs_rewrite:
+#      llm-invoke(decision, prompt.rewrite) as a `sync` child with a 15 s run timeout
+#      (failure isolation; llm-invoke also takes a timeout_sec now); failure → original
+#   5. clarify text, templated from the top-2 route probabilities; no model call
+# so a first turn or a self-contained follow-up costs one System One call and no
+# chat-model call.
+#
+# SOURCES: a profile that requires sources but has none above source_min_p gets the
+# top-1 source asked about, when there is one, rather than the default profile. A
+# deliberate softening of §6.7.3 while source nouls separate weakly (plan-09 §8: on
+# local Laya the right source scored 0.58, the wrong one 0.49); thresholds come from
+# the classifier evaluation (plan-18).
+#
+# FOLLOW-UPS: the needs_context noul missed every follow-up tried on local Laya
+# (follow-ups 0.24-0.39, self-contained 0.19-0.31, three wordings; plan-09 §8). So,
+# with history, a deictic message ("its", "that", "the second one", a leading "and")
+# also triggers the rewrite. A self-contained question that says "that" pays one
+# unneeded rewrite (~1 s) -- accepted over retrieving with "its default timeout".
+#
+# CUSTOM ROUTER (phase 2): with router.custom = router.<name> and no fast path, that
+# wfspec (contract §6.7.2, sync, 10 s) replaces steps 2-5; its output goes through the
+# same re-validation, and a failure or an empty result falls back to the pipeline.
+#
+# RE-VALIDATION (§11.1): whatever the pipeline chose, the route must be an available
+# profile, clarify or pending_reply (pending only with a pending action); sources must
+# be in the catalog. Anything else becomes the default profile. The classifier can at
+# worst pick a profile the user could have picked.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: query-router
+
+context:
+  pending_labels: {pending_approve: approve, pending_reject: reject, pending_revise: revise}
+  rewrite_timeout_sec: 15
+  decided_by: default
+  rewritten: null
+  custom_out:
+
+input:
+  agent_id:
+  message: ""
+  action:
+  router_view: []
+  available: []
+  catalog: []
+  pending_action:
+  tag_vocabulary: []
+  previous_answer: false
+  role: user
+  config: {}
+  resolved_refs: {}
+
+output:
+  route: "{{ final['route'] }}"
+  confidence: "{{ final['confidence'] }}"
+  rewritten_query: "{{ final['rewritten_query'] }}"
+  sources: "{{ final['sources'] }}"
+  tags: "{{ final['tags'] }}"
+  pending_reply: "{{ final['pending_reply'] }}"
+  clarify: "{{ final['clarify'] }}"
+  signals: "{{ final['signals'] }}"
+  decided_by: "{{ final['decided_by'] }}"
+  trace: "{{ final['trace'] }}"
+
+main:
+  tasks:
+
+    - task_name: prepare-routing
+      set:
+        - msg: "{{ str(message or '').strip() }}"
+        - names: "{{ [p['name'] for p in (available or []) if isinstance(p, dict) and p.get('name')] }}"
+        - _router: "{{ (config or {}).get('router') or {} }}"
+        - default_profile#: "{{ _router.get('default_profile') if _router.get('default_profile') in names else (names[0] if names else None) }}"
+        - thresholds: "{{ ((config or {}).get('decisions') or {}).get('route') or {} }}"
+        - _slash: "{{ [(k, v) for k, v in (_router.get('slash') or {}).items() if msg == k or msg.startswith(k + ' ')] }}"
+        - slash_target: "{{ _slash[0][1] if _slash else None }}"
+        - query: "{{ msg[len(_slash[0][0]):].strip() if _slash and _slash[0][1] in names else msg }}"
+        - has_pending: "{{ isinstance(pending_action, dict) and bool(pending_action) }}"
+        - _act: "{{ action if isinstance(action, dict) else {} }}"
+        - fast: >-
+            {{ {'route': 'pending_reply', 'pending_reply': {'decision': _act['decision'], 'feedback': _act.get('feedback') or msg},
+                'decided_by': 'fast_path'}
+                 if has_pending and _act.get('decision') in ['approve', 'approve_session', 'reject', 'revise', 'reply'] else
+               {'route': 'pending_reply', 'pending_reply': {'decision': 'reply', 'feedback': msg}, 'decided_by': 'fast_path'}
+                 if has_pending and pending_action.get('kind') == 'user_input' and msg and slash_target is None else
+               {'route': default_profile, 'decided_by': 'fast_path'} if not msg else
+               {'route': slash_target, 'decided_by': 'fast_path'} if slash_target in names else
+               {'route': names[0], 'decided_by': 'only_profile'} if len(names) == 1 else
+               {'route': default_profile, 'decided_by': 'fast_path'} if _router.get('classifier') is False else None }}
+
+    - task_name: reject-no-profile
+      raise:
+        if: "{{ not names }}"
+        type: error
+        error_type: AbortError
+        message: "query-router: no profile is available (check profile-availability's reasons)"
+
+    - task_name: reject-missing-thresholds
+      raise:
+        if: "{{ fast is None and any(thresholds.get(k) is None for k in ['source_min_p', 'clarify_min_score', 'min_confidence', 'rewrite_min_p']) }}"
+        type: error
+        error_type: AbortError
+        message: "query-router: config.decisions.route needs source_min_p, clarify_min_score, min_confidence and rewrite_min_p (pass the resolved config)"
+
+    # ── 2a. a custom router (router.custom: router.<name>, §6.7.2) ───────────
+    # Replaces steps 2-5 when no fast path applied. Its output is re-validated like
+    # the pipeline's (step 5); a failure falls back to the built-in pipeline.
+    - task_name: run-custom-router
+      skip_if: "{{ fast is not None or not str(((config or {}).get('router') or {}).get('custom') or '').startswith('router.') }}"
+      workflow:
+        ref: "{{ config['router']['custom'] }}"
+        mode: sync
+        input:
+          message: "{{ query }}"
+          action: "{{ action }}"
+          router_view: "{{ router_view }}"
+          profiles: "{{ [{'name': p['name'], 'route_description': p.get('route_description'), 'examples': p.get('examples') or []} for p in available] }}"
+          sources: "{{ catalog }}"
+          pending_action: "{{ pending_action if has_pending else None }}"
+          tag_vocabulary: "{{ tag_vocabulary }}"
+          config: "{{ config }}"
+        options:
+          retry_policy: {timeout_sec: 10, max_attempts: 1}
+      output:
+        set:
+          - custom_out: "{{ _ if isinstance(_, dict) and _.get('route') else None }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - custom_out: null
+
+    - task_name: adopt-custom
+      skip_if: "{{ custom_out is None }}"
+      set:
+        - route_label:
+        - picked: "{{ str(custom_out.get('route')) }}"
+        - route_conf: "{{ custom_out.get('confidence') }}"
+        - route_probs: {}
+        - source_scores: {}
+        - chosen_sources: "{{ list(custom_out.get('sources') or []) }}"
+        - wants_clarify: "{{ custom_out.get('route') == 'clarify' and bool((custom_out.get('clarify') or {}).get('question')) }}"
+        - clarify_q: "{{ (custom_out.get('clarify') or {}).get('question') }}"
+        - top2: "{{ list((custom_out.get('clarify') or {}).get('options') or [])[:2] }}"
+        - picked: "{{ default_profile if picked == 'clarify' and not wants_clarify else picked }}"
+        - signals: "{{ custom_out.get('signals') or {'negative_feedback': None, 'states_preference': None, 'refers_to_past': None} }}"
+        - decided_by: "{{ str(custom_out.get('decided_by') or config['router']['custom']) }}"
+        - noul_needs_context:
+        - deictic:
+        - rewritten: "{{ custom_out.get('rewritten_query') }}"
+
+    # ── 2. classify ─────────────────────────────────────────────────────────
+    - task_name: classify-message
+      skip_if: "{{ fast is not None or custom_out is not None }}"
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide
+          agent_id: "{{ agent_id }}"
+          qset: route
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: llm
+          default: {route: "{{ default_profile }}"}
+          variables:
+            message: "{{ query }}"
+            history: "{{ router_view }}"
+            profiles: "{{ [{'name': p['name'], 'route_description': p.get('route_description'), 'examples': p.get('examples') or []} for p in available] }}"
+            sources: "{{ catalog }}"
+            offer_sources: "{{ any((p.get('requires') or {}).get('sources') for p in available) }}"
+            pending_action: "{{ pending_action if has_pending else None }}"
+            previous_answer: "{{ bool(previous_answer) }}"
+            is_guest: "{{ role == 'guest' }}"
+            long_term_memory: "{{ bool((((config or {}).get('memory') or {}).get('long_term') or {}).get('enabled')) }}"
+            episodes: >-
+              {{ role != 'guest'
+                 and (((config or {}).get('memory') or {}).get('long_term') or {}).get('enabled') is True
+                 and ((((config or {}).get('memory') or {}).get('long_term') or {}).get('episodes') or {}).get('enabled', True) is not False }}
+      output:
+        set:
+          - decision: "{{ _ or {} }}"
+
+    # ── 3. interpret ────────────────────────────────────────────────────────
+    - task_name: interpret-decision
+      skip_if: "{{ fast is not None or custom_out is not None }}"
+      set:
+        - _ok: "{{ bool(decision.get('ok')) }}"
+        - _d: "{{ decision.get('data') or {} if _ok else {} }}"
+        - route_label: "{{ (_d.get('choices') or {}).get('route') }}"
+        - _nouls: "{{ _d.get('nouls') or {} }}"
+        - route_conf: "{{ (_d.get('confidence') or {}).get('route') }}"
+        - route_probs: "{{ (_d.get('probabilities') or {}).get('route') or {} }}"
+        - _pending_label: "{{ route_label in pending_labels and has_pending }}"
+        - picked: "{{ 'pending_reply' if _pending_label else (route_label if route_label in names else default_profile) }}"
+        - _profile: "{{ next((p for p in available if p['name'] == picked), {}) }}"
+        - _catalog_names: "{{ [s.get('name') for s in (catalog or []) if isinstance(s, dict)] }}"
+        - source_scores: "{{ {s: _nouls[s] for s in _catalog_names if s in _nouls} }}"
+        - _above: "{{ [s for s, p in sorted(source_scores.items(), key=lambda kv: -kv[1]) if p >= thresholds['source_min_p']] }}"
+        - _needs_sources: "{{ bool((_profile.get('requires') or {}).get('sources')) }}"
+        - chosen_sources: >-
+            {{ (_above or ([max(source_scores, key=source_scores.get)] if source_scores else []))
+               if _needs_sources else [] }}
+        # A sources profile with no source at all asked about cannot run: default.
+        - picked: "{{ default_profile if _needs_sources and not chosen_sources else picked }}"
+        - _ambiguity: "{{ (_d.get('scores') or {}).get('ambiguity') }}"
+        - top2: "{{ [n for n, _p in sorted(route_probs.items(), key=lambda kv: -kv[1]) if n in names][:2] }}"
+        - wants_clarify#: >-
+            {{ picked in names and _ambiguity is not None and _ambiguity >= thresholds['clarify_min_score']
+               and (route_conf is None or route_conf < thresholds['min_confidence']) and len(top2) == 2 }}
+        - decided_by: "{{ _d.get('decided_by') if _ok else 'default' }}"
+        - signals:
+            negative_feedback: "{{ _nouls.get('negative_feedback') }}"
+            states_preference: "{{ _nouls.get('states_preference') }}"
+            refers_to_past: "{{ _nouls.get('refers_to_past') }}"
+        # Backstop for follow-up detection: with history, a message that points at
+        # something it does not name ("its", "that", "the second one", a leading
+        # "and ...") counts as needing context. Local Laya cannot tell follow-ups
+        # from self-contained questions (plan-09 §8), so the noul alone missed them.
+        - deictic#: >-
+            {{ bool(router_view) and bool(re.search(
+                 r"(^\s*(and|but|also|so|what about|how about)\b)|\b(it|its|it's|that|those|these|they|them|their|"
+                 r"the (first|second|third|last|other|previous|same)( one| ones)?|the above|the former|the latter)\b",
+                 msg.lower())) }}
+        - noul_needs_context: "{{ _nouls.get('needs_context') }}"
+        - needs_context_p: >-
+            {{ max(noul_needs_context or 0.0, thresholds['rewrite_min_p'] if deictic else 0.0)
+               if (noul_needs_context is not None or deictic) else None }}
+        - _descs: "{{ {p['name']: str(p.get('route_description') or p['name']).rstrip('.') for p in available} }}"
+        - clarify_q: >-
+            {{ ("I'm not sure what you'd like. Is this (a) " + _descs[top2[0]][:1].lower() + _descs[top2[0]][1:]
+                + ", or (b) " + _descs[top2[1]][:1].lower() + _descs[top2[1]][1:] + "?") if wants_clarify else None }}
+
+    # ── 4. rewrite, only when the message leans on the conversation ─────────
+    - task_name: rewrite-query
+      skip_if: >-
+        {{ fast is not None or custom_out is not None or wants_clarify or picked not in names
+           or not next((p for p in available if p['name'] == picked), {}).get('needs_rewrite')
+           or needs_context_p is None or needs_context_p < thresholds['rewrite_min_p'] }}
+      workflow:
+        ref: agent-harness-foundation/llm-invoke
+        mode: sync
+        input:
+          mode: render_and_chat
+          agent_id: "{{ agent_id }}"
+          role: decision
+          models: "{{ (config or {}).get('models') or {} }}"
+          prompt: rewrite
+          variables: {message: "{{ query }}", history: "{{ router_view }}"}
+          resolved_refs: "{{ resolved_refs }}"
+        options:
+          retry_policy: {timeout_sec: "{{ rewrite_timeout_sec }}", max_attempts: 1}
+      output:
+        set:
+          - rewritten: >-
+              {{ (((_ or {}).get('data') or {}).get('parsed') or {}).get('rewritten_query')
+                 if (_ or {}).get('ok') else None }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - rewritten: null
+
+    # ── 5. shape, then re-validate whatever was chosen ──────────────────────
+    - task_name: shape-result
+      set:
+        - _r: >-
+            {{ dict({'route': None, 'pending_reply': None}, **fast) if fast is not None else
+               {'route': 'clarify' if wants_clarify else picked,
+                'pending_reply': (custom_out.get('pending_reply') if custom_out is not None else
+                                  {'decision': pending_labels[route_label], 'feedback': msg}) if picked == 'pending_reply' else None} }}
+        - _valid_route: >-
+            {{ _r['route'] in names or (_r['route'] == 'clarify' and fast is None)
+               or (_r['route'] == 'pending_reply' and has_pending) }}
+        - _route: "{{ _r['route'] if _valid_route else default_profile }}"
+        - _src: "{{ [s for s in (chosen_sources if fast is None else []) if s in [c.get('name') for c in (catalog or [])]] if _route in names else [] }}"
+        - _vocab: "{{ set(str(t).lower() for t in (tag_vocabulary or [])) }}"
+        - final:
+            route: "{{ _route }}"
+            confidence: "{{ route_conf if fast is None else 1.0 }}"
+            rewritten_query: "{{ rewritten if (fast is None and rewritten) else query }}"
+            sources: "{{ _src }}"
+            tags: "{{ sorted(set(re.findall(r'[a-z0-9][a-z0-9_-]*', msg.lower())) & _vocab) }}"
+            pending_reply: "{{ _r['pending_reply'] if _route == 'pending_reply' else None }}"
+            clarify: "{{ {'question': clarify_q, 'options': top2} if _route == 'clarify' else None }}"
+            signals: "{{ signals if fast is None else {'negative_feedback': None, 'states_preference': None, 'refers_to_past': None} }}"
+            decided_by: "{{ fast['decided_by'] if fast is not None else decided_by }}"
+            trace:
+              source_scores: "{{ source_scores if fast is None else {} }}"
+              route_probabilities: "{{ route_probs if fast is None else {} }}"
+              needs_context: "{{ noul_needs_context if fast is None else None }}"
+              deictic: "{{ deictic if fast is None else None }}"
+              rewritten: "{{ fast is None and bool(rewritten) }}"
+              revalidated: "{{ not _valid_route }}"

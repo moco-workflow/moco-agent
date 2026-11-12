@@ -1,0 +1,787 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-REGISTRY — tool manifests, toolsets and the tool lifecycle (design §6.9.3–6)
+# ================================================================================
+#
+#   mode           in                                        data out
+#   ────────────── ───────────────────────────────────────── ─────────────────────────
+#   get            name, scope                               {tool}
+#   list           scope: shared|agent|both, status?,        {tools: [manifest, ...]}
+#                  toolset?
+#   save           name, scope, manifest                     {tool}  (a new draft version)
+#   validate       name, scope                               {tool}  draft → enabled
+#   enable         name, scope                               {tool}  disabled → enabled
+#   disable        name, scope                               {tool}  enabled → disabled
+#   deprecate      name, scope, by                           {tool}  enabled → deprecated
+#   retire         name, scope                               {tool}  deprecated → retired (tool-stats-rollup)
+#   delete         name, scope                               {tool: null}  draft or disabled
+#   list_toolsets  scope: shared|agent|both                  {toolsets: [row, ...]}
+#   save_toolset   scope, toolset: {name, description,       {toolset}
+#                  tools, always_offer}
+#   members        toolsets: [name, ...]                     {toolsets: {name: {found, members,
+#                                                              always_offer}}, tools: [manifest]}
+#   activity_rules —                                         {allowlist, min_side_effects,
+#                                                              default_min_side_effects}
+#
+# ACTIVITY TOOLS are held to two literals here, the authority for both:
+#   activity_allowlist        which activity types may be bound at all
+#   activity_min_side_effects the least side effects a tool binding that type may declare;
+#                             an allowlisted type missing from it gets `external`, so an
+#                             activity a prefix newly lets in is treated as the strictest
+#                             kind until it is classified here
+# `validate` refuses a tool that declares less, and every READ clamps a stored row up to
+# the minimum (raising permission auto → approve when the minimum is write or external),
+# so a row saved before a rule existed is never offered looser than the rule. tool-provider
+# reads both through `activity_rules` instead of keeping copies.
+#
+# ONE OWNER (§4.3): only this wfspec reads or writes `tool:<name>` (topic `tool`) and
+# `toolset:<name>` (topic `toolset`). Both scopes are global namespaces:
+#   shared   agent-harness
+#   agent    agent.<agent_id>        (an agent row shadows a shared row of the same name)
+# User-installed tools (`<uid>:agent.<id>`) are phase 3. The harness built-in tools are
+# data in tool-catalog, never rows here, so `save` rejects a `builtin` binding. Reads
+# that cover the shared scope (list, list_toolsets, members) merge the catalog in as
+# shared rows, and a built-in wins over a stored row of the same name.
+#
+# MANIFEST (§6.9.3). `save` fills the defaults; everything else is the author's:
+#   {schema_version: 1, name, version, title, description, parameters, examples,
+#    result: {schema, shape, max_chars: 8000, sources},
+#    binding: exactly one of
+#      wfspec:   {name: tool.<x>, version?}
+#      activity: {type: <allowlisted>, input_template: {...}}
+#      mcp:      {endpoint, tool_name, provider?}   (authored, or imported by tool-provider)
+#    credential: {mode: none|service|user, secret_key, connect_hint},
+#    policy: {side_effects: none|read|write|external, permission: auto|approve|deny,
+#             idempotent, allow_session_grant: false, approval_template,
+#             limits: {per_turn: 4, per_session: 50},
+#             enabled_for: {users: ["*"], denied_users: []}},
+#    execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}},
+#    tags, toolsets, scope, origin: authored | provider:<name> (tool-provider imports),
+#    status, deprecated_by,
+#    created_at, updated_at, updated_by}
+# permission defaults to auto for side_effects none/read and approve otherwise;
+# idempotent defaults to true for none/read. side_effects has no default: `validate`
+# requires it, so nobody gets a write tool by forgetting a field.
+#
+# LIFECYCLE (row state machine; an illegal transition is ok: false, invalid_state):
+#   save ─▶ draft ──validate──▶ enabled ──disable──▶ disabled ──enable──▶ enabled
+#                                  └──deprecate {by}──▶ deprecated ──retire──▶ retired
+#   draft | disabled ──delete──▶ (row deleted)
+# `save` on an existing draft, enabled or disabled tool writes version + 1 as a DRAFT:
+# an edited tool is offline until it is validated again, so nothing unvalidated is
+# ever offered. A deprecated or retired tool cannot be saved (save a new name).
+# `save` keeps a tool's origin: it refuses to write over a row of another origin
+# (authored, or another provider), so imported tools -- named without a provider
+# prefix -- never silently replace someone else's. A disabled tool can be deleted
+# (tool-provider deletes a removed provider's tools this way).
+# `enable` re-validates. `deprecate` needs `by`: an enabled tool in the same scope.
+#
+# VALIDATE (check-manifest; every problem is reported, joined in error.message):
+#   - name, description; side_effects, permission, limits, retry, timeout in range
+#   - parameters: {type: object, properties: {...}, required ⊆ properties}; each
+#     property has a type in json_types and, if given, a non-empty `enum` list.
+#     ENFORCED by tool-executor: required, primitive types, enum. Other JSON Schema
+#     keywords (minimum, pattern, items, ...) are passed to the model, not enforced.
+#   - binding: exactly one of wfspec | activity | mcp; activity type on the
+#     ALLOWLIST below (a literal, so any change shows in a diff); a wfspec binding
+#     names a `tool.*` wfspec deployed in the harness or the agent package
+#   - templates (input_template leaves, result.shape, result.sources,
+#     approval_template): strings with balanced `{{ }}` and no `__` inside an
+#     expression. They are rendered in a scope that holds only args, result, config
+#     and user_id (tool-executor), and `dry_run` renders each against the manifest's
+#     `examples` -- that is the full compile check
+#   - credential: none on an http.* or mcp binding -- those take no secret name, and
+#     the harness does not fetch secrets at dispatch (F49): a credentialed http/mcp
+#     tool is a tool.* wfspec that passes an encrypted secret (builtin.secret.get ->
+#     encrypted_auth_token) or acquires a token; the secret name goes into
+#     input_template for activities that take names (k8s
+#     connection.token_secret_key, sql, gdrive, ...)
+#   - credential: secret_key matches secret_name_pattern; service keys are
+#     `global/<NAME>` and must exist (builtin.secret.list, names only); user keys are
+#     the user's own and are checked per call by tool-policy (needs_credential)
+#   - execution.mode: sync | async (§6.9.9: async runs as a job; timeout up to
+#     max_async_timeout_sec)
+#
+# WRITES call `access` (write; scope shared → shared, agent → agent): both need an
+# admin. Reads are unguarded; tool-policy decides what a user may be offered.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-registry
+
+context:
+  valid_modes: ["get", "list", "save", "validate", "enable", "disable", "deprecate", "retire",
+                "delete", "list_toolsets", "save_toolset", "members", "activity_rules"]
+  row_modes: ["get", "save", "validate", "enable", "disable", "deprecate", "retire", "delete"]
+  read_modes: ["list", "list_toolsets", "members"]
+  valid_scopes: ["shared", "agent"]
+  name_pattern: "^[a-z][a-z0-9_]{1,48}$"
+  toolset_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  wfspec_binding_pattern: "^tool\\.[a-z0-9][a-z0-9.-]{0,62}$"
+  secret_name_pattern: "^(global/)?[A-Za-z0-9_.-]{1,128}$"
+  # The activity allowlist (§6.9.3). An entry ending in '.' is a prefix; any other
+  # entry is one exact activity type. Never builtin.state, builtin.secret, shell,
+  # claude_agent or builtin.deploy.
+  activity_allowlist: ["http.", "sql.", "gdrive.", "llama_index.", "typesafe.", "k8s.get", "k8s.list"]
+  # The least side effects per allowlisted activity type (header). http.request and
+  # typesafe.system_one take a URL / base_url the model may choose: external.
+  activity_min_side_effects:
+    http.request: external
+    sql.query: read
+    sql.execute: write
+    k8s.get: read
+    k8s.list: read
+    gdrive.list: read
+    gdrive.get_metadata: read
+    gdrive.download: read
+    gdrive.upload: write
+    gdrive.create_folder: write
+    gdrive.delete: write
+    llama_index.query: read
+    llama_index.index_docs: write
+    llama_index.index_files: write
+    llama_index.index_gdrive: write
+    llama_index.index_github: write
+    llama_index.index_site: write
+    llama_index.index_texts: write
+    llama_index.index_web: write
+    llama_index.delete_docs: write
+    llama_index.drop_table: write
+    typesafe.system_one: external
+  default_min_side_effects: external
+  side_effect_values: ["none", "read", "write", "external"]
+  permission_values: ["auto", "approve", "deny"]
+  credential_modes: ["none", "service", "user"]
+  json_types: ["string", "number", "integer", "boolean", "array", "object"]
+  max_timeout_sec: 300
+  # An async tool runs as a job (§6.9.9, §6.12), bounded by limits.job_timeout_sec.
+  max_async_timeout_sec: 3600
+  max_retry_attempts: 3
+  # from-status → statuses a mode may move to; `validate` and `enable` also run
+  # check-manifest, `deprecate` also checks its replacement.
+  transitions:
+    validate: {draft: enabled}
+    enable: {disabled: enabled}
+    disable: {enabled: disabled}
+    deprecate: {enabled: deprecated}
+    retire: {deprecated: retired}
+  savable_statuses: [null, "draft", "enabled", "disabled"]
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  shared_namespace: agent-harness
+  # Where the harness's own tool.* wfspecs live (tool.mcp-call).
+  harness_package: agent-harness-tools
+  ok: false
+  data:
+  error:
+  # Seeded so the read paths can skip a scope without leaving a name unbound.
+  shared_tool_keys: []
+  agent_tool_keys: []
+  shared_toolset_keys: []
+  agent_toolset_keys: []
+  tool_rows: []
+  catalog: {}
+  toolset_rows: []
+  global_secrets: []
+  cat_agent: {}
+  cat_harness: {}
+  cat_target: {}
+  run_target: ""
+  current:
+  replacement:
+  manifest_problems: []
+
+input:
+  mode: get
+  agent_id:
+  name:
+  scope: shared
+  status:
+  toolset:
+  toolsets: []
+  manifest: {}
+  by:
+  definition_access: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "tool-registry: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-bad-scope
+      raise:
+        if: "{{ mode != 'members' and scope not in valid_scopes + (['both'] if mode in ['list', 'list_toolsets'] else []) }}"
+        type: error
+        error_type: AbortError
+        message: "tool-registry: scope must be one of {{ ', '.join(valid_scopes) }}{{ ' or both' if mode in ['list', 'list_toolsets'] else '' }}, got '{{ scope }}'"
+
+    - task_name: check-addressing
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - needs_agent: >-
+            {{ (mode == 'members' and bool(aid)) or scope in ['agent', 'both'] }}
+        - agent_ns: "agent.{{ aid }}"
+        - error: >-
+            {{ {'code': 'invalid_input', 'message': 'agent_id must match ' + agent_id_pattern, 'retryable': False}
+               if needs_agent and not re.match(agent_id_pattern, aid) else
+               {'code': 'invalid_input', 'message': 'scope agent needs an agent_id', 'retryable': False}
+               if scope == 'agent' and not aid else None }}
+        - addressed#: "{{ error is None }}"
+
+    - task_name: mode-activity-rules
+      skip_if: "{{ mode != 'activity_rules' }}"
+      set:
+        - ok: true
+        - data: >-
+            {{ {'allowlist': activity_allowlist, 'min_side_effects': activity_min_side_effects,
+                'default_min_side_effects': default_min_side_effects} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # READS — list, list_toolsets, members. Keys per scope, then one read per
+    # row (no batch read exists).
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-read
+      skip_if: "{{ not addressed or mode not in read_modes }}"
+      tasks:
+        - task_name: plan-read
+          set:
+            - want_tools: "{{ mode in ['list', 'members'] }}"
+            - want_toolsets: "{{ mode in ['list_toolsets', 'members'] }}"
+            - want_shared: "{{ mode == 'members' or scope in ['shared', 'both'] }}"
+            - want_agent: "{{ (mode == 'members' and bool(aid)) or scope in ['agent', 'both'] }}"
+
+        # The harness built-ins (tool-catalog) read as shared rows. They win over a row of
+        # the same name, so a stored tool can never impersonate knowledge_search.
+        - task_name: read-catalog
+          skip_if: "{{ not want_shared }}"
+          workflow:
+            ref: tool-catalog
+            mode: inline
+          output:
+            set:
+              - catalog: "{{ _ or {} }}"
+
+        - task_name: list-shared-tools
+          skip_if: "{{ not (want_tools and want_shared) }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ shared_namespace }}", key_pattern: "tool:*", topic_pattern: tool}
+          output:
+            set:
+              - shared_tool_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: list-agent-tools
+          skip_if: "{{ not (want_tools and want_agent) }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ agent_ns }}", key_pattern: "tool:*", topic_pattern: tool}
+          output:
+            set:
+              - agent_tool_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: list-shared-toolsets
+          skip_if: "{{ not (want_toolsets and want_shared) }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ shared_namespace }}", key_pattern: "toolset:*", topic_pattern: toolset}
+          output:
+            set:
+              - shared_toolset_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: list-agent-toolsets
+          skip_if: "{{ not (want_toolsets and want_agent) }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: true, namespace: "{{ agent_ns }}", key_pattern: "toolset:*", topic_pattern: toolset}
+          output:
+            set:
+              - agent_toolset_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+        - task_name: read-tool-rows
+          skip_if: "{{ not want_tools }}"
+          loop:
+            in: >-
+              {{ [(shared_namespace, k) for k in shared_tool_keys] + [(agent_ns, k) for k in agent_tool_keys] }}
+            foreach: entry
+            execute_mode: parallel
+            do:
+              task_name: read-tool-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "{{ entry[0] }}", key: "{{ entry[1] }}"}
+          output:
+            set:
+              - tool_rows: >-
+                  {{ [r for r in (_ or [])
+                      if isinstance(r, dict) and r.get('schema_version', 0) in supported_schema_versions] }}
+
+        - task_name: read-toolset-rows
+          skip_if: "{{ not want_toolsets }}"
+          loop:
+            in: >-
+              {{ [(shared_namespace, k) for k in shared_toolset_keys] + [(agent_ns, k) for k in agent_toolset_keys] }}
+            foreach: entry
+            execute_mode: parallel
+            do:
+              task_name: read-toolset-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "{{ entry[0] }}", key: "{{ entry[1] }}"}
+          output:
+            set:
+              - toolset_rows: >-
+                  {{ [r for r in (_ or [])
+                      if isinstance(r, dict) and r.get('schema_version', 0) in supported_schema_versions] }}
+
+        # An agent row shadows a shared row of the same name (both lists, and members).
+        - task_name: shape-read
+          set:
+            - _merged: >-
+                {{ list(dict([(r.get('name'), r) for r in tool_rows if r.get('scope') != 'agent']
+                             + [(r.get('name'), r) for r in tool_rows if r.get('scope') == 'agent']
+                             + [(r.get('name'), r) for r in ((catalog.get('tools') or []) if want_tools else [])]).values()) }}
+            # Activity tools clamped up to their type's minimum side effects (header).
+            - _tools: >-
+                {{ [dict(t, policy=dict(pol, side_effects=floor,
+                                        permission='approve' if pol.get('permission') == 'auto' and floor in ['write', 'external']
+                                                   else pol.get('permission'),
+                                        side_effects_raised_from=pol.get('side_effects')))
+                    if floor is not None and (side_effect_values.index(pol.get('side_effects')) if pol.get('side_effects') in side_effect_values else -1)
+                                             < side_effect_values.index(floor)
+                    else t
+                    for t in _merged
+                    for pol in [t.get('policy') if isinstance(t.get('policy'), dict) else {}]
+                    for floor in [activity_min_side_effects.get(str(((t.get('binding') or {}).get('activity') or {}).get('type')), default_min_side_effects)
+                                  if isinstance((t.get('binding') or {}).get('activity'), dict) else None]] }}
+            - _sets: >-
+                {{ dict([(r.get('name'), r) for r in toolset_rows if r.get('scope') != 'agent']
+                        + [(r.get('name'), r) for r in toolset_rows if r.get('scope') == 'agent']
+                        + [(r.get('name'), r) for r in ((catalog.get('toolsets') or []) if want_toolsets else [])]) }}
+            - _wanted: "{{ [str(t) for t in (toolsets or [])] }}"
+            - _members: >-
+                {{ {ts: sorted(set(list((_sets.get(ts) or {}).get('tools') or [])
+                                   + [t.get('name') for t in _tools if ts in (t.get('toolsets') or [])]))
+                    for ts in _wanted} }}
+            - ok: true
+            - data: >-
+                {{ {'tools': sorted([t for t in _tools
+                                     if (status is None or t.get('status') == status)
+                                        and (toolset is None or toolset in (t.get('toolsets') or [])
+                                             or t.get('name') in ((_sets.get(toolset) or {}).get('tools') or []))],
+                                    key=lambda t: str(t.get('name')))}
+                   if mode == 'list' else
+                   {'toolsets': sorted(_sets.values(), key=lambda s: str(s.get('name')))}
+                   if mode == 'list_toolsets' else
+                   {'toolsets': {ts: {'found': ts in _sets, 'members': _members[ts],
+                                      'always_offer': [n for n in ((_sets.get(ts) or {}).get('always_offer') or [])
+                                                       if n in _members[ts]]}
+                                 for ts in _wanted},
+                    'tools': sorted([t for t in _tools if any(t.get('name') in _members[ts] for ts in _wanted)],
+                                    key=lambda t: str(t.get('name')))} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SAVE_TOOLSET — one toolset row
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-save-toolset
+      skip_if: "{{ not addressed or mode != 'save_toolset' }}"
+      tasks:
+        - task_name: authorize-toolset-write
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: authorize
+              agent_id: "{{ aid }}"
+              action: write
+              scope: "{{ scope }}"
+              definition_access: "{{ definition_access }}"
+          output:
+            set:
+              - ts_authz: "{{ (_ or {}).get('data') or {} }}"
+
+        - task_name: plan-toolset
+          set:
+            - _ts: "{{ toolset if isinstance(toolset, dict) else {} }}"
+            - _tsname: '{{ str(_ts.get("name") or "").strip() }}'
+            - _tools: "{{ _ts.get('tools') or [] }}"
+            - _always: "{{ _ts.get('always_offer') or [] }}"
+            - ts_problem#: >-
+                {{ ('forbidden', 'not allowed to write ' + scope + ' toolsets (' + str(ts_authz.get('reason')) + ')')
+                     if not ts_authz.get('allow') else
+                   ('invalid_input', 'toolset.name must match ' + toolset_pattern)
+                     if not re.match(toolset_pattern, _tsname) else
+                   ('invalid_input', 'toolset.tools and toolset.always_offer must be lists of tool names')
+                     if not isinstance(_tools, list) or not isinstance(_always, list)
+                        or not all(isinstance(n, str) and re.match(name_pattern, n) for n in _tools + _always) else None }}
+            - error: "{{ None if ts_problem is None else {'code': ts_problem[0], 'message': ts_problem[1], 'retryable': False} }}"
+            - ts_ns: "{{ shared_namespace if scope == 'shared' else agent_ns }}"
+            - ts_key: "toolset:{{ _tsname }}"
+            - ts_row: >-
+                {{ None if ts_problem is not None else
+                   {'schema_version': schema_version, 'name': _tsname, 'scope': scope,
+                    'description': str(_ts.get('description') or ''),
+                    'tools': sorted(set(_tools)), 'always_offer': sorted(set(_always)),
+                    'updated_at': now().isoformat(), 'updated_by': str(__user_info__.get('user_id'))} }}
+
+        - task_name: write-toolset
+          skip_if: "{{ ts_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: true
+              namespace: "{{ ts_ns }}"
+              key: "{{ ts_key }}"
+              value: "{{ ts_row }}"
+              topic: toolset
+
+        - task_name: shape-toolset
+          set:
+            - ok: "{{ ts_problem is None }}"
+            - data: "{{ {'toolset': ts_row} if ts_problem is None else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ONE TOOL ROW — get, save and the lifecycle modes
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-row
+      skip_if: "{{ not addressed or mode not in row_modes }}"
+      tasks:
+        - task_name: check-name
+          set:
+            - sname: '{{ str(name or "").strip() }}'
+            - valid#: "{{ bool(re.match(name_pattern, sname)) }}"
+            - row_ns: "{{ shared_namespace if scope == 'shared' else agent_ns }}"
+            - key: "tool:{{ sname }}"
+            - error: >-
+                {{ None if valid else
+                   {'code': 'invalid_input', 'message': 'name must match ' + name_pattern, 'retryable': False} }}
+
+        - task_name: read-current
+          skip_if: "{{ not valid }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "{{ row_ns }}", key: "{{ key }}"}
+          output:
+            set:
+              - current: "{{ _ if isinstance(_, dict) else None }}"
+
+        - task_name: shape-get
+          skip_if: "{{ not valid or mode != 'get' }}"
+          set:
+            - ok: "{{ current is not None }}"
+            # Clamped as on every read (header).
+            - data: >-
+                {{ {'tool': [dict(current, policy=dict(pol, side_effects=floor,
+                                                       permission='approve' if pol.get('permission') == 'auto' and floor in ['write', 'external']
+                                                                  else pol.get('permission'),
+                                                       side_effects_raised_from=pol.get('side_effects')))
+                             if floor is not None and (side_effect_values.index(pol.get('side_effects')) if pol.get('side_effects') in side_effect_values else -1)
+                                                      < side_effect_values.index(floor)
+                             else current
+                             for pol in [current.get('policy') if isinstance(current.get('policy'), dict) else {}]
+                             for floor in [activity_min_side_effects.get(str(((current.get('binding') or {}).get('activity') or {}).get('type')), default_min_side_effects)
+                                           if isinstance((current.get('binding') or {}).get('activity'), dict) else None]][0]}
+                   if current is not None else None }}
+            - error: "{{ None if current is not None else {'code': 'not_found', 'message': 'no ' + scope + ' tool ' + sname, 'retryable': False} }}"
+
+        - task_name: authorize-write
+          skip_if: "{{ not valid or mode == 'get' }}"
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input:
+              mode: authorize
+              agent_id: "{{ aid }}"
+              action: write
+              scope: "{{ scope }}"
+              definition_access: "{{ definition_access }}"
+          output:
+            set:
+              - authz: "{{ (_ or {}).get('data') or {} }}"
+
+        # validate / enable check the manifest; these are its outside facts.
+        - task_name: plan-checks
+          skip_if: "{{ not valid or mode not in ['validate', 'enable', 'deprecate'] }}"
+          set:
+            - _m: "{{ current or {} }}"
+            - _b: "{{ _m.get('binding') if isinstance(_m.get('binding'), dict) else {} }}"
+            - _c: "{{ _m.get('credential') if isinstance(_m.get('credential'), dict) else {} }}"
+            - run_checks: "{{ current is not None and bool(authz.get('allow')) and mode in ['validate', 'enable'] }}"
+            - need_catalog: "{{ run_checks and isinstance(_b.get('wfspec'), dict) }}"
+            # tool.run-workflow (workflow providers): the target must be deployed too.
+            - run_target: >-
+                {{ str(((_b.get('wfspec') or {}).get('workflow') or {}).get('ref') or '')
+                   if need_catalog and (_b.get('wfspec') or {}).get('name') == 'tool.run-workflow' else '' }}
+            - need_secrets: >-
+                {{ run_checks and _c.get('mode') == 'service' and str(_c.get('secret_key') or '').startswith('global/') }}
+            - by_name: '{{ str(by or "").strip() }}'
+            - need_replacement: >-
+                {{ current is not None and bool(authz.get('allow')) and mode == 'deprecate'
+                   and bool(re.match(name_pattern, by_name)) and by_name != sname }}
+
+        - task_name: catalog-agent
+          skip_if: "{{ not valid or mode not in ['validate', 'enable'] or not need_catalog or scope != 'agent' }}"
+          workflow:
+            ref: agent-harness-foundation/package-catalog
+            mode: sync
+            input: {package_name: "agent-{{ aid }}"}
+            options:
+              retry_policy: {timeout_sec: 60, max_attempts: 1}
+          output:
+            set:
+              - cat_agent: "{{ _ or {} }}"
+
+        - task_name: catalog-harness
+          skip_if: "{{ not valid or mode not in ['validate', 'enable'] or not need_catalog }}"
+          workflow:
+            ref: agent-harness-foundation/package-catalog
+            mode: sync
+            input: {package_name: "{{ harness_package }}"}
+            options:
+              retry_policy: {timeout_sec: 60, max_attempts: 1}
+          output:
+            set:
+              - cat_harness: "{{ _ or {} }}"
+
+        - task_name: catalog-target
+          skip_if: "{{ not valid or mode not in ['validate', 'enable'] or not run_target or '/' not in run_target }}"
+          workflow:
+            ref: agent-harness-foundation/package-catalog
+            mode: sync
+            input: {package_name: "{{ run_target.split('/')[0] }}"}
+            options:
+              retry_policy: {timeout_sec: 60, max_attempts: 1}
+          output:
+            set:
+              - cat_target: "{{ _ or {} }}"
+
+        - task_name: list-global-secrets
+          skip_if: "{{ not valid or mode not in ['validate', 'enable'] or not need_secrets }}"
+          activity:
+            type: builtin.secret.list
+            input: {in_global_ns: true}
+          output:
+            set:
+              - global_secrets: "{{ [str(k) for k in (_ or [])] }}"
+
+        - task_name: read-replacement
+          skip_if: "{{ not valid or mode != 'deprecate' or not need_replacement }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "{{ row_ns }}", key: "tool:{{ by_name }}"}
+          output:
+            set:
+              - replacement: "{{ _ if isinstance(_, dict) else None }}"
+
+        - task_name: check-manifest
+          skip_if: "{{ not valid or mode not in ['validate', 'enable'] or not run_checks }}"
+          set:
+            - _m: "{{ current or {} }}"
+            - _p: "{{ _m.get('parameters') if isinstance(_m.get('parameters'), dict) else {} }}"
+            - _props: "{{ _p.get('properties') if isinstance(_p.get('properties'), dict) else {} }}"
+            - _req: "{{ _p.get('required') if isinstance(_p.get('required'), list) else [] }}"
+            - _b: "{{ _m.get('binding') if isinstance(_m.get('binding'), dict) else {} }}"
+            - _kinds: "{{ [k for k in ['wfspec', 'activity', 'mcp', 'builtin'] if k in _b] }}"
+            - _act: "{{ _b.get('activity') if isinstance(_b.get('activity'), dict) else {} }}"
+            - _atype: '{{ str(_act.get("type") or "") }}'
+            - _wf: "{{ _b.get('wfspec') if isinstance(_b.get('wfspec'), dict) else {} }}"
+            - _wfname: '{{ str(_wf.get("name") or "") }}'
+            - _mcp: "{{ _b.get('mcp') if isinstance(_b.get('mcp'), dict) else {} }}"
+            - _pol: "{{ _m.get('policy') if isinstance(_m.get('policy'), dict) else {} }}"
+            - _lim: "{{ _pol.get('limits') if isinstance(_pol.get('limits'), dict) else {} }}"
+            - _ex: "{{ _m.get('execution') if isinstance(_m.get('execution'), dict) else {} }}"
+            - _res: "{{ _m.get('result') if isinstance(_m.get('result'), dict) else {} }}"
+            - _cred: "{{ _m.get('credential') if isinstance(_m.get('credential'), dict) else {} }}"
+            - _skey: '{{ str(_cred.get("secret_key") or "") }}'
+            # Every template string, input_template leaves included: json.dumps flattens
+            # the nesting so one regex finds them all.
+            - _tpl_text: >-
+                {{ json.dumps([_act.get('input_template'), _res.get('shape'), _res.get('sources'),
+                               _pol.get('approval_template')]) }}
+            - _tpl_ok: >-
+                {{ all(t is None or isinstance(t, str) for t in [_res.get('shape'), _res.get('sources'), _pol.get('approval_template')])
+                   and isinstance(_act.get('input_template', {}), dict) }}
+            # chr(123)/chr(125) are the braces: a literal pair in an expression ends it.
+            - _open: "{{ chr(123) * 2 }}"
+            - _close: "{{ chr(125) * 2 }}"
+            # Braces count only inside JSON string tokens: a nested mapping's close is `}}` too.
+            - _tpl_strings: "{{ [json.loads(t) for t in re.findall(r'\"(?:[^\"\\\\]|\\\\.)*\"', _tpl_text)] }}"
+            # A whole-expression string (starts {{, ends }}, one {{) may hold any braces,
+            # as the evaluator treats it; only interpolated strings need balanced pairs.
+            - _whole: "{{ [t.strip().startswith(_open) and t.strip().endswith(_close) and t.count(_open) == 1 for t in _tpl_strings] }}"
+            - _exprs: >-
+                {{ [e for t, w in zip(_tpl_strings, _whole)
+                    for e in ([t.strip()[2:-2]] if w else re.findall(re.escape(_open) + '(.*?)' + re.escape(_close), t, flags=re.S))] }}
+            - manifest_problems#: >-
+                {{ [p for p in [
+                     'description is required' if not str(_m.get('description') or '').strip() else None,
+                     'parameters must be {type: object, properties: {...}}'
+                       if _p.get('type') != 'object' or not isinstance(_p.get('properties', {}), dict) else None,
+                     'parameters.required must name declared properties'
+                       if not isinstance(_p.get('required', []), list) or any(r not in _props for r in _req) else None,
+                     ('parameter ' + ', '.join(sorted(n for n, s in _props.items()
+                        if not isinstance(s, dict) or s.get('type') not in json_types
+                           or ('enum' in s and not (isinstance(s['enum'], list) and s['enum']))))
+                      + ': each needs a type in ' + ', '.join(json_types) + ' and a non-empty enum if any')
+                       if any(not isinstance(s, dict) or s.get('type') not in json_types
+                              or ('enum' in s and not (isinstance(s['enum'], list) and s['enum']))
+                              for s in _props.values()) else None,
+                     'binding must be exactly one of wfspec, activity, mcp' if len(_kinds) != 1 else None,
+                     'binding builtin is harness-only (tool-catalog)' if 'builtin' in _kinds else None,
+                     ('activity ' + _atype + ' is not on the allowlist (' + ', '.join(activity_allowlist) + ')')
+                       if _kinds == ['activity'] and not any(_atype.startswith(a) if a.endswith('.') else _atype == a
+                                                             for a in activity_allowlist) else None,
+                     ('wfspec binding must name a tool.* wfspec, got ' + repr(_wfname))
+                       if _kinds == ['wfspec'] and not re.match(wfspec_binding_pattern, _wfname) else None,
+                     ('wfspec ' + _wfname + ' is not deployed in ' + harness_package
+                      + (' or agent-' + aid if scope == 'agent' else ''))
+                       if _kinds == ['wfspec'] and re.match(wfspec_binding_pattern, _wfname)
+                          and _wfname not in (cat_harness.get('wfspecs') or []) + (cat_agent.get('wfspecs') or []) else None,
+                     ('workflow ' + run_target + ' is not deployed to you on this stage')
+                       if run_target and run_target.split('/', 1)[-1] not in (cat_target.get('wfspecs') or []) else None,
+                     'mcp binding needs an http(s) endpoint and a tool_name'
+                       if _kinds == ['mcp'] and not (re.match(r'^https?://', str(_mcp.get('endpoint') or ''))
+                                                     and str(_mcp.get('tool_name') or '').strip()) else None,
+                     'templates must be strings (input_template a mapping)' if not _tpl_ok else None,
+                     'unbalanced expression braces in a template'
+                       if any(not w and t.count(_open) != t.count(_close) for t, w in zip(_tpl_strings, _whole)) else None,
+                     'templates may not use dunder names' if any('__' in e for e in _exprs) else None,
+                     ('policy.side_effects must be one of ' + ', '.join(side_effect_values))
+                       if _pol.get('side_effects') not in side_effect_values else None,
+                     ('activity ' + _atype + ' must declare side_effects at least '
+                      + activity_min_side_effects.get(_atype, default_min_side_effects))
+                       if _kinds == ['activity'] and _pol.get('side_effects') in side_effect_values
+                          and any(_atype.startswith(a) if a.endswith('.') else _atype == a for a in activity_allowlist)
+                          and side_effect_values.index(_pol.get('side_effects'))
+                              < side_effect_values.index(activity_min_side_effects.get(_atype, default_min_side_effects)) else None,
+                     ('policy.permission must be one of ' + ', '.join(permission_values))
+                       if _pol.get('permission') not in permission_values else None,
+                     'policy.idempotent and policy.allow_session_grant must be booleans'
+                       if not isinstance(_pol.get('idempotent'), bool) or not isinstance(_pol.get('allow_session_grant'), bool) else None,
+                     'policy.limits per_turn and per_session must be positive integers'
+                       if not all(isinstance(_lim.get(k), int) and not isinstance(_lim.get(k), bool) and _lim.get(k) > 0
+                                  for k in ['per_turn', 'per_session']) else None,
+                     ('execution.timeout_sec must be an integer in 1..'
+                      + str(max_async_timeout_sec if _ex.get('mode') == 'async' else max_timeout_sec))
+                       if not (isinstance(_ex.get('timeout_sec'), int)
+                               and 0 < _ex.get('timeout_sec') <= (max_async_timeout_sec if _ex.get('mode') == 'async' else max_timeout_sec)) else None,
+                     'execution.mode must be sync or async' if _ex.get('mode') not in ['sync', 'async'] else None,
+                     ('execution.retry.max_attempts must be an integer in 1..' + str(max_retry_attempts))
+                       if not (isinstance((_ex.get('retry') or {}).get('max_attempts'), int)
+                               and 0 < (_ex.get('retry') or {}).get('max_attempts') <= max_retry_attempts) else None,
+                     'result.max_chars must be a positive integer'
+                       if not (isinstance(_res.get('max_chars'), int) and _res.get('max_chars') > 0) else None,
+                     ('credential.mode must be one of ' + ', '.join(credential_modes))
+                       if _cred.get('mode') not in credential_modes else None,
+                     ('credential.secret_key must match ' + secret_name_pattern)
+                       if _cred.get('mode') in ['service', 'user'] and not re.match(secret_name_pattern, _skey) else None,
+                     'a service credential is a global secret: global/<NAME>'
+                       if _cred.get('mode') == 'service' and not _skey.startswith('global/') else None,
+                     'a user credential is the user\'s own secret: drop the global/ prefix'
+                       if _cred.get('mode') == 'user' and _skey.startswith('global/') else None,
+                     ('service secret ' + _skey + ' does not exist')
+                       if _cred.get('mode') == 'service' and _skey.startswith('global/')
+                          and _skey[len('global/'):] not in global_secrets else None,
+                     ('credential ' + str(_cred.get('mode')) + ' needs an activity that takes secret NAMES; '
+                      + (_atype if _kinds == ['activity'] else 'mcp.call_tool') + ' takes no secret name (F49): '
+                      + 'bind a tool.* wfspec that passes an encrypted secret')
+                       if _cred.get('mode') in ['service', 'user'] and (_kinds == ['mcp'] or (_kinds == ['activity'] and _atype.startswith('http.'))) else None,
+                     ('toolsets must match ' + toolset_pattern)
+                       if not isinstance(_m.get('toolsets', []), list)
+                          or not all(isinstance(t, str) and re.match(toolset_pattern, t) for t in (_m.get('toolsets') or [])) else None,
+                   ] if p is not None] }}
+
+        - task_name: plan-write
+          skip_if: "{{ not valid or mode == 'get' }}"
+          set:
+            - _uid: '{{ str(__user_info__.get("user_id")) }}'
+            - _from: "{{ (current or {}).get('status') }}"
+            - _m: "{{ manifest if isinstance(manifest, dict) else {} }}"
+            - _to: "{{ (transitions.get(mode) or {}).get(_from) }}"
+            - _origin: "{{ str(_m.get('origin')) if re.match(r'^provider:[a-z][a-z0-9-]{1,31}$', str(_m.get('origin') or '')) else 'authored' }}"
+            - problem#: >-
+                {{ ('forbidden', 'not allowed to write ' + scope + ' tools (' + str(authz.get('reason')) + ')')
+                     if not authz.get('allow') else
+                   ('not_found', 'no ' + scope + ' tool ' + sname)
+                     if mode != 'save' and current is None else
+                   ('invalid_state', 'tool ' + sname + ' is ' + str(_from) + ' and cannot be saved')
+                     if mode == 'save' and _from not in savable_statuses else
+                   ('invalid_input', 'manifest must be a mapping')
+                     if mode == 'save' and not isinstance(manifest, dict) else
+                   ('invalid_input', 'manifest.name must equal name')
+                     if mode == 'save' and str(_m.get('name', sname)) != sname else
+                   ('invalid_input', 'binding builtin is harness-only (tool-catalog)')
+                     if mode == 'save' and isinstance(_m.get('binding'), dict) and 'builtin' in _m.get('binding') else
+                   ('invalid_state', 'tool ' + sname + ' already exists from ' + str(current.get('origin') or 'authored') + '; it cannot be replaced from ' + _origin)
+                     if mode == 'save' and current is not None and str(current.get('origin') or 'authored') != _origin else
+                   ('invalid_state', 'tool ' + sname + ' is ' + str(_from) + ' and can only be deleted as a draft or disabled')
+                     if mode == 'delete' and _from not in ['draft', 'disabled'] else
+                   ('invalid_state', 'tool ' + sname + ': ' + str(_from) + ' cannot ' + mode)
+                     if mode in transitions and _to is None else
+                   ('invalid_input', 'tool ' + sname + ' fails validation: ' + '; '.join(manifest_problems))
+                     if mode in ['validate', 'enable'] and manifest_problems else
+                   ('invalid_input', 'deprecate needs `by`: another enabled ' + scope + ' tool')
+                     if mode == 'deprecate' and (replacement is None or replacement.get('status') != 'enabled') else None }}
+            - error: "{{ None if problem is None else {'code': problem[0], 'message': problem[1], 'retryable': False} }}"
+            - _now: "{{ now().isoformat() }}"
+            - _pol: "{{ _m.get('policy') if isinstance(_m.get('policy'), dict) else {} }}"
+            - _se: "{{ _pol.get('side_effects') }}"
+            - new_row: >-
+                {{ None if problem is not None or mode == 'delete' else
+                   dict(_m, schema_version=schema_version, name=sname, scope=scope,
+                        version=int((current or {}).get('version') or 0) + 1,
+                        title=str(_m.get('title') or sname),
+                        description=str(_m.get('description') or ''),
+                        parameters=_m.get('parameters') or {'type': 'object', 'properties': {}},
+                        examples=list(_m.get('examples') or []),
+                        result=dict({'schema': None, 'shape': None, 'max_chars': 8000, 'sources': None},
+                                    **(_m.get('result') or {})),
+                        credential=dict({'mode': 'none', 'secret_key': None, 'connect_hint': None},
+                                        **(_m.get('credential') or {})),
+                        policy=dict({'side_effects': None,
+                                     'permission': 'auto' if _se in ['none', 'read'] else 'approve',
+                                     'idempotent': _se in ['none', 'read'],
+                                     'allow_session_grant': False, 'approval_template': None,
+                                     'limits': {'per_turn': 4, 'per_session': 50},
+                                     'enabled_for': {'users': ['*'], 'denied_users': []}}, **_pol),
+                        execution=dict({'timeout_sec': 30, 'mode': 'sync', 'retry': {'max_attempts': 1}},
+                                       **(_m.get('execution') or {})),
+                        tags=list(_m.get('tags') or []), toolsets=list(_m.get('toolsets') or []),
+                        origin=_origin,
+                        status='draft', deprecated_by=None,
+                        created_at=(current or {}).get('created_at') or _now,
+                        updated_at=_now, updated_by=_uid)
+                   if mode == 'save' else
+                   dict(current, status=_to, schema_version=schema_version, updated_at=_now, updated_by=_uid,
+                        **({'deprecated_by': by_name} if mode == 'deprecate' else {})) }}
+
+        - task_name: write-row
+          skip_if: "{{ not valid or mode == 'get' or new_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: true
+              namespace: "{{ row_ns }}"
+              key: "{{ key }}"
+              value: "{{ new_row }}"
+              topic: tool
+
+        - task_name: delete-row
+          skip_if: "{{ not (valid and mode == 'delete' and problem is None) }}"
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: true, namespace: "{{ row_ns }}", key: "{{ key }}"}
+
+        - task_name: shape-write
+          skip_if: "{{ not valid or mode == 'get' }}"
+          set:
+            - ok: "{{ problem is None }}"
+            - data: "{{ {'tool': new_row} if problem is None else None }}"

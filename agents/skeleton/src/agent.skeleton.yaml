@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT.SKELETON — the phase-0 agent definition (plan-00a, plan-18 step 0)
+# ================================================================================
+#
+# The dev-stage test agent. Phase 0 drove the walking skeleton with one `chat`
+# profile; phase 1 adds `rag` over `moco-docs` and turns the classifier on, so the
+# whole turn pipeline (router, context, retrieval, guard) runs. No tools, no
+# long-term memory. It is the agent tier of the
+# config (design §5.2): `agent-config resolve` merges it field by field over
+# `agent-harness-defaults`, so it only states what differs from the defaults.
+#
+# Deployed in its own package into the SAME namespace as the harness, because the
+# harness loads it by name (P7). Agent packages are named `agent-<agent_id>`
+# (package names cannot contain dots) and the harness loads the definition
+# package-qualified, as `agent-<agent_id>/agent.<agent_id>`: a bare name outside
+# the caller's loaded packages resolves as a package of that name.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent.skeleton
+
+context:
+  definition:
+    agent_id: skeleton
+    display_name: Skeleton
+    harness: ">=0.1 <2.0"
+    # Phase 0 has no prompt manager (plan-01), so the persona is inline text.
+    # From phase 1 this becomes `persona_prompt: persona.<name>`.
+    persona_text: >-
+      You are a concise, helpful assistant. Answer the user's latest message using the conversation so far. If you do not know, say so plainly.
+    # The internal LLM gateway, as in the old agent's working user-tier model_config.
+    # Merged field by field over the harness default (deepseek), so max_tokens and
+    # temperature still come from the defaults. Phase 1 moves per-user choices to
+    # the stored user tier.
+    models:
+      inference:
+        provider: default
+        model:
+        base_url:
+        apikey_secret_key: MY_LLM_TOKEN
+    router:
+      default_profile: chat
+      classifier: true
+    profiles: [chat, rag]
+    memory:
+      short_term:
+        recent_turns: 6
+    # Dev stage only: the developer is this agent's admin, so shared sources can be
+    # registered (design §6.13: a deployment names its admins in the definition).
+    access:
+      admin_user_ids: [tjin4]
+    knowledge:
+      sources: [moco-docs]
+    limits:
+      turn_budget_sec: 110
+      max_queued_messages: 1
+      retire_after_idle_sec: 86400
+      retire_throwaway_after_idle_sec: 600
+
+output:
+  definition: "{{ definition }}"
+  # Part of agent-config's config_version (F21): the agent package's version, so
+  # a republished definition changes it.
+  version: "{{ __sys_info__.get('wfspec_version') }}"
+
+main:
+  task_name: emit-definition
+  set:
+    - _loaded: true

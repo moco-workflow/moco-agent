@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# DEMO-TOOLS — the package's main wfspec (moco publish requires one named after it)
+# ================================================================================
+# The package holds workflows that opt in to being agent tools with
+# `header.metadata.tool` (demo-echo, demo-word-count). `moco publish` collects those
+# declarations into the package manifest (`manifest.tools`), where the agent harness's
+# workflow tool providers find them. Dev stage only.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: demo-tools
+
+output:
+  tools: ["demo-echo", "demo-word-count"]
+
+main:
+  task_name: noop
+  set:
+    - done: true

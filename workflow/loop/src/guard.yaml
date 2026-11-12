@@ -1,0 +1,377 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# GUARD — the probabilistic safety and quality checks (design §6.13, plan-05)
+# ================================================================================
+#
+#   mode            in                                  data out
+#   ─────────────── ─────────────────────────────────── ──────────────────────────
+#   screen_content  items: [{text, ...}], source        {items: [{..., text, injection_p,
+#                   passage|tool                          action: fence|replace}],
+#                                                         degraded, decided_by}
+#   check_output    question, answer, passages          {grounded_p, answered_p,
+#                                                         degraded, decided_by}
+#   every mode      config (resolved), resolved_refs
+#
+# AGENT layer: calls only `decide` (Foundation); `access` is the deterministic half
+# of guardrails and lives in Foundation (F5, F24).
+#
+# THE FENCE. Untrusted text reaches a model only inside the canonical fence
+#   <data source="…" n="…"> … </data>          (attributes optional)
+# which the prompts write. Guard's part is to make the text safe to fence: every
+# `<data …>` / `</data>` tag inside it -- with or without attributes, any case -- is
+# replaced by `[tag removed]`, so content can never close its fence or forge one.
+#
+# screen_content: ONE System One request per item (qset.guard.content), all in
+# parallel through decide_many. One item per request because batching items into one
+# state erased the signal on local Laya (plan-05 §8). An item with
+# injection_p ≥ decisions.guard.injection_replace_p is REPLACED by a notice; every
+# other item is kept (action `fence`). check_output: grounded_p (only with passages)
+# and answered_p (qset.guard.output).
+#
+# FAILING CLOSED (§6.13). decide runs with `fallback: none`: if the classifier is
+# disabled or down, screen_content still neutralises and fences every item
+# (injection_p null) and check_output returns grounded_p null, so the turn is not
+# curated into memory. `degraded: true` says so. A malformed qset is a bug and
+# raises (decide).
+#
+#   check_tool_call question, tool: {name,            {escalate, overreach_p,
+#                   description, side_effects},         degraded, decided_by}
+#                   arguments
+# check_tool_call (phase 2): one request per call (qset.guard.tool). It can only
+# ESCALATE an auto call to approve (§6.9.7), never allow one: escalate when
+# overreach_p ≥ decisions.guard.tool_escalate_p, and also when the classifier is
+# down (degraded) -- failing closed means asking the human. tool-executor calls it
+# for auto calls with side effects, when config.guard.checks lists it.
+#
+#   check_input     message, is_guest                  {allow, flags, injection_p,
+#                                                       harmful_p, reason, degraded}
+#   run_checks      checks, question, answer, passages  {answer, grounded_p, answered_p,
+#                                                       blocked, reason, verdicts, degraded}
+# check_input (off by default, guard.input_check): blocks at
+# decisions.guard.input_block_p on either noul. It FAILS OPEN -- classifier down →
+# allow, degraded -- because refusing every message during an outage would take the
+# agent down, while fencing and screening still protect what reaches the model.
+# run_checks runs a profile's output_checks in order: `check_output` (built in) and
+# `guard.<name>` extensions as sync children (5 s; contract {question, answer,
+# passages} → {verdict, p?, action: annotate | redact | block, note?, answer?}). An
+# extension can annotate (append its note), redact (replace the answer) or block
+# (the answer becomes its note); it can never loosen. A failing extension is
+# skipped and logged (degraded).
+#
+# PHASE 1 (plan-05 steps 1-3); check_tool_call, check_input, run_checks and the
+# guard.<name> extension point phase 2.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: guard
+
+context:
+  valid_modes: ["screen_content", "check_output", "check_tool_call", "check_input", "run_checks"]
+  valid_sources: ["passage", "tool"]
+  replaced_notice: "[content removed: it looked like instructions to the assistant rather than information]"
+  ok: false
+  data:
+  error:
+  check_out: {}
+  input_result: {}
+
+input:
+  mode: screen_content
+  agent_id:
+  config: {}
+  resolved_refs: {}
+  # screen_content
+  items: []
+  source: passage
+  # check_output
+  question: ""
+  answer: ""
+  passages: []
+  # check_tool_call
+  tool: {}
+  arguments: {}
+  # check_input
+  message: ""
+  is_guest: false
+  # run_checks: the profile's output_checks (check_output and guard.<name> extensions)
+  checks: []
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "guard: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: read-settings
+      set:
+        - models: "{{ (config or {}).get('models') or {} }}"
+        # The threshold lives only in agent-harness-defaults. Without one (an unresolved
+        # config) nothing is replaced -- everything is still fenced -- and it is logged.
+        - _thr: "{{ (((config or {}).get('decisions') or {}).get('guard') or {}).get('injection_replace_p') }}"
+        - replace_p#: "{{ float(_thr) if _thr is not None else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SCREEN_CONTENT
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-screen-content
+      skip_if: "{{ mode != 'screen_content' }}"
+      tasks:
+        - task_name: reject-unknown-source
+          raise:
+            if: "{{ source not in valid_sources }}"
+            type: error
+            error_type: AbortError
+            message: "guard: screen_content source must be one of {{ ', '.join(valid_sources) }}, got '{{ source }}'"
+
+        - task_name: plan-screening
+          set:
+            - _items: "{{ [it if isinstance(it, dict) else {'text': str(it)} for it in (items or [])] }}"
+            - clean_items: "{{ [dict(it, text=re.sub(r'(?i)</?\\s*data\\b[^>]*>', '[tag removed]', str(it.get('text') or ''))) for it in _items] }}"
+            - requests: "{{ [{'text': it['text'], 'source': source} for it in clean_items] }}"
+            - screen_results: []
+
+        - task_name: classify-content
+          skip_if: "{{ not requests }}"
+          workflow:
+            ref: agent-harness-foundation/decide
+            mode: inline
+            input:
+              mode: decide_many
+              agent_id: "{{ agent_id }}"
+              qset: guard.content
+              items: "{{ requests }}"
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: none
+          output:
+            set:
+              - screen_results: "{{ ((_ or {}).get('data') or {}).get('results') or [] }}"
+
+        - task_name: apply-screening
+          set:
+            # decide_many keeps the items' order: result i is item i.
+            - _p: >-
+                {{ [((screen_results[i].get('data') or {}).get('nouls') or {}).get('injection')
+                    if i < len(screen_results) and screen_results[i].get('ok') else None
+                    for i in range(len(clean_items))] }}
+            - replaced#: "{{ [i for i, p in enumerate(_p) if p is not None and replace_p is not None and p >= replace_p] }}"
+            - ok: true
+            - data:
+                items: >-
+                  {{ [dict(it, text=(replaced_notice if i in replaced else it['text']),
+                           injection_p=_p[i], action=('replace' if i in replaced else 'fence'))
+                      for i, it in enumerate(clean_items)] }}
+                degraded: "{{ bool(requests) and (len(screen_results) != len(requests) or not all(r.get('ok') for r in screen_results)) }}"
+                decided_by: "{{ sorted(set((r.get('data') or {}).get('decided_by') for r in screen_results if r.get('ok'))) }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CHECK_OUTPUT
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-check-output
+      skip_if: "{{ mode != 'check_output' }}"
+      tasks:
+        - task_name: classify-output
+          workflow:
+            ref: agent-harness-foundation/decide
+            mode: inline
+            input:
+              mode: decide
+              agent_id: "{{ agent_id }}"
+              qset: guard.output
+              variables:
+                question: "{{ question }}"
+                answer: "{{ answer }}"
+                passages: "{{ passages }}"
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: none
+          output:
+            set:
+              - out_result: "{{ _ or {} }}"
+
+        - task_name: shape-check
+          set:
+            - _ok: "{{ bool(out_result.get('ok')) }}"
+            - _n: "{{ (out_result.get('data') or {}).get('nouls') or {} if _ok else {} }}"
+            - ok: true
+            - data:
+                grounded_p: "{{ _n.get('grounded') }}"
+                answered_p: "{{ _n.get('answered') }}"
+                degraded: "{{ not _ok }}"
+                decided_by: "{{ (out_result.get('data') or {}).get('decided_by') if _ok else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CHECK_TOOL_CALL — may only escalate auto → approve; fails closed
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-check-tool-call
+      skip_if: "{{ mode != 'check_tool_call' }}"
+      tasks:
+        - task_name: classify-tool-call
+          workflow:
+            ref: agent-harness-foundation/decide
+            mode: inline
+            input:
+              mode: decide
+              agent_id: "{{ agent_id }}"
+              qset: guard.tool
+              variables:
+                question: "{{ question }}"
+                tool: "{{ tool }}"
+                arguments: "{{ arguments }}"
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: none
+          output:
+            set:
+              - tool_result: "{{ _ or {} }}"
+
+        - task_name: shape-tool-check
+          set:
+            - _ok: "{{ bool(tool_result.get('ok')) }}"
+            - _p: "{{ ((tool_result.get('data') or {}).get('nouls') or {}).get('overreach') if _ok else None }}"
+            - _thr: "{{ (((config or {}).get('decisions') or {}).get('guard') or {}).get('tool_escalate_p') }}"
+            - ok: true
+            - data:
+                escalate: "{{ _p is None or _thr is None or _p >= float(_thr) }}"
+                overreach_p: "{{ _p }}"
+                degraded: "{{ not _ok }}"
+                decided_by: "{{ (tool_result.get('data') or {}).get('decided_by') if _ok else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CHECK_INPUT — off by default; fails OPEN (see header)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-check-input
+      skip_if: "{{ mode != 'check_input' }}"
+      tasks:
+        - task_name: classify-input
+          workflow:
+            ref: agent-harness-foundation/decide
+            mode: inline
+            input:
+              mode: decide
+              agent_id: "{{ agent_id }}"
+              qset: guard.input
+              variables: {message: "{{ message }}", is_guest: "{{ bool(is_guest) }}"}
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: none
+          output:
+            set:
+              - input_result: "{{ _ or {} }}"
+
+        - task_name: shape-input-check
+          set:
+            - _ok: "{{ bool(input_result.get('ok')) }}"
+            - _n: "{{ ((input_result.get('data') or {}).get('nouls') or {}) if _ok else {} }}"
+            - _thr: "{{ (((config or {}).get('decisions') or {}).get('guard') or {}).get('input_block_p') }}"
+            - _flags: >-
+                {{ [f for f in ['injection', 'harmful']
+                    if _ok and _thr is not None and _n.get(f) is not None and _n[f] >= float(_thr)] }}
+            - ok: true
+            - data:
+                allow: "{{ not _flags }}"
+                flags: "{{ _flags }}"
+                injection_p: "{{ _n.get('injection') }}"
+                harmful_p: "{{ _n.get('harmful') }}"
+                reason: >-
+                  {{ None if not _flags else
+                     "I can't help with that request." if 'harmful' in _flags else
+                     "I can't follow instructions that try to change how I work. Please ask your question directly." }}
+                degraded: "{{ not _ok }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RUN_CHECKS — a profile's output_checks, built in and guard.<name>
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-run-checks
+      skip_if: "{{ mode != 'run_checks' }}"
+      tasks:
+        - task_name: plan-checks
+          set:
+            - run_builtin: "{{ 'check_output' in (checks or []) }}"
+            - custom_checks#: "{{ [c for c in (checks or []) if isinstance(c, str) and c.startswith('guard.')] }}"
+            - checked_answer: "{{ str(answer or '') }}"
+            - verdicts: []
+            - check_blocked: false
+            - check_reason:
+            - builtin_result: {}
+            - checks_degraded: false
+
+        - task_name: run-builtin-check
+          skip_if: "{{ not run_builtin }}"
+          workflow:
+            ref: agent-harness-foundation/decide
+            mode: inline
+            input:
+              mode: decide
+              agent_id: "{{ agent_id }}"
+              qset: guard.output
+              variables: {question: "{{ question }}", answer: "{{ answer }}", passages: "{{ passages }}"}
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: none
+          output:
+            set:
+              - builtin_result: "{{ _ or {} }}"
+
+        - task_name: run-custom-checks
+          skip_if: "{{ not custom_checks }}"
+          loop:
+            in: "{{ custom_checks }}"
+            foreach: check_name
+            do:
+              tasks:
+                - task_name: run-custom-check
+                  workflow:
+                    ref: "{{ check_name }}"
+                    mode: sync
+                    input: {question: "{{ question }}", answer: "{{ checked_answer }}", passages: "{{ passages }}", agent_id: "{{ agent_id }}"}
+                    options:
+                      retry_policy: {timeout_sec: 5, max_attempts: 1}
+                  output:
+                    set:
+                      - check_out: "{{ _ if isinstance(_, dict) else {} }}"
+                  on_error:
+                    catch: true
+                    do:
+                      set:
+                        - check_out: "{{ {'failure': str(_.get('error_message'))[:300]} }}"
+                - task_name: apply-custom-check
+                  set:
+                    - _act: "{{ str(check_out.get('action') or 'annotate') }}"
+                    - _note: "{{ str(check_out.get('note') or '') }}"
+                    - checks_degraded: "{{ checks_degraded or bool(check_out.get('failure')) }}"
+                    - check_blocked: "{{ check_blocked or (_act == 'block' and not check_out.get('failure')) }}"
+                    - check_reason: "{{ (_note or 'This answer was withheld by a check.') if _act == 'block' and not check_out.get('failure') else check_reason }}"
+                    - checked_answer: >-
+                        {{ checked_answer if check_out.get('failure') else
+                           str(check_out.get('answer')) if _act == 'redact' and check_out.get('answer') is not None else
+                           (checked_answer + '\n\n' + _note) if _act == 'annotate' and _note else checked_answer }}
+                    - verdicts: >-
+                        {{ verdicts + [{'check': check_name, 'verdict': check_out.get('verdict'), 'p': check_out.get('p'),
+                                        'action': _act if not check_out.get('failure') else 'skipped', 'failure': check_out.get('failure')}] }}
+                    - check_out: {}
+
+        - task_name: shape-run-checks
+          set:
+            - _ok: "{{ bool(builtin_result.get('ok')) }}"
+            - _n: "{{ ((builtin_result.get('data') or {}).get('nouls') or {}) if _ok else {} }}"
+            - ok: true
+            - data:
+                answer: "{{ check_reason if check_blocked else checked_answer }}"
+                grounded_p: "{{ _n.get('grounded') }}"
+                answered_p: "{{ _n.get('answered') }}"
+                blocked: "{{ check_blocked }}"
+                reason: "{{ check_reason }}"
+                verdicts: "{{ verdicts }}"
+                degraded: "{{ (run_builtin and not _ok) or checks_degraded }}"
+                decided_by: "{{ (builtin_result.get('data') or {}).get('decided_by') if _ok else None }}"

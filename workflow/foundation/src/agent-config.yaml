@@ -1,0 +1,566 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-CONFIG — the effective configuration for agent × user × session (design §6.1)
+# ================================================================================
+#
+#   mode         in                         data out
+#   ──────────── ────────────────────────── ────────────────────────────────────────
+#   resolve      session_overrides?         {config, profiles, resolved_refs,
+#                                            config_version, versions, tiers,
+#                                            user_settable}
+#   validate     scope, partial             {valid, errors: [{path, message}]}
+#   save         scope: user|agent, patch   {config_version}
+#   reset        scope: user|agent, section? {config_version}
+#   list_models  —                          {providers}
+#   version      —                          {agent_row, user_row}: the two tier rows'
+#                                            versions only (2 reads), for the session's
+#                                            per-turn check; it re-resolves when they move
+#
+# TIERS, merged FIELD BY FIELD for dicts and REPLACE for everything else (lists
+# included), so a new default reaches an agent or user holding a partial override:
+#   harness defaults < definition < agent tier < user tier < session overrides
+# The definition and its profiles come from `agent-registry load` (plan-03), which
+# also proves every extension exists and yields `resolved_refs`; this file adds
+# the stored tiers and the defaults.
+#
+# WHO MAY SET WHAT (§6.1.1), checked by `validate` on every save:
+#   agent    everything except agent_id, harness and access.namespace_admins (the
+#            definition's: an agent-tier save could lock the namespace admins out);
+#            admin only (access, scope agent)
+#   user     per model role (inference, decision, classifier, embedding): provider,
+#            model (`model`; `model_name` for embedding), base_url (http/https) and the
+#            secret NAME -- a catalog pick or anything custom; for inference and decision
+#            also max_tokens (1..100000) and temperature (0..2), for embedding embed_dim;
+#            persona_text (≤ 2000), disabled_profiles. Classifier enabled/timeout_sec are
+#            agent-tier only (guard policy).
+#   session  models.inference.model, models.inference.temperature, disabled_profiles
+# so decisions.*, guard.*, retention and limits.* are agent-tier only by construction.
+# Capabilities (catalog): the decision role -- or inference when decision is null --
+# needs json_mode; inference needs tools when an enabled profile has tools. Only
+# catalog models are capability-checked; a custom model is accepted as typed at the
+# agent and user tiers (the session tier stays catalog-only). A CATALOG pick at the
+# user or session tier -- a catalog model with no base_url or one of its provider's
+# base_urls -- brings its catalog provider (resolve, every role, `model_roles` below):
+# from ANOTHER provider, that provider's id, apikey_secret_key and the picked base_url
+# (else its first); from the same provider, the agent tier's endpoint stays unless a
+# catalog base_url was picked. An embedding pick also brings the model's embed_dim. A
+# secret name set at the user or session tier wins over the catalog's. A CUSTOM pick
+# (model or base_url outside the catalog) stands as typed. Accepted risk: a user's
+# custom URL can receive an inherited secret, and a user can point their own classifier
+# anywhere (their own sessions' guard decisions only).
+#
+# PROFILES: definition.profiles minus `disabled_profiles`; the router's default
+# profile can never be disabled.
+#
+# STORAGE (one owner, §4.3): ONE row per tier, key `config`, topic `config`:
+#   agent tier  namespace agent.<id>        (in_global_ns: true)
+#   user tier   <uid>:agent.<id>            (in_global_ns: false; the platform prefixes)
+#   row         {schema_version: 1, version, sections: {...}, updated_at, updated_by}
+# One row rather than one per section: a resolve reads 2 rows instead of listing and
+# fetching every section (list_states returns keys only). The price is that two
+# concurrent saves of different sections are last-write-wins -- accepted for config
+# (no compare-and-set, P15). `reset` never deletes a row: it writes the emptied row
+# with version + 1, so config_version never repeats.
+#
+# config_version: `d<harness>+a<agent package>+g<agent row>+u<user row>` -- the
+# sandbox has no hash function, and any redeploy or save changes it (F21).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-config
+
+context:
+  valid_modes: ["resolve", "validate", "save", "reset", "list_models", "version"]
+  valid_scopes: {validate: [user, agent, session], save: [user, agent], reset: [user, agent]}
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  # Each model role: the catalog `kind` its models come from and the key naming the model.
+  model_roles:
+    inference: {kind: inference, key: model}
+    decision: {kind: inference, key: model}
+    classifier: {kind: classifier, key: model}
+    embedding: {kind: embedding, key: model_name}
+  allowed_paths:
+    user: [models.inference.provider, models.inference.model, models.inference.base_url,
+           models.inference.apikey_secret_key, models.inference.max_tokens, models.inference.temperature,
+           models.decision.provider, models.decision.model, models.decision.base_url,
+           models.decision.apikey_secret_key, models.decision.max_tokens, models.decision.temperature,
+           models.classifier.provider, models.classifier.model, models.classifier.base_url,
+           models.classifier.apikey_secret_key,
+           models.embedding.provider, models.embedding.model_name, models.embedding.base_url,
+           models.embedding.apikey_secret_key, models.embedding.embed_dim,
+           persona_text, disabled_profiles]
+    session: [models.inference.model, models.inference.temperature, disabled_profiles]
+  secret_name_pattern: "^(global/)?[A-Za-z0-9_.-]{1,128}$"
+  # Dotted paths: a patch may neither set one nor replace an ancestor of one.
+  # access.namespace_admins is definition-only; the other two are computed (F48).
+  agent_forbidden: [agent_id, harness, access.namespace_admins,
+                    access.caller_is_namespace_admin, access.namespace_id]
+  # Seeded so the output is bound on the invalid-input path, where nothing loads.
+  ok: false
+  data:
+  error:
+
+input:
+  mode: resolve
+  agent_id:
+  session_overrides: {}
+  scope:
+  partial: {}
+  patch: {}
+  section:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+functions:
+
+  # Defaults, definition (via the registry) and the two stored tiers, merged.
+  resolve-config:
+    input:
+      agent_id:
+      session_overrides: {}
+      allowed_paths: {}
+      model_roles: {}
+      supported_schema_versions: []
+    output:
+      config: "{{ config }}"
+      profiles: "{{ profiles }}"
+      resolved_refs: "{{ resolved_refs }}"
+      config_version: "{{ config_version }}"
+      versions: "{{ versions }}"
+      rows: "{{ rows }}"
+      catalog: "{{ catalog }}"
+      session_dropped: "{{ session_dropped }}"
+    main:
+      tasks:
+        - task_name: load-registry
+          workflow:
+            ref: agent-registry
+            mode: inline
+            input: {mode: load, agent_id: "{{ agent_id }}"}
+          output:
+            set:
+              - reg: "{{ (_ or {}).get('data') or {} }}"
+
+        # Inline: a fresh context and no Temporal child, which is all a data load needs.
+        - task_name: load-defaults
+          workflow:
+            ref: agent-harness-defaults
+            mode: inline
+          output:
+            set:
+              - harness_defaults: "{{ _ or {} }}"
+
+        - task_name: read-agent-tier
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: true
+              namespace: "agent.{{ agent_id }}"
+              key: config
+          output:
+            set:
+              - agent_row: "{{ _ if isinstance(_, dict) else None }}"
+
+        - task_name: read-user-tier
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "agent.{{ agent_id }}"
+              key: config
+          output:
+            set:
+              - user_row: "{{ _ if isinstance(_, dict) else None }}"
+
+        # A row from a newer schema is refused rather than half-read (§4.3).
+        - task_name: reject-unreadable-rows
+          raise:
+            if: >-
+              {{ any(isinstance(r, dict) and r.get('schema_version', 0) not in supported_schema_versions
+                     for r in [agent_row, user_row]) }}
+            type: error
+            error_type: AbortError
+            message: "agent-config: a config row of agent '{{ agent_id }}' has an unsupported schema_version"
+
+        # THE merge. A self-applied lambda, because an expression cannot define a
+        # named recursive function; applied in this one expression and never bound
+        # to a variable (a function value would not survive serialisation).
+        - task_name: merge-config
+          set:
+            - _definition: "{{ reg.get('definition') or {} }}"
+            - _agent_sections: "{{ (agent_row or {}).get('sections') or {} }}"
+            - _user_sections: "{{ (user_row or {}).get('sections') or {} }}"
+            # Session overrides keep only the session allowlist.
+            - _flat: >-
+                {{ (lambda f: f(f, session_overrides or {}, ''))(
+                     lambda self, v, p: [x for k, sub in v.items()
+                                         for x in (self(self, sub, p + k + '.') if isinstance(sub, dict) and sub
+                                                   else [(p + k, sub)])]) }}
+            - session_dropped: "{{ [k for k, _v in _flat if k not in allowed_paths['session']] }}"
+            # The kept session paths, rebuilt as a patch. Mirrors allowed_paths.session.
+            - _so: "{{ session_overrides or {} }}"
+            - _si: "{{ {k: v for k, v in ((_so.get('models') or {}).get('inference') or {}).items() if k in ['model', 'temperature']} }}"
+            - _session: >-
+                {{ dict(({'models': {'inference': _si}} if _si else {}),
+                        **({'disabled_profiles': _so['disabled_profiles']} if 'disabled_profiles' in _so else {})) }}
+            - config: >-
+                {{ (lambda m: m(m(m(m(harness_defaults.get('defaults') or {}, _definition),
+                                     _agent_sections), _user_sections), _session))(
+                     (lambda f: (lambda a, b: f(f, a, b)))(
+                       lambda self, a, b: dict(a, **{
+                         k: (self(self, a[k], v) if isinstance(a.get(k), dict) and isinstance(v, dict) else v)
+                         for k, v in b.items()}))) }}
+            # A catalog model picked at the user or session tier brings its catalog
+            # provider (every role): those tiers name a model and at most a catalog
+            # base_url, never a secret, so without this a model from another provider
+            # would be sent to the agent tier's endpoint with its key.
+            - _low: "{{ [(_session.get('models') or {}), (_user_sections.get('models') or {})] }}"
+            - _picked: >-
+                {{ {r: m for r, spec in model_roles.items()
+                    for m in [next((t.get(r, {}).get(spec['key']) for t in _low
+                                    if isinstance(t.get(r), dict) and t[r].get(spec['key'])), None)] if m} }}
+            - _picked_url: >-
+                {{ {r: u for r in model_roles
+                    for u in [next((t[r]['base_url'] for t in _low
+                                    if isinstance(t.get(r), dict) and t[r].get('base_url')), None)] if u} }}
+            - _picked_key: >-
+                {{ {r: k for r in model_roles
+                    for k in [next((t[r]['apikey_secret_key'] for t in _low
+                                    if isinstance(t.get(r), dict) and t[r].get('apikey_secret_key')), None)] if k} }}
+            - _cat: >-
+                {{ {str(prov.get('kind')) + ':' + str(mm['id']): {'p': prov, 'm': mm}
+                    for prov in ((harness_defaults.get('catalog') or {}).get('providers') or [])
+                    for mm in (prov.get('models') or [])} }}
+            - config: >-
+                {{ dict(config, models=dict(config.get('models') or {}, **{
+                     r: (lambda cur, c, url, key: (
+                           dict(cur, base_url=url) if url in (c['p'].get('base_urls') or []) else cur)
+                           if cur.get('provider') == c['p'].get('id') else
+                           dict({'max_tokens': c['m']['max_tokens']} if c['m'].get('max_tokens') else {},
+                                **dict(cur, provider=c['p'].get('id'),
+                                       base_url=(url if url in (c['p'].get('base_urls') or [])
+                                                 else (c['p'].get('base_urls') or [cur.get('base_url')])[0]),
+                                       apikey_secret_key=key or c['p'].get('apikey_secret_key'),
+                                       **({'embed_dim': c['m']['embed_dim']} if c['m'].get('embed_dim') else {}))))(
+                          dict((config.get('models') or {}).get(r) or {}),
+                          _cat[model_roles[r]['kind'] + ':' + str(m)], _picked_url.get(r), _picked_key.get(r))
+                     for r, m in _picked.items() if model_roles[r]['kind'] + ':' + str(m) in _cat
+                     and (r not in _picked_url
+                          or _picked_url[r] in (_cat[model_roles[r]['kind'] + ':' + str(m)]['p'].get('base_urls') or []))}))
+                   if _picked else config }}
+            - _default_profile: "{{ (config.get('router') or {}).get('default_profile') }}"
+            - _disabled: "{{ [p for p in (config.get('disabled_profiles') or []) if p != _default_profile] }}"
+            - config: "{{ dict(config, profiles=[p for p in (config.get('profiles') or []) if p not in _disabled]) }}"
+            - profiles: "{{ {p: v for p, v in (reg.get('profiles') or {}).items() if p in config['profiles']} }}"
+            - resolved_refs: "{{ reg.get('resolved_refs') or {} }}"
+            - versions:
+                harness: "{{ (reg.get('versions') or {}).get('harness') }}"
+                agent: "{{ (reg.get('versions') or {}).get('agent') }}"
+                agent_row: "{{ (agent_row or {}).get('version') or 0 }}"
+                user_row: "{{ (user_row or {}).get('version') or 0 }}"
+            - config_version#: >-
+                {{ 'd' + str(versions['harness']) + '+a' + str(versions['agent'])
+                   + '+g' + str(versions['agent_row']) + '+u' + str(versions['user_row']) }}
+            - rows: {agent: "{{ agent_row }}", user: "{{ user_row }}"}
+            - catalog: "{{ harness_defaults.get('catalog') or {} }}"
+            # Seeded: the result when the lookup is off, skipped or fails.
+            - ns_admin: {}
+
+        # Namespace admins (F48): is the caller a `manage_ns` holder in the namespace
+        # owning the agent package? Guests and denied ids are excluded up front --
+        # they beat admin in `access` anyway. A failure is data: not an admin.
+        - task_name: resolve-namespace-admin
+          skip_if: "{{ (config.get('access') or {}).get('namespace_admins') is not True }}"
+          workflow:
+            ref: namespace-admin
+            mode: inline
+            input:
+              package_name: "agent-{{ agent_id }}"
+              exclude_user_ids: >-
+                {{ list((config.get('access') or {}).get('denied_user_ids') or [])
+                   + list((config.get('access') or {}).get('guest_user_ids') or []) }}
+          on_error: {catch: true}
+          output:
+            set:
+              - ns_admin: "{{ _ if isinstance(_, dict) else {} }}"
+
+        # The computed keys, written AFTER every tier, so a stored row or a definition
+        # that holds them is overwritten, never trusted. A null `access` stays null
+        # (access then fails closed on the missing lists).
+        - task_name: stamp-access
+          set:
+            - config: >-
+                {{ dict(config, access=dict(config['access'],
+                                            caller_is_namespace_admin=ns_admin.get('is_admin') is True,
+                                            namespace_id=ns_admin.get('namespace_id')))
+                   if isinstance(config.get('access'), dict) else config }}
+
+  # The tier allowlist, the catalog and the capability rules, over the config a
+  # save would produce. `config` is the current resolved config.
+  validate-partial:
+    input:
+      scope:
+      partial: {}
+      config: {}
+      profiles: {}
+      catalog: {}
+      allowed_paths: {}
+      model_roles: {}
+      secret_name_pattern: ""
+      agent_forbidden: []
+    output:
+      errors: "{{ errors }}"
+    main:
+      task_name: check-partial
+      set:
+        - _p: "{{ partial if isinstance(partial, dict) else {} }}"
+        - _paths: >-
+            {{ (lambda f: f(f, _p, ''))(
+                 lambda self, v, p: [x for k, sub in v.items()
+                                     for x in (self(self, sub, p + k + '.') if isinstance(sub, dict) and sub
+                                               else [p + k])]) }}
+        - _not_allowed: >-
+            {{ [x for x in _paths if any(x == f or x.startswith(f + '.') or f.startswith(x + '.')
+                                         for f in agent_forbidden)] if scope == 'agent'
+               else [x for x in _paths if x not in allowed_paths.get(scope, [])] }}
+        - _cand: >-
+            {{ (lambda f: (lambda a, b: f(f, a, b)))(
+                 lambda self, a, b: dict(a, **{
+                   k: (self(self, a[k], v) if isinstance(a.get(k), dict) and isinstance(v, dict) else v)
+                   for k, v in b.items()}))(config or {}, _p) }}
+        - _models: "{{ {m['id']: m for prov in ((catalog or {}).get('providers') or []) if prov.get('kind') == 'inference' for m in (prov.get('models') or [])} }}"
+        # (role, model) named by the partial, every role, with its catalog entry.
+        - _pm: "{{ _p.get('models') if isinstance(_p.get('models'), dict) else {} }}"
+        - _named: >-
+            {{ [(r, (_pm.get(r) or {}).get(spec['key'])) for r, spec in model_roles.items()
+                if isinstance(_pm.get(r), dict) and _pm[r].get(spec['key'])] }}
+        - _all: >-
+            {{ {str(prov.get('kind')) + ':' + str(mm['id']): prov for prov in ((catalog or {}).get('providers') or [])
+                for mm in (prov.get('models') or [])} }}
+        - _cm: "{{ _cand.get('models') or {} }}"
+        - _inf: "{{ (_cm.get('inference') or {}).get('model') }}"
+        - _dec: "{{ (_cm.get('decision') or {}).get('model') if _cm.get('decision') else _inf }}"
+        - _enabled: "{{ [p for p in (_cand.get('profiles') or []) if p not in (_cand.get('disabled_profiles') or [])] }}"
+        - _needs_tools: "{{ any(((profiles or {}).get(p) or {}).get('loop', {}).get('tools') for p in _enabled) }}"
+        - _dp: "{{ _p.get('disabled_profiles') }}"
+        - errors: >-
+            {{ [{'path': '$.' + x, 'message': 'not settable at the ' + str(scope) + ' tier'} for x in _not_allowed]
+               + [{'path': '$.models.' + r + '.' + model_roles[r]['key'], 'message': str(m) + ' is not in the model catalog'}
+                  for r, m in _named if scope == 'session' and model_roles[r]['kind'] + ':' + str(m) not in _all]
+               + [{'path': '$.models.' + r + '.base_url', 'message': 'must be an http(s) URL'}
+                  for r in model_roles if isinstance(_pm.get(r), dict) and _pm[r].get('base_url') is not None
+                  and not (isinstance(_pm[r]['base_url'], str) and re.match(r'^https?://\S+$', _pm[r]['base_url']))]
+               + [{'path': '$.models.' + r + '.embed_dim', 'message': 'must be a positive integer'}
+                  for r in model_roles if isinstance(_pm.get(r), dict) and _pm[r].get('embed_dim') is not None
+                  and not (isinstance(_pm[r]['embed_dim'], int) and not isinstance(_pm[r]['embed_dim'], bool) and _pm[r]['embed_dim'] > 0)]
+               + [{'path': '$.models.' + r + '.apikey_secret_key', 'message': 'must be a secret name (NAME or global/NAME)'}
+                  for r in model_roles if isinstance(_pm.get(r), dict) and _pm[r].get('apikey_secret_key') is not None
+                  and not (isinstance(_pm[r]['apikey_secret_key'], str) and re.match(secret_name_pattern, _pm[r]['apikey_secret_key']))]
+               + [{'path': '$.models.' + r + '.max_tokens', 'message': 'must be an integer from 1 to 100000'}
+                  for r in model_roles if isinstance(_pm.get(r), dict) and _pm[r].get('max_tokens') is not None
+                  and not (isinstance(_pm[r]['max_tokens'], int) and not isinstance(_pm[r]['max_tokens'], bool) and 1 <= _pm[r]['max_tokens'] <= 100000)]
+               + [{'path': '$.models.' + r + '.temperature', 'message': 'must be a number from 0 to 2'}
+                  for r in model_roles if isinstance(_pm.get(r), dict) and _pm[r].get('temperature') is not None
+                  and not (isinstance(_pm[r]['temperature'], (int, float)) and not isinstance(_pm[r]['temperature'], bool) and 0 <= _pm[r]['temperature'] <= 2)]
+               + ([{'path': '$.models', 'message': 'the decision model ' + str(_dec) + ' lacks json_mode'}]
+                  if _dec in _models and not _models[_dec].get('json_mode') else [])
+               + ([{'path': '$.models.inference', 'message': str(_inf) + ' lacks tools, which an enabled profile needs'}]
+                  if _needs_tools and _inf in _models and not _models[_inf].get('tools') else [])
+               + ([{'path': '$.persona_text', 'message': 'longer than 2000 characters'}]
+                  if len(str(_p.get('persona_text') or '')) > 2000 else [])
+               + ([{'path': '$.disabled_profiles', 'message': 'must be a list of profile names'}]
+                  if _dp is not None and not (isinstance(_dp, list) and all(isinstance(x, str) for x in _dp)) else [])
+               + ([{'path': '$.disabled_profiles', 'message': 'the default profile cannot be disabled'}]
+                  if isinstance(_dp, list) and (_cand.get('router') or {}).get('default_profile') in _dp else []) }}
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "agent-config: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-bad-scope
+      raise:
+        if: "{{ mode in valid_scopes and scope not in valid_scopes[mode] }}"
+        type: error
+        error_type: AbortError
+        message: "agent-config: {{ mode }} needs scope one of {{ ', '.join(valid_scopes.get(mode, [])) }}, got '{{ scope }}'"
+
+    - task_name: check-agent-id
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - valid#: "{{ mode == 'list_models' or bool(re.match(agent_id_pattern, aid)) }}"
+        - error: >-
+            {{ None if valid else
+               {'code': 'invalid_input',
+                'message': 'agent_id must match ' + agent_id_pattern,
+                'retryable': False} }}
+
+    - task_name: mode-list-models
+      skip_if: "{{ mode != 'list_models' }}"
+      workflow:
+        ref: agent-harness-defaults
+        mode: inline
+      output:
+        set:
+          - ok: true
+          - data: "{{ {'providers': ((_ or {}).get('catalog') or {}).get('providers') or []} }}"
+
+    # The per-turn check (plan-04 §8, plan-14 §8): a full resolve costs two sync
+    # catalog calls, so the session compares only the rows' versions each turn.
+    - task_name: mode-version
+      skip_if: "{{ not valid or mode != 'version' }}"
+      tasks:
+        - task_name: read-agent-version
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "agent.{{ aid }}", key: config}
+          output:
+            set:
+              - _av: "{{ (_ or {}).get('version') or 0 if isinstance(_, dict) else 0 }}"
+              - agent_row_version: "{{ _av }}"
+        - task_name: read-user-version
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "agent.{{ aid }}", key: config}
+          output:
+            set:
+              - ok: true
+              - data: "{{ {'agent_row': agent_row_version, 'user_row': ((_ or {}).get('version') or 0) if isinstance(_, dict) else 0} }}"
+
+    - task_name: resolve-current
+      skip_if: "{{ not valid or mode in ['list_models', 'version'] }}"
+      workflow:
+        function: resolve-config
+        input:
+          agent_id: "{{ aid }}"
+          session_overrides: "{{ session_overrides if mode == 'resolve' else {} }}"
+          allowed_paths: "{{ allowed_paths }}"
+          model_roles: "{{ model_roles }}"
+          supported_schema_versions: "{{ supported_schema_versions }}"
+      output:
+        set:
+          - cur: "{{ _ }}"
+
+    - task_name: shape-resolve
+      skip_if: "{{ not valid or mode != 'resolve' }}"
+      set:
+        - session_dropped#: "{{ cur['session_dropped'] or None }}"
+        - ok: true
+        # `tiers` (each stored tier's own sections) and `user_settable` are for
+        # the admin UI: it shows what a user overrides and offers only what they may set.
+        - data: >-
+            {{ {'config': cur['config'], 'profiles': cur['profiles'], 'resolved_refs': cur['resolved_refs'],
+                'config_version': cur['config_version'], 'versions': cur['versions'],
+                'tiers': {t: ((cur['rows'].get(t) or {}).get('sections') or {}) for t in ['agent', 'user']},
+                'user_settable': allowed_paths['user']} }}
+
+    # ── validate / save: the allowlist, catalog and capabilities ────────────
+    - task_name: validate-change
+      skip_if: "{{ not valid or mode not in ['validate', 'save'] }}"
+      workflow:
+        function: validate-partial
+        input:
+          scope: "{{ scope }}"
+          partial: "{{ partial if mode == 'validate' else patch }}"
+          config: "{{ cur['config'] }}"
+          profiles: "{{ cur['profiles'] }}"
+          catalog: "{{ cur['catalog'] }}"
+          allowed_paths: "{{ allowed_paths }}"
+          model_roles: "{{ model_roles }}"
+          secret_name_pattern: "{{ secret_name_pattern }}"
+          agent_forbidden: "{{ agent_forbidden }}"
+      output:
+        set:
+          - change_errors: "{{ _['errors'] }}"
+
+    - task_name: shape-validate
+      skip_if: "{{ not valid or mode != 'validate' }}"
+      set:
+        - ok: true
+        - data: "{{ {'valid': not change_errors, 'errors': change_errors} }}"
+
+    # ── save / reset: authorize, then write the tier's one row ──────────────
+    - task_name: authorize-write
+      skip_if: "{{ not valid or mode not in ['save', 'reset'] }}"
+      workflow:
+        ref: access
+        mode: inline
+        input:
+          mode: authorize
+          agent_id: "{{ aid }}"
+          action: write
+          scope: "{{ scope }}"
+          definition_access: "{{ cur['config'].get('access') }}"
+      output:
+        set:
+          - authz: "{{ (_ or {}).get('data') or {} }}"
+
+    - task_name: decide-write
+      skip_if: "{{ not valid or mode not in ['save', 'reset'] }}"
+      set:
+        - _forbidden: "{{ not authz.get('allow') }}"
+        - _invalid: "{{ mode == 'save' and bool(change_errors) }}"
+        - do_write#: "{{ not _forbidden and not _invalid }}"
+        - error: >-
+            {{ {'code': 'forbidden', 'message': 'not allowed to write the ' + scope + ' tier (' + str(authz.get('reason')) + ')', 'retryable': False}
+                 if _forbidden else
+               {'code': 'invalid_input', 'message': '; '.join(e['path'] + ' ' + e['message'] for e in change_errors), 'retryable': False}
+                 if _invalid else None }}
+        - _row: "{{ cur['rows'][scope if scope == 'user' else 'agent'] or {} }}"
+        - _sections: "{{ _row.get('sections') or {} }}"
+        - new_row:
+            schema_version: "{{ schema_version }}"
+            version: "{{ (_row.get('version') or 0) + 1 }}"
+            sections: >-
+              {{ ((lambda f: (lambda a, b: f(f, a, b)))(
+                    lambda self, a, b: dict(a, **{
+                      k: (self(self, a[k], v) if isinstance(a.get(k), dict) and isinstance(v, dict) else v)
+                      for k, v in b.items()}))(_sections, patch or {}))
+                 if mode == 'save' else
+                 ({k: v for k, v in _sections.items() if k != section} if section else {}) }}
+            updated_at: "{{ now().isoformat() }}"
+            updated_by: "{{ str(__user_info__.get('user_id')) }}"
+
+    - task_name: write-agent-tier
+      skip_if: "{{ not (valid and mode in ['save', 'reset'] and do_write and scope == 'agent') }}"
+      activity:
+        type: builtin.state.set_state
+        input:
+          in_global_ns: true
+          namespace: "agent.{{ aid }}"
+          key: config
+          value: "{{ new_row }}"
+          topic: config
+
+    - task_name: write-user-tier
+      skip_if: "{{ not (valid and mode in ['save', 'reset'] and do_write and scope == 'user') }}"
+      activity:
+        type: builtin.state.set_state
+        input:
+          in_global_ns: false
+          namespace: "agent.{{ aid }}"
+          key: config
+          value: "{{ new_row }}"
+          topic: config
+
+    - task_name: shape-write
+      skip_if: "{{ not valid or mode not in ['save', 'reset'] }}"
+      set:
+        - _v: "{{ cur['versions'] }}"
+        - ok: "{{ do_write }}"
+        - data: >-
+            {{ {'config_version': 'd' + str(_v['harness']) + '+a' + str(_v['agent'])
+                   + '+g' + str(new_row['version'] if scope == 'agent' else _v['agent_row'])
+                   + '+u' + str(new_row['version'] if scope == 'user' else _v['user_row'])}
+               if do_write else None }}

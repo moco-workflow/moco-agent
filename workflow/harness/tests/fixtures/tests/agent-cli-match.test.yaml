@@ -1,0 +1,23 @@
+test_type: integration-test
+
+# P16 on the real engine: agent-cli's wait_for takes the answer carrying its own
+# message_id, not whichever arrived first (plan-00a §6). See the fixture's header.
+
+wfspec:
+  name: agent-cli-match-fixture
+
+test_cases:
+  # Another caller's answer is first in the buffer; ours must still be chosen.
+  - id: the-answer-with-our-message-id-is-taken-even-when-another-arrived-first
+    input: {mid: m-mine}
+    expect:
+      assert:
+        - "{{ matched_message_id == 'm-mine' }}"
+        - "{{ matched_answer == 'yours' }}"
+
+  # Nothing carries our id: time out, never take someone else's answer.
+  - id: with-no-answer-for-us-nothing-is-taken
+    input: {mid: m-mine, send_ours: false}
+    expect:
+      assert:
+        - "{{ matched_message_id is None }}"

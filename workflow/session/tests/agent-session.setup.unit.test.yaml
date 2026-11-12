@@ -1,0 +1,90 @@
+test_type: unit-test
+
+# agent-session, setup answers (F70): a turn that failed because a model is not set
+# up is answered with what to set up, not the apology.
+#
+#   classify-setup   auth / unconfigured / profile_failed text / retrieval_failed /
+#                    an unrelated error (no setup)
+#   finalize-turn    the setup answer replaces the apology; setup in the event and
+#                    the transcript
+
+wfspec:
+  name: agent-session
+
+test_data:
+  config: &config
+    session:
+      apology_text: "SORRY"
+      setup_text: "Not set up: {role}. {hint}"
+      setup_hints: {no_secret_name: "Pick a key.", secret_missing: "Store {secret}.", env_default: "Set a model.", auth_failed: "Bad key {secret}."}
+      setup_patterns: ["has no model configured", "secret not found", "environment variable not set", "unauthorized"]
+    models:
+      inference: {apikey_secret_key: MY_LLM_TOKEN}
+      embedding: {apikey_secret_key: null}
+    memory: {short_term: {recent_turns: 2}}
+
+test_groups:
+  - step_name: classify-setup
+    test_cases:
+      - id: a-missing-key-is-setup
+        input:
+          config: *config
+          result: {status: error, trace: {error: {code: auth, message: "WorkflowRuntimeError: secret not found: MY_LLM_TOKEN", role: inference}}}
+        expect:
+          assert:
+            - "{{ turn_setup == {'role': 'inference', 'reason': 'secret_missing', 'secret_name': 'MY_LLM_TOKEN', 'scope': 'user'} }}"
+            - "{{ setup_answer == 'Not set up: inference. Store MY_LLM_TOKEN.' }}"
+
+      - id: no-key-name-is-setup
+        input:
+          config: *config
+          result: {status: error, trace: {error: {code: unconfigured, message: "llm-invoke: role 'inference' has no model configured (models.inference)", role: inference}}}
+        expect:
+          assert:
+            - "{{ turn_setup['reason'] == 'no_secret_name' and setup_answer == 'Not set up: inference. Pick a key.' }}"
+
+      - id: a-profile-failure-naming-a-worker-variable-is-setup
+        input:
+          config: *config
+          result: {status: error, trace: {error: {code: profile_failed, message: "Required environment variable not set: MOCO_LLM_DEFAULT_BASE_URL"}}}
+        expect:
+          assert:
+            - "{{ turn_setup['role'] == 'inference' and turn_setup['reason'] == 'env_default' }}"
+
+      - id: failed-knowledge-search-on-an-unset-embedding-is-setup
+        input:
+          config: *config
+          result: {status: declined, answer: "I couldn't search moco-docs right now.", trace: {error: {code: retrieval_failed, role: embedding, message: "Required environment variable not set: MOCO_LLM_DEFAULT_EMBED_MODEL_NAME"}}}
+        expect:
+          assert:
+            - "{{ turn_setup == {'role': 'embedding', 'reason': 'env_default', 'secret_name': None, 'scope': None} }}"
+
+      - id: an-outage-is-not-setup
+        input:
+          config: *config
+          result: {status: error, trace: {error: {code: provider_error, message: "Connection refused"}}}
+        expect:
+          assert:
+            - "{{ turn_setup is None and setup_answer is None }}"
+
+  - step_name: finalize-turn
+    test_cases:
+      - id: the-setup-answer-replaces-the-apology
+        input:
+          config: *config
+          session_id: s1
+          profile: {name: chat}
+          config_version: v
+          budget_sec: 40
+          turn_count: 0
+          title: ""
+          recent: []
+          turn_ctx: {message: "hi", message_id: m1, sent_at: "2026-10-27T10:00:00", received_at: "2026-10-27T10:00:00"}
+          result: {status: error, trace: {error: {code: auth}}}
+          turn_setup: {role: inference, reason: secret_missing, secret_name: MY_LLM_TOKEN, scope: user}
+          setup_answer: "Not set up: inference. Store MY_LLM_TOKEN."
+        expect:
+          assert:
+            - "{{ turn_status == 'error' and turn_answer == 'Not set up: inference. Store MY_LLM_TOKEN.' }}"
+            - "{{ answer_event['setup']['secret_name'] == 'MY_LLM_TOKEN' and turn_entries[1]['setup']['reason'] == 'secret_missing' }}"
+            - "{{ new_recent == [] }}"

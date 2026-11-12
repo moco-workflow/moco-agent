@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROMPT.RAG.ANSWER — answer from retrieved passages, with citations (design §6.3.1)
+# ================================================================================
+#
+#   variables                                  out
+#   ────────────────────────────────────────── ─────────────────────────────────
+#   context_bundle, passages, messages,        {kind: chat, messages,
+#   tools_offered, forced_final                 response_format, schema}
+#
+# The same variables as prompt.loop, because the loop's `thinking` state renders
+# whichever prompt the profile names (§6.8.3). It RUNS prompt.loop for the bundle
+# and adds, to the system message:
+#   - the rag rules (cite [n], answer only from the passages, say when they don't
+#     cover it), ported from the old agent's rag-qa-agent;
+#   - the passages, numbered by their `n`, attributed (title | source | url), each
+#     clamped and in its own canonical fence <data source="…" n="…">…</data>, with
+#     any fence tag inside neutralised (plan-05).
+#
+# Passages are numbered by knowledge retrieve (§6.5.1) in round-robin order across
+# sources, and `n` is what the answer cites. Memory blocks stay in their "background,
+# not a source" section, so the model can never cite a memory as [n].
+#
+# answer_schema is null: the answer is markdown with inline [n] citations, which
+# the loop's `checking` state reads as text.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: prompt.rag.answer
+
+context:
+  answer_schema:
+  max_passage_chars: 4000
+  rag_rules: >-
+    Answer from the numbered source passages below.
+
+    - Cite the passage number after each claim it supports, like [2]. Cite only
+    passages that are listed below.
+
+    - If the passages do not contain the answer, say so plainly instead of
+    guessing, and do not fill the gap from outside knowledge.
+
+    - Prefer concrete detail from the passages over generalities.
+
+    - Use markdown, and keep the answer under 350 words unless the user asks for
+    more.
+
+input:
+  context_bundle: {}
+  passages: []
+  messages: []
+  tools_offered: false
+  forced_final:
+
+output:
+  kind: chat
+  messages: "{{ out_messages }}"
+  response_format:
+  schema: "{{ answer_schema }}"
+
+main:
+  tasks:
+    - task_name: render-bundle
+      workflow:
+        ref: prompt.loop
+        mode: inline
+        input:
+          context_bundle: "{{ context_bundle }}"
+          messages: "{{ messages }}"
+          tools_offered: "{{ tools_offered }}"
+          forced_final: "{{ forced_final }}"
+      output:
+        set:
+          - base_messages: "{{ (_ or {}).get('messages') or [] }}"
+
+    - task_name: add-passages
+      set:
+        - _ps: "{{ [p for p in (passages or []) if isinstance(p, dict) and p.get('text')] }}"
+        # The canonical fence (plan-05): one <data source=… n=…> per passage. The
+        # attribute values are quoted and stripped of quotes and angle brackets.
+        - _listing: >-
+            {{ '\n\n'.join(
+                 '[' + str(p.get('n') or (i + 1)) + '] '
+                 + ' | '.join(str(x) for x in [p.get('title'), p.get('source'), p.get('url')] if x)
+                 + '\n<data source="' + re.sub(r'["<>]', '', str(p.get('source') or 'unknown'))
+                 + '" n="' + str(p.get('n') or (i + 1)) + '">\n'
+                 + re.sub(r'(?i)</?\s*data\b[^>]*>', '[tag removed]', str(p['text'])[:max_passage_chars])
+                 + '\n</data>'
+                 for i, p in enumerate(_ps)) }}
+        - _rag: >-
+            {{ '## Sources\n' + rag_rules + '\n\n'
+               + (_listing if _ps
+                  else 'No source passages were retrieved. Say that you could not find this in '
+                       'the sources searched.') }}
+        - _has_system: "{{ bool(base_messages) and base_messages[0].get('role') == 'system' }}"
+        - out_messages: >-
+            {{ ([{'role': 'system', 'content': base_messages[0]['content'] + '\n\n' + _rag}] + base_messages[1:])
+               if _has_system else ([{'role': 'system', 'content': _rag}] + base_messages) }}

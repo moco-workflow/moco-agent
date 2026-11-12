@@ -1,0 +1,235 @@
+test_type: integration-test
+
+# hitl (plan-12, design §6.11): every legal transition and the illegal ones,
+# already_open, a stale id, the resume payload and its approval_token, revise then
+# a re-open in the same turn (suffixed id), expiry at the boundary.
+
+wfspec:
+  name: hitl
+
+test_data:
+  awaiting: &awaiting
+    schema_version: 1
+    id: pa-s1-3
+    session_id: s1
+    turn: 3
+    kind: tool_call
+    profile: react
+    status: awaiting
+    summary: "Scale web to 3?"
+    detail: {call: {id: c1, name: k8s_scale, arguments: {name: web}}, args_hash: abc123}
+    offer_session_grant: true
+    decision: null
+    created_at: "2026-10-11T10:00:00"
+    expires_at: "2999-01-01T00:00:00"
+  overdue: &overdue
+    {schema_version: 1, id: pa-s1-3, session_id: s1, turn: 3, kind: tool_call, status: awaiting, detail: {args_hash: abc123}, offer_session_grant: false, expires_at: "2000-01-01T00:00:00"}
+  resolved: &resolved
+    {schema_version: 1, id: pa-s1-3, session_id: s1, turn: 3, kind: tool_call, status: resolved, detail: {}, expires_at: "2999-01-01T00:00:00"}
+  user_input: &user_input
+    {schema_version: 1, id: pa-s1-5, session_id: s1, turn: 5, kind: user_input, status: awaiting, detail: {call: {id: c2, name: ask_user}}, offer_session_grant: false, expires_at: "2999-01-01T00:00:00"}
+
+test_cases:
+
+  # ── open ────────────────────────────────────────────────────────────────
+  - id: open-writes-an-awaiting-row
+    input: {mode: open, agent_id: ops, session_id: s1, turn: 3, kind: tool_call, profile: react, summary: "Scale web to 3?", detail: {args_hash: abc123}, offer_session_grant: true, ttl_sec: 3600}
+    mocks:
+      - {step_name: read-current, _: null}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['pending']['id'] == 'pa-s1-3' and data['pending']['status'] == 'awaiting' and data['pending']['schema_version'] == 1 }}"
+        - "{{ data['pending']['offer_session_grant'] == True and data['pending']['expires_at'] > data['pending']['created_at'] }}"
+
+  - id: open-while-one-is-awaiting-is-already-open
+    input: {mode: open, agent_id: ops, session_id: s1, turn: 4, kind: tool_call}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: already_open, message: "an action is already waiting in this session: pa-s1-3", retryable: false}
+
+  - id: re-open-in-the-same-turn-after-a-revise-gets-a-suffix
+    input: {mode: open, agent_id: ops, session_id: s1, turn: 3, kind: tool_call}
+    mocks:
+      - {step_name: read-current, _: *resolved}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['pending']['id'] == 'pa-s1-3-2' }}"
+
+  - id: a-third-suspension-in-the-turn-counts-on
+    input: {mode: open, agent_id: ops, session_id: s1, turn: 3, kind: tool_call}
+    mocks:
+      - {step_name: read-current, _: {schema_version: 1, id: pa-s1-3-2, status: resolved}}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['pending']['id'] == 'pa-s1-3-3' }}"
+
+  # ── resolve ─────────────────────────────────────────────────────────────
+  - id: approve-resolves-and-returns-the-resume-with-its-token
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: approve}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['resume']['approval_token'] == 'pa-s1-3:abc123' and data['resume']['decision'] == 'approve' }}"
+        - "{{ data['resume']['pending_action']['status'] == 'resolved' and data['resume']['pending_action']['detail']['call']['name'] == 'k8s_scale' }}"
+        - "{{ data['pending']['decision']['decision'] == 'approve' }}"
+
+  - id: reject-carries-the-feedback-and-no-token
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: reject, feedback: "not now"}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['resume']['approval_token'] is None and data['resume']['feedback'] == 'not now' and data['resume']['decision'] == 'reject' }}"
+
+  - id: approve-session-needs-the-offer
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: approve_session}
+    mocks:
+      - step_name: read-current
+        _: {schema_version: 1, id: pa-s1-3, kind: tool_call, status: awaiting, detail: {}, offer_session_grant: false, expires_at: "2999-01-01T00:00:00"}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+
+  - id: a-user-input-action-takes-a-reply
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-5, decision: reply, feedback: "the web deployment"}
+    mocks:
+      - {step_name: read-current, _: *user_input}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['resume']['feedback'] == 'the web deployment' and data['resume']['approval_token'] is None }}"
+
+  - id: a-tool-call-cannot-take-a-reply
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: reply}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: a-stale-id-is-invalid-state
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-2, decision: approve}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "the pending action is pa-s1-3, not pa-s1-2", retryable: false}
+
+  - id: resolving-a-resolved-row-is-invalid-state
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: approve}
+    mocks:
+      - {step_name: read-current, _: *resolved}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-late-answer-expires-the-row-and-runs-nothing
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: approve}
+    mocks:
+      - {step_name: read-current, _: *overdue}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'expired' and data is None }}"
+
+  - id: resolve-with-nothing-pending-is-not-found
+    input: {mode: resolve, agent_id: ops, session_id: s1, id: pa-s1-3, decision: approve}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  # ── expire / cancel ─────────────────────────────────────────────────────
+  - id: expire-a-due-row
+    input: {mode: expire, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: *overdue}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['expired'] == True and data['pending']['status'] == 'expired' }}"
+
+  - id: expire-before-the-deadline-changes-nothing
+    input: {mode: expire, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['expired'] == False and data['pending']['status'] == 'awaiting' }}"
+
+  - id: force-expire-for-the-janitor
+    input: {mode: expire, agent_id: ops, session_id: s1, force: true}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['expired'] == True }}"
+
+  - id: expiring-a-resolved-row-is-invalid-state
+    input: {mode: expire, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: *resolved}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: cancel-an-awaiting-row
+    input: {mode: cancel, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: null}
+    expect:
+      assert:
+        - "{{ data['cancelled'] == True and data['pending']['status'] == 'cancelled' }}"
+
+  - id: cancelling-a-resolved-row-is-invalid-state
+    input: {mode: cancel, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: *resolved}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  # ── get / list ──────────────────────────────────────────────────────────
+  - id: get-returns-the-row-or-null
+    input: {mode: get, agent_id: ops, session_id: s1}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {pending: null}
+
+  - id: list-returns-only-awaiting-rows
+    input: {mode: list, agent_id: ops}
+    mocks:
+      - {step_name: list-pending-keys, _: [{key: "session:s1:pending"}]}
+      - {step_name: read-pending-row, _: *awaiting}
+    expect:
+      assert:
+        - "{{ ok == True and [p['id'] for p in data['pending']] == ['pa-s1-3'] }}"
+
+  # F50 closed: an owner_user_id input is ignored, the caller's own rows are used.
+  - id: an-owner-user-id-input-addresses-only-the-callers-rows
+    input: {mode: expire, agent_id: ops, session_id: s1, owner_user_id: someone-else, force: true}
+    mocks:
+      - {step_name: read-current, _: *awaiting}
+      - {step_name: write-row, _: "{{ None if sessions_ns == 'agent.ops.sessions' else 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['expired'] == True }}"

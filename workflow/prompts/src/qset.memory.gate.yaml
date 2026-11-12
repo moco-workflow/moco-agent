@@ -1,0 +1,63 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.MEMORY.GATE — is this exchange worth remembering? (design §6.4.6 step 1)
+# ================================================================================
+#
+#   variables                 out
+#   ───────────────────────── ─────────────────────────────────────────────
+#   exchange: {user,          {kind: system_one, state, questions, keymap}
+#   assistant}, kinds, hints
+#
+# memory-curator's gate. ONE exchange per request (decide_many over the batch): the
+# state is the thing judged, and batching exchanges into one state erases the
+# per-exchange signal (F44). Questions about that one state:
+#   worth_remembering  noul   a durable preference, fact or lesson worth keeping
+#   user_stated        noul   the user said it (not only the assistant)
+#   kind               choice one of the agent's memory kinds (criteria: hints)
+# Sorted keys (§6.3.2). Episodes are not curated here (phase 3, on retire).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.memory.gate
+
+context:
+  exchange_chars: 1500
+  default_hints:
+    profile: "A preference or a fact about the user or their environment (tools, setup, role)."
+    fact: "A fact or answer worth reusing in later conversations."
+    lesson: "A lesson, pitfall or procedure: how to do something here, or what fails and why."
+
+input:
+  exchange: {}
+  kinds: [profile, fact, lesson]
+  hints: {}
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: {}
+
+main:
+  task_name: build-gate-qset
+  set:
+    - _x: "{{ exchange if isinstance(exchange, dict) else {} }}"
+    - state: >-
+        {{ ('User: ' + str(_x.get('user') or '').strip() + '\n\nAssistant: ' + str(_x.get('assistant') or '').strip())[:exchange_chars] }}
+    - _kinds: "{{ [k for k in (kinds or []) if k != 'episode'] or ['fact'] }}"
+    - _q:
+        worth_remembering:
+          type: noul
+          instructions: >-
+            Does this exchange contain something durable worth remembering for later
+            conversations with this user -- a preference, a fact about their environment,
+            or a lesson about how something works here -- rather than small talk or a
+            one-off question?
+        user_stated:
+          type: noul
+          instructions: "Did the USER state it themselves, rather than only the assistant saying it?"
+        kind:
+          type: choice
+          instructions: "What kind of thing worth remembering is it?"
+          criteria: "{{ {k: str((hints or {}).get(k) or default_hints.get(k) or k) for k in _kinds} }}"
+    - questions: "{{ {k: dict(sorted({kk: (dict(sorted(vv.items())) if isinstance(vv, dict) else vv) for kk, vv in _q[k].items()}.items())) for k in sorted(_q)} }}"

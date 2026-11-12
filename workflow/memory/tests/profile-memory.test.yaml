@@ -1,0 +1,70 @@
+test_type: integration-test
+
+# profile-memory (plan-11 step 17, design §6.4.7): one System One decision, the memory
+# call, a templated answer -- and a handoff when the message is not about memory.
+
+wfspec:
+  name: profile-memory
+
+test_data:
+  cfg: &cfg {router: {default_profile: chat}, memory: {long_term: {enabled: true}}}
+
+test_cases:
+  - id: remember-strips-the-lead-in-and-stores-a-preference-as-profile
+    input: {agent_id: moco, query: "Please remember that I prefer helm over kubectl", config: *cfg, session_id: s1}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: remember}, decided_by: system_one}}}
+      - {step_name: do-remember, _: "{{ {'ok': True, 'data': {'key': 'mem:profile:x', 'verdict': 'new'}} if statement == 'I prefer helm over kubectl' else 1 / 0 }}"}
+    expect:
+      output:
+        - status: ok
+        - answer: "Got it, I will remember: I prefer helm over kubectl"
+      assert:
+        - "{{ usage['classifier_calls'] == 1 and usage['llm_calls'] == 0 }}"
+
+  - id: remembering-a-known-fact-says-so
+    input: {agent_id: moco, query: "remember: the staging cluster is in eu-west", config: *cfg, session_id: s1}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: remember}, decided_by: system_one}}}
+      - {step_name: do-remember, _: {ok: true, data: {key: "mem:fact:x", verdict: duplicate}}}
+    expect:
+      output:
+        - answer: "I already had that: the staging cluster is in eu-west"
+
+  - id: forget-retires-and-reports
+    input: {agent_id: moco, query: "forget what I said about the staging cluster", config: *cfg}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: forget}, decided_by: system_one}}}
+      - {step_name: do-forget, _: {ok: true, data: {retired: ["mem:fact:staging-cluster"]}}}
+    expect:
+      output:
+        - answer: "Done, I have forgotten 1 thing(s) about that, and I will not learn it again."
+
+  - id: list-shows-what-is-remembered
+    input: {agent_id: moco, query: "what do you know about me?", config: *cfg}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: list}, decided_by: system_one}}}
+      - {step_name: do-list, _: {ok: true, data: {items: [{title: "Deploys with helm"}, {title: "Works in eu-west"}]}}}
+    expect:
+      output:
+        - answer: "Here is what I remember about you:\n- Deploys with helm\n- Works in eu-west\n\nSay \"forget …\" to remove any of it."
+
+  - id: a-message-not-about-memory-hands-off
+    input: {agent_id: moco, query: "how do retries work?", config: *cfg}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: none}, decided_by: system_one}}}
+      - {step_name: do-remember, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - status: handoff
+        - handoff: {profile: chat, reason: "not a memory request"}
+
+  - id: a-memory-failure-is-told-not-raised
+    input: {agent_id: moco, query: "remember I use argo", config: *cfg, session_id: s1}
+    mocks:
+      - {step_name: classify-command, _: {ok: true, data: {choices: {command: remember}, decided_by: system_one}}}
+      - {step_name: do-remember, _: {ok: false, error: {code: forbidden, message: "guests write nothing"}}}
+    expect:
+      output:
+        - status: ok
+        - answer: "I couldn't change my memory just now: guests write nothing"

@@ -1,0 +1,114 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.MEMORY — agent-admin's memory area (plan-16 phase 2, design §6.4.2)
+# ================================================================================
+#   op                in                          → memory
+#   list_memory       scope?, kinds?, status?     list    (the caller's user scope by default)
+#   edit_memory       key, title?, text?, tags?   edit
+#   retire_memory     key                         retire
+#   resolve_memory    key, to: active|retired     resolve_conflict
+#   forget_memory     key | query                 forget  (retire + tombstone: not relearned)
+#   list_proposals    status?                     memory-promote list     (admin, phase 3)
+#   approve_proposal  slug                        memory-promote approve  (→ agent scope)
+#   reject_proposal   slug, reason?               memory-promote reject
+#   run_promotion     —                           memory-promote run      (now, this agent)
+# The user can always see and remove what the agent holds about them (§6.4.7). The
+# agent scope is written only by seeding and promotion; memory enforces it.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.memory
+
+context:
+  ops:
+    list_memory: list
+    edit_memory: edit
+    retire_memory: retire
+    resolve_memory: resolve_conflict
+    forget_memory: forget
+    list_proposals: list
+    approve_proposal: approve
+    reject_proposal: reject
+    run_promotion: run
+  promote_ops: [list_proposals, approve_proposal, reject_proposal, run_promotion]
+  res: {}
+  cfg: {}
+
+input:
+  op:
+  agent_id:
+  key:
+  query:
+  scope:
+  kinds:
+  status:
+  title:
+  text:
+  tags:
+  to:
+  # proposals (phase 3)
+  slug:
+  reason: ""
+
+output:
+  ok: "{{ bool(res.get('ok')) }}"
+  data: "{{ res.get('data') }}"
+  error: "{{ res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.memory: invalid op '{{ op }}'"
+
+    - task_name: resolve-config
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - cfg: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+          - refs: "{{ (((_ or {}).get('data') or {}).get('resolved_refs')) or {} }}"
+
+    - task_name: call-promote
+      skip_if: "{{ op not in promote_ops }}"
+      workflow:
+        ref: agent-harness-memory/memory-promote
+        mode: inline
+        input:
+          mode: "{{ ops[op] }}"
+          agent_id: "{{ agent_id }}"
+          config: "{{ cfg }}"
+          resolved_refs: "{{ refs }}"
+          status: "{{ status }}"
+          slug: "{{ slug }}"
+          reason: "{{ reason }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-memory
+      skip_if: "{{ op in promote_ops }}"
+      workflow:
+        ref: agent-harness-memory/memory
+        mode: inline
+        input:
+          mode: "{{ ops[op] }}"
+          agent_id: "{{ agent_id }}"
+          config: "{{ cfg }}"
+          key: "{{ key }}"
+          query: "{{ query }}"
+          scope: "{{ scope or 'user' }}"
+          kinds: "{{ kinds }}"
+          status: "{{ status }}"
+          title: "{{ title }}"
+          text: "{{ text }}"
+          tags: "{{ tags }}"
+          to: "{{ to }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"

@@ -1,0 +1,22 @@
+test_type: integration-test
+
+# hook.moco.trace: observe-only; reports the event and the payload's keys, never values.
+
+wfspec:
+  name: hook.moco.trace
+
+test_cases:
+  - id: reports-event-and-sorted-keys
+    input: {hook_event: tool.after, payload: {content: "secret result", call: {name: x}}, agent_id: moco-assistant, session_id: s1}
+    expect:
+      output:
+        - action: continue
+        - hook_event: tool.after
+        - payload_keys: [call, content]
+
+  - id: no-payload-continues
+    input: {hook_event: session.retired}
+    expect:
+      output:
+        - action: continue
+        - payload_keys: []

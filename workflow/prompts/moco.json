@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-harness-prompts",
+    "wfspec_package_version": "0.10.0",
+    "wfspec_description": "Agent harness - The harness prompt library (prompt.*), System One question sets (qset.*) and the profile library (profile.*). Part of the agent-harness-* package set; see moco-agent/docs/plan-00-overview.md.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.test.yaml"
+    ]
+}

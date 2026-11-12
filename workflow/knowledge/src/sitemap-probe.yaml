@@ -1,0 +1,91 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SITEMAP-PROBE — does this one URL actually serve a sitemap?
+# ================================================================================
+#
+# One HTTP GET, classified. Ported from the old agent (plan-06 §4); admin.knowledge
+# check_sitemap calls it with `on_error: {catch: true}`, because a host that does not
+# resolve or refuses the connection raises straight out of http.request, and "there
+# is no sitemap there" must stay distinguishable from "the operator crashed".
+#
+# A 200 is NOT enough on its own. Anything that falls back to index.html for an
+# unknown path -- every SPA, and most dev servers -- answers /sitemap.xml with a
+# page of HTML. The sitemap crawler would then find no <loc> entries and index
+# nothing, having been told the URL was fine. So the body has to genuinely open
+# with a sitemap root element.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: sitemap-probe
+
+context:
+  probe_result: {}
+input:
+  url:
+
+output: '{{ probe_result }}'
+
+main:
+  tasks:
+
+    - task_name: reject-non-http-url
+      raise:
+        if: '{{ not bool(re.match(r"^https?://[^/?#]+", str(url or "").strip())) }}'
+        type: error
+        error_type: AbortError
+        message: "Not an http(s) URL: '{{ url }}'"
+
+    - task_name: fetch-candidate
+      activity:
+        type: http.request
+        input:
+          method: GET
+          url: '{{ str(url).strip() }}'
+          # example.com -> www.example.com, and http -> https, are both
+          # ordinary for a site root. Refusing to follow would report a 301
+          # as "no sitemap".
+          follow_redirects: true
+          # A sitemap is XML. Asking for JSON back would throw on parse and
+          # turn every successful probe into a caught exception.
+          output_json: false
+        options:
+          retry_policy:
+            # One shot, and short. Up to two of these run inside one
+            # agent-admin check_sitemap call, which a user is sitting and
+            # waiting on with a form field focused.
+            timeout_sec: 8
+            max_attempts: 1
+      output:
+        set:
+          # All `@`: a sitemap body can be megabytes, and container scope
+          # keeps it out of the workflow context that Temporal serialises.
+          - status_code@: '{{ _.get("status_code") }}'
+          - is_success@: '{{ bool(_.get("is_success")) }}'
+          - content_type@: '{{ str(_.get("headers", {}).get("content-type", "")) }}'
+          - body@: '{{ str(_.get("text") or "") }}'
+
+    - task_name: classify
+      set:
+        # Only the head: a sitemap declares its root element within the
+        # first line or two, and a large HTML page should not be scanned
+        # for one.
+        - _head: "{{ body[:4096] }}"
+        - _is_sitemap: >-
+            {{ bool(is_success and ("<urlset" in _head or "<sitemapindex" in _head)) }}
+        - probe_result:
+            url: '{{ str(url).strip() }}'
+            status_code: "{{ status_code }}"
+            is_success: "{{ is_success }}"
+            is_sitemap: "{{ _is_sitemap }}"
+            # <loc> appears exactly once per entry in both a urlset and a
+            # sitemapindex, so this is the page count the caller can show.
+            entry_count: '{{ len(re.findall(r"<loc>", body)) if _is_sitemap else 0 }}'
+            # Written to be shown to a user verbatim, like agent-admin's
+            # abort messages.
+            reason: >-
+              {{ "" if _is_sitemap
+                 else ("responded HTTP " + str(status_code) if not is_success
+                       else "responded with "
+                            + (content_type.split(";")[0] or "no content type")
+                            + " rather than a sitemap") }}

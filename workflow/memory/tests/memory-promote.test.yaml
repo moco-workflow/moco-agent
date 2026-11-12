@@ -1,0 +1,204 @@
+test_type: integration-test
+
+# memory-promote (plan-07 step 8, design §6.16): admin only; run groups the promotion
+# pool's notes (memory-store list_pool) by kind:term across ≥ 3 users, confirms with System One, merges, writes a
+# proposal, skips what exists and what was proposed before, expires old proposals;
+# approve writes a pinned agent-scope item and marks the row; reject; illegal decisions.
+# Every child and state call is mocked by task name.
+
+wfspec:
+  name: memory-promote
+
+test_data:
+  config: &config {access: {admin_user_ids: [root]}, decisions: {memory: {same_min_p: 0.6}}}
+  admin: &admin {ok: true, data: {role: admin}}
+  # The promotion pool (memory-store list_pool): alice, bob, carol each hold a retry
+  # lesson; dave holds something else.
+  pool: &pool
+    ok: true
+    data:
+      items:
+        - {user_id: alice, key: "mem:lesson:retry-alice", kind: lesson, status: active, title: "Retry timeout per attempt (alice)", text: "timeout_sec applies to each attempt", tags: [retry]}
+        - {user_id: bob, key: "mem:lesson:retry-bob", kind: lesson, status: active, title: "Retry timeout per attempt (bob)", text: "timeout_sec applies to each attempt", tags: [retry]}
+        - {user_id: carol, key: "mem:lesson:retry-carol", kind: lesson, status: active, title: "Retry timeout per attempt (carol)", text: "timeout_sec applies to each attempt", tags: [retry]}
+        - {user_id: dave, key: "mem:fact:helm", kind: fact, status: active, title: "Deploys with helm", text: "x", tags: [helm]}
+  proposal: &proposal
+    {schema_version: 1, key: "proposal:retry-timeout-is-per-attempt", slug: retry-timeout-is-per-attempt, kind: lesson, status: proposed,
+     title: "Retry timeout is per attempt", text: "timeout_sec applies to each attempt.", tags: [retry],
+     members: [{user_id: alice, key: "mem:lesson:retry-alice"}, {user_id: bob, key: "mem:lesson:retry-bob"}, {user_id: carol, key: "mem:lesson:retry-carol"}],
+     user_count: 3, created_at: "2026-10-16T00:00:00+00:00", expires_at: "2099-01-01T00:00:00+00:00"}
+
+test_cases:
+  - id: three-users-sharing-a-lesson-become-one-proposal
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: []}
+      - {step_name: list-pool, _: *pool}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: confirm-groups, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.9, same_1: 0.8}}}]}}}
+      - {step_name: merge-group, _: {ok: true, data: {parsed: {title: "Retry timeout is per attempt", text: "timeout_sec applies to each attempt.", tags: [Retry]}}}}
+      - {step_name: write-proposal, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {users: 4, items: 4, groups: 1, confirmed: 1, proposed: [retry-timeout-is-per-attempt], expired: [], skipped: []}
+
+  - id: system-one-not-confirming-leaves-too-few-users
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: []}
+      - {step_name: list-pool, _: *pool}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: confirm-groups, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.9, same_1: 0.2}}}]}}}
+      - {step_name: merge-group, _: "{{ 1 / 0 }}"}
+      - {step_name: write-proposal, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['groups'] == 1 and data['confirmed'] == 0 and data['proposed'] == [] }}"
+
+  - id: fewer-than-three-users-reads-nothing
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: []}
+      - step_name: list-pool
+        _: {ok: true, data: {items: [{user_id: alice, key: "mem:lesson:a", kind: lesson, status: active, title: "Retry a", tags: [retry]}, {user_id: bob, key: "mem:lesson:b", kind: lesson, status: active, title: "Retry b", tags: [retry]}]}}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: confirm-groups, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {users: 2, items: 2, groups: 0, confirmed: 0, proposed: [], expired: [], skipped: []}
+
+  - id: notes-already-in-a-proposal-are-not-proposed-again
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: "{{ {'key': 'proposal:x', 'slug': 'x', 'status': 'rejected', 'members': [{'user_id': 'alice', 'key': 'mem:lesson:retry-alice'}]} }}"}
+      - {step_name: list-pool, _: *pool}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: confirm-groups, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['items'] == 4 and data['groups'] == 0 }}"
+
+  - id: a-merged-slug-that-exists-in-the-agent-scope-is-skipped
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: []}
+      - {step_name: list-pool, _: *pool}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: [{key: "mem:lesson:retry-timeout-is-per-attempt", slug: retry-timeout-is-per-attempt}]}}}
+      - {step_name: confirm-groups, _: {ok: true, data: {results: [{ok: true, data: {nouls: {same_0: 0.9, same_1: 0.8}}}]}}}
+      - {step_name: merge-group, _: {ok: true, data: {parsed: {title: "Retry timeout is per attempt", text: "t"}}}}
+      - {step_name: write-proposal, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['proposed'] == [] and data['skipped'] == [{'slug': 'retry-timeout-is-per-attempt', 'reason': 'exists'}] }}"
+
+  - id: an-old-proposal-expires-on-the-next-run
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:old"}]}
+      - {step_name: read-proposal, _: {key: "proposal:old", slug: old, status: proposed, members: [], expires_at: "2026-01-01T00:00:00+00:00"}}
+      - {step_name: list-pool, _: {ok: true, data: {items: []}}}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: write-proposal, _: null}
+    expect:
+      assert:
+        - "{{ data['expired'] == ['old'] and data['proposed'] == [] }}"
+
+  - id: only-an-admin-may-run
+    input: {mode: run, agent_id: ops, config: *config}
+    mocks:
+      - {step_name: identify-caller, _: {ok: true, data: {role: user}}}
+      - {step_name: list-proposal-keys, _: "{{ 1 / 0 }}"}
+      - {step_name: list-pool, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: list-filters-by-status
+    input: {mode: list, agent_id: ops, config: *config, status: proposed}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: *proposal}
+    expect:
+      assert:
+        - "{{ ok == True and [p['slug'] for p in data['proposals']] == ['retry-timeout-is-per-attempt'] }}"
+
+  # ── approve / reject ────────────────────────────────────────────────────
+  - id: approve-writes-a-pinned-agent-item-and-marks-the-row
+    input: {mode: approve, agent_id: ops, config: *config, slug: retry-timeout-is-per-attempt}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: *proposal}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - step_name: save-agent-item
+        _: "{{ {'ok': True, 'data': {'item': {'key': 'mem:lesson:' + row['slug'], 'scope': 'agent', 'pinned': True}}} }}"
+      - {step_name: write-proposal, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['proposal']['status'] == 'approved' and data['proposal']['item_key'] == 'mem:lesson:retry-timeout-is-per-attempt' }}"
+        - "{{ data['item']['scope'] == 'agent' and data['proposal']['decided_by'] is not None }}"
+
+  - id: a-refused-agent-write-leaves-the-proposal-open
+    input: {mode: approve, agent_id: ops, config: *config, slug: retry-timeout-is-per-attempt}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: *proposal}
+      - {step_name: read-agent-scope, _: {ok: true, data: {items: []}}}
+      - {step_name: save-agent-item, _: {ok: false, error: {code: forbidden, message: no, retryable: false}}}
+      - {step_name: write-proposal, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: reject-marks-the-row-with-the-reason
+    input: {mode: reject, agent_id: ops, config: *config, slug: retry-timeout-is-per-attempt, reason: "too specific"}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: *proposal}
+      - {step_name: save-agent-item, _: "{{ 1 / 0 }}"}
+      - {step_name: write-proposal, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['proposal']['status'] == 'rejected' and data['proposal']['reason'] == 'too specific' }}"
+
+  - id: a-decided-proposal-cannot-be-decided-again
+    input: {mode: approve, agent_id: ops, config: *config, slug: retry-timeout-is-per-attempt}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: {key: "proposal:retry-timeout-is-per-attempt", slug: retry-timeout-is-per-attempt, status: rejected}}
+      - {step_name: save-agent-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' }}"
+
+  - id: an-expired-proposal-cannot-be-approved
+    input: {mode: approve, agent_id: ops, config: *config, slug: retry-timeout-is-per-attempt}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: [{key: "proposal:retry-timeout-is-per-attempt"}]}
+      - {step_name: read-proposal, _: {key: "proposal:retry-timeout-is-per-attempt", slug: retry-timeout-is-per-attempt, status: proposed, expires_at: "2026-01-01T00:00:00+00:00"}}
+      - {step_name: save-agent-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' and 'expired' in error['message'] }}"
+
+  - id: an-unknown-proposal-is-not-found
+    input: {mode: reject, agent_id: ops, config: *config, slug: nope}
+    mocks:
+      - {step_name: identify-caller, _: *admin}
+      - {step_name: list-proposal-keys, _: []}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"

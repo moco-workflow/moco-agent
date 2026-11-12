@@ -1,0 +1,259 @@
+test_type: integration-test
+
+# agent-registry (plan-03 steps 1-5). The package catalogs (`catalog-agent`,
+# `catalog-harness` for the harness version, `catalog-library` for the profiles,
+# prompts and qsets), the definition (`load-definition`) and profile loads
+# (`load-profile`) are mocked by task name; prompt-render runs for real (it is
+# pure), so resolved_refs is the real resolution over the mocked catalogs.
+
+wfspec:
+  name: agent-registry
+
+test_data:
+  cat_harness: &cat_harness
+    package: agent-harness
+    version: "0.3.0"
+    wfspecs: [agent-harness, agent-cli, agent-admin]
+  cat_library: &cat_library
+    package: agent-harness-prompts
+    version: "0.4.0"
+    wfspecs: [agent-harness-prompts, prompt.decide.fallback, prompt.episode.digest, prompt.loop, prompt.rag.answer,
+              prompt.rewrite, prompt.session.title, prompt.summarize, prompt.system.base, qset.route,
+              qset.guard.content, qset.guard.input, qset.guard.output, qset.guard.tool, qset.tools,
+              qset.memory.gate, qset.memory.match, qset.memory.command, prompt.memory.extract, prompt.memory.merge,
+              profile.chat, profile.memory, profile.rag, profile.react]
+  cat_agent: &cat_agent
+    package: agent-moco
+    version: "1.2.0"
+    wfspecs: [agent-moco, agent.moco, prompt.persona.moco, prompt.moco.rag.answer]
+  cat_agent_local_chat: &cat_agent_local_chat
+    package: agent-moco
+    version: "1.2.0"
+    wfspecs: [agent-moco, agent.moco, prompt.persona.moco, profile.moco.chat]
+  chat: &chat
+    profile:
+      name: chat
+      kind: loop
+      mode: sync
+      route_description: "chit-chat"
+      requires: {}
+      budget_sec: 40
+      estimated_sec: 10
+      loop: {model_role: inference, prompt: loop, retrieval: {when: none}, tools: null, max_steps: 1, grounding: none}
+  definition: &definition
+    definition:
+      agent_id: moco
+      display_name: Moco
+      harness: ">=0.3 <1.0"
+      persona_prompt: persona.moco
+      profiles: [chat]
+      router: {default_profile: chat, classifier: false}
+      profile_overrides: {chat: {budget_sec: 30, loop: {max_steps: 1}}}
+
+test_cases:
+
+  - id: load-resolves-profiles-and-prompts-agent-local-first
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - {step_name: load-definition, _: *definition}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      output:
+        - ok: true
+        - error: null
+      assert:
+        - "{{ data['profile_refs'] == {'chat': 'agent-harness-prompts/profile.chat'} }}"
+        # Overrides merge field by field: budget replaced, loop.prompt inherited.
+        - "{{ data['profiles']['chat']['budget_sec'] == 30 and data['profiles']['chat']['loop']['prompt'] == 'loop' }}"
+        - "{{ data['resolved_refs']['persona.moco'] == {'wfspec': 'agent-moco/prompt.persona.moco', 'version': '1.2.0', 'owner': 'moco'} }}"
+        - "{{ data['resolved_refs']['rag.answer'] == {'wfspec': 'agent-moco/prompt.moco.rag.answer', 'version': '1.2.0', 'owner': 'moco'} }}"
+        - "{{ data['resolved_refs']['route'] == {'wfspec': 'agent-harness-prompts/qset.route', 'version': '0.4.0', 'owner': 'harness'} }}"
+        - "{{ sorted(data['resolved_refs']) == ['decide.fallback', 'episode.digest', 'guard.content', 'guard.input', 'guard.output', 'guard.tool', 'loop', 'memory.command', 'memory.extract', 'memory.gate', 'memory.match', 'memory.merge', 'persona.moco', 'rag.answer', 'rewrite', 'route', 'session.title', 'summarize', 'system.base', 'tools'] }}"
+        - "{{ data['versions'] == {'agent': '1.2.0', 'harness': '0.3.0'} }}"
+
+  - id: an-agent-local-profile-wins-over-the-library
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent_local_chat}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - {step_name: load-definition, _: *definition}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      assert:
+        - "{{ data['profile_refs'] == {'chat': 'agent-moco/profile.moco.chat'} }}"
+
+  - id: a-version-pin-goes-into-the-ref
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _:
+          definition:
+            agent_id: moco
+            harness: ">=0.3"
+            profiles: [chat]
+            prompts: {overrides: {route: {version: "0.2.1"}}}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      assert:
+        - "{{ data['resolved_refs']['route'] == {'wfspec': 'agent-harness-prompts/0.2.1/qset.route', 'version': '0.2.1', 'owner': 'harness'} }}"
+
+  # ── Loud failures (§5.2) ─────────────────────────────────────────────────
+  - id: an-undeployed-agent-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: {package: agent-moco, version: null, wfspecs: []}}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent 'moco' is not deployed for this user (no agent.moco in package agent-moco)"
+
+  - id: an-invalid-definition-raises-with-paths
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: "latest", profiles: [chat], router: {default_profile: rag}}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco is invalid: $.harness must be a semver range like \">=0.2 <1.0\"; $.router.default_profile not one of the profiles: rag"
+
+  - id: an-incompatible-harness-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: ">=1.0 <2.0", profiles: [chat]}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco needs harness >=1.0 <2.0, deployed is 0.3.0"
+
+  - id: a-missing-profile-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: ">=0.3", profiles: [chat, claude]}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco enables profile(s) that are not deployed: claude"
+
+  - id: a-typo-in-the-persona-prompt-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: ">=0.3", persona_prompt: persona.mcoo, profiles: [chat]}}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco uses prompt(s) that are not deployed: persona.mcoo"
+
+  - id: an-invalid-profile-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: ">=0.3", profiles: [chat], profile_overrides: {chat: {loop: {max_steps: 4}}}}}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco has invalid profile(s): $.profiles.chat.loop.max_steps more than one step needs tools"
+
+  - id: a-missing-hook-raises
+    input: {mode: load, agent_id: moco}
+    mocks:
+      - {step_name: catalog-agent, _: *cat_agent}
+      - {step_name: catalog-harness, _: *cat_harness}
+      - {step_name: catalog-library, _: *cat_library}
+      - step_name: load-definition
+        _: {definition: {agent_id: moco, harness: ">=0.3", profiles: [chat], hooks: [{event: answer.ready, wfspec: hook.moco.link-check}]}}
+      - {step_name: load-profile, _: *chat}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-registry: agent.moco references wfspec(s) that are not deployed: hooks: hook.moco.link-check"
+
+  - id: a-bad-agent-id-is-invalid-input
+    input: {mode: load, agent_id: "../etc"}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  # ── validate (pure) ──────────────────────────────────────────────────────
+  - id: validate-accepts-the-skeleton-shape
+    input:
+      mode: validate
+      definition:
+        agent_id: skeleton
+        harness: ">=0.1 <2.0"
+        persona_text: "You are concise."
+        router: {default_profile: chat, classifier: false}
+        profiles: [chat]
+        limits: {turn_budget_sec: 110}
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: validate-reports-every-error-with-its-path
+    input:
+      mode: validate
+      definition:
+        agent_id: Bad_Id
+        profiles: [chat, chat]
+        router: {slash: {/rag: rag}, custom: my-router}
+        hooks: [{event: route.changed, wfspec: hook.x}]
+        profile_overrides: {rag: {}}
+        access: {admin_user_ids: root}
+    expect:
+      assert:
+        - "{{ data['valid'] == False }}"
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.access.admin_user_ids', '$.agent_id', '$.harness', '$.hooks[0]', '$.profile_overrides.rag', '$.profiles', '$.router.custom', '$.router.slash./rag'] }}"
+
+  # F48: namespace_admins is a bool; the computed keys never come from a definition.
+  - id: validate-checks-the-namespace-admin-keys
+    input:
+      mode: validate
+      definition:
+        agent_id: skeleton
+        harness: ">=0.1"
+        profiles: [chat]
+        access: {namespace_admins: "no", caller_is_namespace_admin: true, namespace_id: [x], admin_user_ids: []}
+    expect:
+      assert:
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.access.caller_is_namespace_admin', '$.access.namespace_admins', '$.access.namespace_id'] }}"
+        - "{{ [e['message'] for e in data['errors'] if e['path'] == '$.access.namespace_admins'] == ['must be true or false'] }}"
+
+  - id: a-definition-may-opt-out-of-namespace-admins
+    input:
+      mode: validate
+      definition: {agent_id: skeleton, harness: ">=0.1", profiles: [chat], access: {namespace_admins: false}}
+    expect:
+      output:
+        - data: {valid: true, errors: []}

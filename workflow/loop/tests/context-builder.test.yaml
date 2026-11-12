@@ -1,0 +1,177 @@
+test_type: integration-test
+
+# context-builder (plan-08 steps 1-3, 5-6; design §6.6). The two prompt renders
+# (`render-persona`, `render-system`) are mocked by task name.
+
+wfspec:
+  name: context-builder
+
+test_data:
+  config: &config
+    persona_prompt: persona.moco
+    persona_text: "Be brief."
+    display_name: Moco
+    context:
+      max_context_tokens: 12000
+      providers: [system, pending, jobs, profile_memory, question, recent, recalled_memory, episodes, summary]
+      recent_item_chars: 1500
+  conversation: &conversation
+    summary: "Earlier the user set up retries."
+    recent:
+      - {role: user, content: "how do retries work?"}
+      - {role: assistant, content: "Per activity, with a retry_policy."}
+      - {role: user, content: "and backoff?"}
+      - {role: assistant, content: "It doubles by default."}
+  memory: &memory
+    profile: [{key: "mem:profile:cluster", title: cluster, text: "uses GKE"}]
+    recalled: [{key: "mem:fact:helm", title: helm, text: "deploys with helm"}, {key: "mem:lesson:yaml", title: yaml, text: "prefers YAML examples"}]
+  persona: &persona {ok: true, data: {kind: chat, messages: [{role: system, content: "You are an expert on moco."}]}}
+  system: &system {ok: true, data: {kind: chat, messages: [{role: system, content: "RULES + PERSONA"}]}}
+  question: &question {original: "and the timeout?", rewritten: "what is the default activity timeout?"}
+
+test_cases:
+
+  - id: conversation-gives-the-last-four-exchanges-clamped
+    input:
+      mode: conversation
+      conversation:
+        recent: [{role: user, content: "m0"}, {role: assistant, content: "a0"}, {role: user, content: "m1"}, {role: assistant, content: "a1"}, {role: user, content: "m2"}, {role: assistant, content: "a2"}, {role: user, content: "m3"}, {role: assistant, content: "a3"}, {role: user, content: "m4"}, {role: assistant, content: "Long answer xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}]
+    expect:
+      assert:
+        - "{{ len(data['router_view']) == 8 and data['router_view'][0]['content'] == 'm1' }}"
+        - "{{ len(data['router_view'][-1]['content']) == 300 }}"
+
+  - id: assemble-builds-the-blocks-in-provider-order
+    input: {mode: assemble, config: *config, conversation: *conversation, memory_recall: *memory, question: *question}
+    mocks:
+      - {step_name: render-persona, _: *persona}
+      - {step_name: render-system, _: *system}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'profile_memory', 'question', 'recent', 'recalled_memory', 'summary'] }}"
+        - "{{ data['context_bundle']['blocks'][0]['content'] == 'RULES + PERSONA' }}"
+        - "{{ data['context_bundle']['blocks'][2]['items'] == [{'original': 'and the timeout?', 'rewritten': 'what is the default activity timeout?'}] }}"
+        # recent is newest first.
+        - "{{ data['context_bundle']['blocks'][3]['items'][0]['content'] == 'It doubles by default.' }}"
+        - "{{ data['context_bundle']['used_memory'] == ['mem:profile:cluster', 'mem:fact:helm', 'mem:lesson:yaml'] }}"
+        - "{{ data['context_bundle']['budget']['dropped'] == {} and data['context_bundle']['budget']['overflow'] == False }}"
+        - "{{ data['context_bundle']['question'] == {'original': 'and the timeout?', 'rewritten': 'what is the default activity timeout?'} }}"
+
+  - id: a-tight-budget-keeps-the-newest-exchanges-and-drops-the-rest
+    input:
+      mode: assemble
+      config:
+        persona_prompt: null
+        context: {max_context_tokens: 25, providers: [system, question, recent, summary], recent_item_chars: 1500}
+      conversation: *conversation
+      question: {original: "q", rewritten: ""}
+    mocks:
+      - {step_name: render-system, _: {ok: true, data: {messages: [{role: system, content: "SYS"}]}}}
+    expect:
+      assert:
+        # SYS (1) + question (1) = 2 required, 23 left; recent costs 6, 4, 9, 6 newest first ⇒ 3 fit (19).
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'question', 'recent'] }}"
+        - "{{ [i['content'] for i in data['context_bundle']['blocks'][2]['items']] == ['It doubles by default.', 'and backoff?', 'Per activity, with a retry_policy.'] }}"
+        - "{{ data['context_bundle']['budget']['dropped'] == {'recent': 1, 'summary': 1} }}"
+
+  - id: required-blocks-that-overflow-drop-everything-else
+    input:
+      mode: assemble
+      config: {context: {max_context_tokens: 3, providers: [system, question, recent], recent_item_chars: 1500}}
+      conversation: *conversation
+      question: {original: "a long question that costs more than three tokens", rewritten: ""}
+    mocks:
+      - {step_name: render-system, _: {ok: true, data: {messages: [{role: system, content: "SYSTEM RULES"}]}}}
+    expect:
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'question'] }}"
+        - "{{ data['context_bundle']['budget']['overflow'] == True and data['context_bundle']['budget']['dropped'] == {'recent': 4} }}"
+
+  - id: provider-order-is-priority
+    input:
+      mode: assemble
+      config:
+        context: {max_context_tokens: 12, providers: [system, question, summary, recent], recent_item_chars: 1500}
+      conversation: *conversation
+      question: {original: "q", rewritten: ""}
+    mocks:
+      - {step_name: render-system, _: {ok: true, data: {messages: [{role: system, content: "S"}]}}}
+    expect:
+      assert:
+        # summary (9) comes before recent now, so it goes in and recent gets what is left.
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'question', 'summary'] }}"
+
+  - id: providers-without-data-yield-no-block
+    input: {mode: assemble, config: *config, question: *question}
+    mocks:
+      - {step_name: render-persona, _: *persona}
+      - {step_name: render-system, _: *system}
+    expect:
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'question'] }}"
+        - "{{ data['context_bundle']['used_memory'] == [] and data['context_bundle']['pending_action'] is None }}"
+
+  - id: a-pending-action-is-a-required-block
+    input: {mode: assemble, config: *config, question: *question, pending_action: {id: pa-1, kind: tool_call, summary: "restart pod web-1"}}
+    mocks:
+      - {step_name: render-persona, _: *persona}
+      - {step_name: render-system, _: *system}
+    expect:
+      assert:
+        - "{{ data['context_bundle']['blocks'][1] == {'id': 'pending', 'title': 'Pending action', 'content': 'restart pod web-1'} }}"
+        - "{{ data['context_bundle']['pending_action']['id'] == 'pa-1' }}"
+
+  - id: a-provider-the-definition-does-not-list-yields-no-block
+    input:
+      mode: assemble
+      config: {context: {max_context_tokens: 12000, providers: [question, recent], recent_item_chars: 1500}}
+      conversation: *conversation
+      memory_recall: *memory
+      question: *question
+    mocks:
+      - {step_name: render-system, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['question', 'recent'] }}"
+
+  - id: an-unresolved-config-raises
+    input: {mode: assemble, config: {}, question: *question}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  # ── custom providers (phase 2, §6.6.2) ──────────────────────────────────
+  - id: a-custom-provider-block-takes-its-place-in-priority-order
+    input:
+      mode: assemble
+      agent_id: moco
+      session_id: s1
+      question: *question
+      config:
+        persona_prompt: persona.moco
+        context: {max_context_tokens: 12000, providers: [system, question, context.open-tickets, recent], recent_item_chars: 1500}
+      conversation: *conversation
+    mocks:
+      - {step_name: render-persona, _: *persona}
+      - {step_name: render-system, _: *system}
+      - {step_name: run-custom-provider, _: {block: {title: "Open tickets", items: [{text: "MOCO-1 retries flaky"}], droppable_unit: item}}}
+    expect:
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['system', 'question', 'context.open-tickets', 'recent'] }}"
+        - "{{ data['context_bundle']['blocks'][2]['title'] == 'Open tickets' and data['context_bundle']['blocks'][2]['items'] == [{'text': 'MOCO-1 retries flaky'}] }}"
+
+  - id: a-failing-custom-provider-is-skipped
+    input:
+      mode: assemble
+      agent_id: moco
+      question: *question
+      config:
+        context: {max_context_tokens: 12000, providers: [question, context.broken], recent_item_chars: 1500}
+    mocks:
+      - {step_name: run-custom-provider, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ [b['id'] for b in data['context_bundle']['blocks']] == ['question'] }}"

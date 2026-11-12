@@ -1,0 +1,173 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KNOWLEDGE-REFRESH — re-index the shared sources whose refresh is due (§6.16)
+# ================================================================================
+#
+#   in               out
+#   ──────────────── ─────────────────────────────────────────────────────────────
+#   max_sources?     {ok, data: {due: [name], started: [{name, agent_id, table_name}],
+#                     skipped: [{name, reason}], errors: [{name, error}]}, error}
+#
+# Started hourly by its schedule (agent-harness.knowledge_refresh, installed by
+# agent-schedules), or by an admin. Idempotent: a source being refreshed is not due.
+#
+# DUE: a SHARED pgvector source that is `ready`, has refresh.sources and
+# refresh.every_hours ≥ 1, is not refreshing (one older than knowledge's
+# refresh_stale_sec counts as dead), and whose last attempt -- the later of indexed_at
+# and refresh_failed_at -- is at least every_hours old. A failed refresh therefore
+# waits a full interval before the next try. Oldest first, at most max_sources per run:
+# each refresh is a detached indexer that may run for minutes.
+#
+# AUTHORITY: a shared write needs an admin of an agent (access, §6.13), and a shared
+# source belongs to no agent. So each due source is refreshed through the first agent
+# (by id) whose resolved config.knowledge.sources lists it, with that config -- the
+# schedule's creator, the deploying admin, is that agent's admin through
+# admin_user_ids or as a namespace admin (F48). A source no agent lists is skipped
+# (`unused`): nothing reads it. Agent configs are resolved only when something is due,
+# sequentially (F52).
+#
+# PRIVATE sources are not refreshed here: a user's `<uid>:agent-harness` namespace
+# cannot be listed by another user (F51). Their owner refreshes them (agent-admin
+# refresh_source).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: knowledge-refresh
+
+context:
+  refresh_stale_sec: 7200
+  rows: []
+  due_rows: []
+  agent_ids: []
+  agent_configs: {}
+  plan: []
+  started: []
+  skipped: []
+  errors: []
+  ok: true
+  error:
+
+input:
+  max_sources: 3
+
+output:
+  ok: "{{ ok }}"
+  data:
+    due: "{{ [r['name'] for r in due_rows] }}"
+    started: "{{ started }}"
+    skipped: "{{ skipped }}"
+    errors: "{{ errors }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: list-shared-sources
+      workflow:
+        ref: source-registry
+        mode: inline
+        input: {mode: list, scope: shared, status: ready}
+      output:
+        set:
+          - rows: "{{ (((_ or {}).get('data') or {}).get('sources')) or [] }}"
+          - ok: "{{ bool((_ or {}).get('ok')) }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: pick-due
+      set:
+        - _now: "{{ now().replace(tzinfo=None) }}"
+        - _cands: >-
+            {{ [r for r in rows
+                if r.get('kind', 'pgvector') == 'pgvector' and r.get('status') == 'ready'
+                and isinstance((r.get('refresh') or {}).get('every_hours'), int)
+                and not isinstance((r.get('refresh') or {}).get('every_hours'), bool)
+                and (r.get('refresh') or {}).get('every_hours') >= 1
+                and ((r.get('refresh') or {}).get('sources') or [])
+                and not ((r.get('refreshing') or {}).get('started_at')
+                         and (_now - dt.datetime.fromisoformat(str(r['refreshing']['started_at'])).replace(tzinfo=None)).total_seconds() < refresh_stale_sec)] }}
+        - _last: >-
+            {{ [max([dt.datetime.fromisoformat(str(t)).replace(tzinfo=None) for t in [r.get('indexed_at'), r.get('refresh_failed_at')] if t]
+                    or [None]) if any([r.get('indexed_at'), r.get('refresh_failed_at')]) else None
+                for r in _cands] }}
+        - due_rows#: >-
+            {{ [r for r, last in sorted([(r, l) for r, l in zip(_cands, _last)
+                                         if l is None or (_now - l).total_seconds() >= r['refresh']['every_hours'] * 3600],
+                                        key=lambda x: (x[1].isoformat() if x[1] else '', str(x[0].get('name'))))][:max(0, int(max_sources or 0))] }}
+
+    - task_name: list-agents
+      skip_if: "{{ not due_rows }}"
+      workflow:
+        ref: agent-harness-foundation/agent-registry
+        mode: inline
+        input: {mode: list}
+      output:
+        set:
+          - agent_ids: "{{ sorted(str(a.get('agent_id')) for a in ((((_ or {}).get('data') or {}).get('agents')) or []) if a.get('agent_id')) }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - agent_ids: []
+            - errors: "{{ [{'name': '*', 'error': {'code': 'agent_list_failed', 'message': str(_.get('error_message'))[:300]}}] }}"
+
+    - task_name: resolve-agent-configs
+      skip_if: "{{ not due_rows or not agent_ids }}"
+      loop:
+        in: "{{ agent_ids }}"
+        foreach: refresh_aid
+        # Sequential (F52): parallel iterations whose inline child starts the same
+        # sync grandchild (agent-registry's package-catalog) collide on its workflow id.
+        execute_mode: sequential
+        do:
+          task_name: resolve-agent-config
+          workflow:
+            ref: agent-harness-foundation/agent-config
+            mode: inline
+            input: {mode: resolve, agent_id: "{{ refresh_aid }}"}
+          on_error:
+            catch: true
+      output:
+        set:
+          - agent_configs: >-
+              {{ {a: ((r or {}).get('data') or {}).get('config')
+                  for a, r in zip(agent_ids, _ or [])
+                  if isinstance(r, dict) and r.get('ok') and ((r.get('data') or {}).get('config'))} }}
+
+    - task_name: plan-refreshes
+      skip_if: "{{ not due_rows }}"
+      set:
+        - plan: >-
+            {{ [{'name': r['name'],
+                 'agent_id': next((a for a in sorted(agent_configs)
+                                   if r['name'] in (((agent_configs[a] or {}).get('knowledge') or {}).get('sources') or [])), None)}
+                for r in due_rows] }}
+        - skipped: "{{ [{'name': p['name'], 'reason': 'unused'} for p in plan if p['agent_id'] is None] }}"
+
+    - task_name: start-refreshes
+      skip_if: "{{ not [p for p in plan if p['agent_id']] }}"
+      loop:
+        in: "{{ [p for p in plan if p['agent_id']] }}"
+        foreach: refresh_item
+        execute_mode: sequential
+        do:
+          task_name: refresh-source
+          workflow:
+            ref: knowledge
+            mode: inline
+            input:
+              mode: refresh
+              agent_id: "{{ refresh_item['agent_id'] }}"
+              config: "{{ agent_configs[refresh_item['agent_id']] }}"
+              name: "{{ refresh_item['name'] }}"
+              scope: shared
+          on_error:
+            catch: true
+      output:
+        set:
+          - _todo: "{{ [p for p in plan if p['agent_id']] }}"
+          - started: >-
+              {{ [{'name': p['name'], 'agent_id': p['agent_id'], 'table_name': ((r or {}).get('data') or {}).get('table_name')}
+                  for p, r in zip(_todo, _ or []) if isinstance(r, dict) and r.get('ok')] }}
+          - errors: >-
+              {{ errors + [{'name': p['name'], 'error': (r or {}).get('error') if isinstance(r, dict) else {'code': 'refresh_failed', 'message': str(r)[:300]}}
+                           for p, r in zip(_todo, _ or []) if not (isinstance(r, dict) and r.get('ok'))] }}

@@ -1,0 +1,23 @@
+test_type: integration-test
+
+wfspec:
+  name: admin.agents
+
+test_cases:
+  - id: get-definition-returns-the-definition-not-the-refs
+    input: {op: get_definition, agent_id: skeleton}
+    mocks:
+      - {step_name: call-registry, _: {ok: true, data: {definition: {agent_id: skeleton}, profiles: {chat: {}}, resolved_refs: {x: 1}, versions: {agent: "0.2.2"}}, error: null}}
+    expect:
+      output:
+        - ok: true
+        - data: {definition: {agent_id: skeleton}, profiles: {chat: {}}, versions: {agent: "0.2.2"}}
+
+  - id: a-broken-agent-is-an-answer-not-a-crash
+    input: {op: get_definition, agent_id: nope}
+    mocks:
+      # A mock that fails to evaluate is a real task error: it drives on_error.
+      - {step_name: call-registry, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'load_failed' }}"

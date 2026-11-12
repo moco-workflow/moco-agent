@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M2 — overhead of a `sync` child workflow vs inline work (plan-00a step 8)
+# ================================================================================
+#
+# Decides: how many wfspec calls a turn can afford, and whether the plans' module
+# boundaries (one wfspec per module call) survive or must become inline
+# expressions / merged wfspecs before phase 1 (plan-00a §8, the main reason to
+# measure first). Also confirms built-in context providers stay inline (S8).
+#
+# `iterations` calls of `measure-noop` (one `set`, no activity) per variant:
+#   transform   the same work as a `set` task in this workflow (the variant keeps
+#               its DSL v1 name: scripts/measure.sh and the recorded numbers use it)
+#   inline      workflow mode: inline  (fresh context, same workflow)
+#   sync        workflow mode: sync    (a Temporal child workflow)
+#
+# CAUTION reading the numbers. Workflow time (now()) only advances at workflow-task
+# boundaries, so `transform` and `inline` report ~0 workflow ms however much CPU
+# they burn; `sync` reports the real child round trip. Their true cost is
+# wall-clock: run each variant on its own and time the whole call --
+# scripts/measure.sh does exactly that. Must run on Temporal (a dev stage): with
+# --in-memory `sync` degrades to inline and measures nothing.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m2-child-overhead
+
+context:
+  m2_result: {}
+
+input:
+  variants: [transform, inline, sync]
+  iterations: 100
+
+output: '{{ m2_result }}'
+
+main:
+  tasks:
+    - task_name: t-start-transform
+      skip_if: "{{ 'transform' not in variants }}"
+      set:
+        - t_transform: "{{ now() }}"
+    - task_name: run-transform
+      skip_if: "{{ 'transform' not in variants }}"
+      loop:
+        in: "{{ list(range(int(iterations))) }}"
+        foreach: item
+        do:
+          task_name: inline-work
+          set:
+            - y: "{{ item + 1 }}"
+    - task_name: t-end-transform
+      set:
+        - ms_transform: "{{ int((now() - t_transform).total_seconds() * 1000) if 'transform' in variants else None }}"
+
+    - task_name: t-start-inline
+      set:
+        - t_inline: "{{ now() }}"
+    - task_name: run-inline
+      skip_if: "{{ 'inline' not in variants }}"
+      loop:
+        in: "{{ list(range(int(iterations))) }}"
+        foreach: item
+        do:
+          task_name: inline-child
+          workflow:
+            ref: measure-noop
+            mode: inline
+            input:
+              x: "{{ item }}"
+    - task_name: t-end-inline
+      set:
+        - ms_inline: "{{ int((now() - t_inline).total_seconds() * 1000) if 'inline' in variants else None }}"
+
+    - task_name: t-start-sync
+      set:
+        - t_sync: "{{ now() }}"
+    - task_name: run-sync
+      skip_if: "{{ 'sync' not in variants }}"
+      loop:
+        in: "{{ list(range(int(iterations))) }}"
+        foreach: item
+        do:
+          task_name: sync-child
+          workflow:
+            ref: measure-noop
+            mode: sync
+            input:
+              x: "{{ item }}"
+    - task_name: t-end-sync
+      set:
+        - ms_sync: "{{ int((now() - t_sync).total_seconds() * 1000) if 'sync' in variants else None }}"
+
+    - task_name: summarise
+      set:
+        - m2_result:
+            measurement: M2
+            iterations: "{{ iterations }}"
+            runtime_tier: "{{ __sys_info__.get('tier') }}"
+            workflow_ms: {transform: "{{ ms_transform }}", inline: "{{ ms_inline }}", sync: "{{ ms_sync }}"}
+            per_call_workflow_ms:
+              transform: "{{ round(ms_transform / iterations, 2) if ms_transform is not None else None }}"
+              inline: "{{ round(ms_inline / iterations, 2) if ms_inline is not None else None }}"
+              sync: "{{ round(ms_sync / iterations, 2) if ms_sync is not None else None }}"
+            note: "transform/inline cost is wall-clock only; see scripts/measure.sh"

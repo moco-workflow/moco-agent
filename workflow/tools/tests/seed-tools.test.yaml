@@ -1,0 +1,134 @@
+test_type: integration-test
+
+# seed-tools (plan-17, design §6.16, §16): an agent package's tool data installed at
+# agent scope -- saved and validated, unchanged tools left alone (a redeploy bumps no
+# version), validation failures reported, no data → nothing to do.
+
+wfspec:
+  name: seed-tools
+
+test_data:
+  cfg: &cfg {ok: true, data: {config: {access: {admin_user_ids: [u1]}}, profiles: {}, config_version: v}}
+  catalog: &catalog {package: agent-ops, version: "1.0.0", wfspecs: [agent.ops, tools.ops]}
+  seed: &seed
+    toolsets: [{name: k8s-readonly, tools: [k8s_list_pods]}]
+    tools: [{name: k8s_list_pods, description: "List pods", policy: {side_effects: read}, binding: {activity: {type: k8s.list, input_template: {kind: Pod}}}}]
+
+test_cases:
+  - id: a-new-tool-is-saved-validated-and-enabled
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: save-toolset, _: {ok: true, data: {toolset: {name: k8s-readonly}}}}
+      - {step_name: read-stored-tool, _: {ok: false, error: {code: not_found}}}
+      - {step_name: save-tool, _: {ok: true, data: {tool: {status: draft}}}}
+      - {step_name: validate-tool, _: {ok: true, data: {tool: {status: enabled}}}}
+    expect:
+      output:
+        - ok: true
+        - data:
+            source: agent-ops/tools.ops
+            toolsets: [{name: k8s-readonly, ok: true, error: null}]
+            tools: [{name: k8s_list_pods, action: enabled, status: enabled, error: null}]
+
+  - id: an-unchanged-enabled-tool-is-left-alone
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: save-toolset, _: {ok: true, data: {}}}
+      - step_name: read-stored-tool
+        _: {ok: true, data: {tool: {name: k8s_list_pods, version: 4, status: enabled, description: "List pods",
+                                    policy: {side_effects: read, permission: auto, idempotent: true},
+                                    binding: {activity: {type: k8s.list, input_template: {kind: Pod}}}}}}
+      - {step_name: save-tool, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['tools'] == [{'name': 'k8s_list_pods', 'action': 'unchanged', 'status': 'enabled', 'error': None}] }}"
+
+  - id: a-changed-tool-is-saved-again
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: save-toolset, _: {ok: true, data: {}}}
+      - step_name: read-stored-tool
+        _: {ok: true, data: {tool: {name: k8s_list_pods, status: enabled, description: "List the pods (old)", policy: {side_effects: read}, binding: {activity: {type: k8s.list, input_template: {kind: Pod}}}}}}
+      - {step_name: save-tool, _: {ok: true, data: {tool: {status: draft}}}}
+      - {step_name: validate-tool, _: {ok: true, data: {tool: {status: enabled}}}}
+    expect:
+      assert:
+        - "{{ data['tools'][0]['action'] == 'enabled' }}"
+
+  - id: a-tool-that-fails-validation-is-reported-and-stays-a-draft
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: save-toolset, _: {ok: true, data: {}}}
+      - {step_name: read-stored-tool, _: {ok: false}}
+      - {step_name: save-tool, _: {ok: true, data: {tool: {status: draft}}}}
+      - {step_name: validate-tool, _: {ok: false, error: {code: invalid_input, message: "tool k8s_list_pods fails validation: service secret global/K8S_TOKEN does not exist"}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'seed_failed' }}"
+        - "{{ data['tools'][0]['action'] == 'failed' and data['tools'][0]['status'] == 'draft' and 'K8S_TOKEN' in data['tools'][0]['error']['message'] }}"
+
+  - id: an-agent-without-tool-data-has-nothing-to-seed
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: {package: agent-ops, version: "1.0.0", wfspecs: [agent.ops]}}
+      - {step_name: load-seed, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {source: null, toolsets: [], tools: []}
+
+  - id: an-unresolvable-agent-is-an-error
+    input: {agent_id: ops, install_schedules: false}
+    mocks:
+      - {step_name: resolve-config, _: {ok: false, error: {code: not_found, message: "no agent"}}}
+      - {step_name: catalog-agent, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'config_failed' }}"
+
+  - id: the-harness-schedules-are-installed-and-reported
+    input: {agent_id: ops}
+    mocks:
+      - {step_name: resolve-config, _: *cfg}
+      - {step_name: catalog-agent, _: *catalog}
+      - {step_name: load-seed, _: *seed}
+      - {step_name: save-toolset, _: {ok: true, data: {toolset: {name: k8s-readonly}}}}
+      - {step_name: read-stored-tool, _: {ok: false, error: {code: not_found}}}
+      - {step_name: save-tool, _: {ok: true, data: {tool: {status: draft}}}}
+      - {step_name: validate-tool, _: {ok: true, data: {tool: {status: enabled}}}}
+      - step_name: install-schedules
+        _:
+          ok: false
+          error: {code: install_failed, message: "jobs not installed: keep_warm", retryable: true}
+          data:
+            namespace: team
+            jobs:
+              - {job: janitor, schedule_id: team/agent-harness.janitor, action: created, error: null}
+              - {job: keep_warm, schedule_id: team/agent-harness.keep_warm, action: failed, error: denied}
+    expect:
+      output:
+        # A failed schedule install is reported, but does not fail the tool seeding.
+        - ok: true
+        - data:
+            source: agent-ops/tools.ops
+            toolsets: [{name: k8s-readonly, ok: true, error: null}]
+            tools: [{name: k8s_list_pods, action: enabled, status: enabled, error: null}]
+            schedules:
+              ok: false
+              error: {code: install_failed, message: "jobs not installed: keep_warm", retryable: true}
+              jobs:
+                - {job: janitor, schedule_id: team/agent-harness.janitor, action: created, error: null}
+                - {job: keep_warm, schedule_id: team/agent-harness.keep_warm, action: failed, error: denied}

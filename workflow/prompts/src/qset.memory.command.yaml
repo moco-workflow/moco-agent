@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.MEMORY.COMMAND — remember, forget, list, or none? (design §6.4.7)
+# ================================================================================
+#
+#   variables  out
+#   ────────── ─────────────────────────────────────────────
+#   message    {kind: system_one, state, questions, keymap}
+#
+# The `memory` profile's one decision: what the user asks of the memory. One state
+# (the message), one choice. Sorted (§6.3.2).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.memory.command
+
+context:
+  message_chars: 1500
+
+input:
+  message: ""
+
+output:
+  kind: system_one
+  state: "{{ 'Message: ' + str(message or '').strip()[:message_chars] }}"
+  questions:
+    command:
+      criteria:
+        forget: "The user asks to forget or delete something remembered about them."
+        list: "The user asks what is remembered about them."
+        none: "Anything else: no request about the assistant's memory."
+        remember: "The user asks the assistant to remember something for later."
+      instructions: "What does the user ask the assistant to do with its memory?"
+      type: choice
+  keymap: {}
+
+main:
+  task_name: build-command-qset
+  set:
+    - _built: true

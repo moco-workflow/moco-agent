@@ -1,0 +1,162 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROMPT-RENDER — run a prompt or question set by its logical name (design §6.3.3)
+# ================================================================================
+#
+#   mode    in                              data out
+#   ─────── ─────────────────────────────── ─────────────────────────────────────
+#   render  name, variables, resolved_refs  {kind: chat, messages, response_format,
+#                                            schema, version}
+#                                           | {kind: system_one, state, questions,
+#                                              keymap, version, ...}
+#   list    —                               [{name, kind, owner}]
+#   resolve_names  agent_id, names, overrides,   {resolved_refs, missing}
+#                  catalogs: {agent, harness}
+#
+# NO LOOKUP IN RENDER. Name resolution runs once, in agent-registry load, which
+# fetches the agent's and the harness library's catalogs (package-catalog) and
+# calls `resolve_names`
+# (plan-01 step 2, plan-03). `resolve_names` is pure: for each logical name `n`
+# the first wfspec that exists wins, in this order --
+#   agent package    prompt.<agent_id>.<n>, qset.<agent_id>.<n>   (an override)
+#                    prompt.<n>, qset.<n>                          (the agent's own)
+#   harness library  prompt.<n>, qset.<n>   (package agent-harness-prompts;
+#                                           `catalogs.harness` is its catalog)
+# A pin `overrides[n].version` makes the ref `<package>/<version>/<wfspec>`; the
+# pinned version must be deployed (not checked here). Names found nowhere are
+# returned in `missing`, and agent-registry load raises on them. `render` only reads
+#   resolved_refs[name] = {wfspec: "<package>/<wfspec>", version}
+# and runs that wfspec. A name missing from resolved_refs is a bug in the caller
+# (it skipped load) and raises.
+#
+# INLINE, not sync (§4.3, M2): a prompt needs no timeout or failure isolation of its
+# own, and inline costs ~3 ms where sync costs ~0.2 s. The ref is dynamic, so it
+# resolves only against deployed packages (P7): tests mock `render-prompt`.
+#
+# PHASE 1 (plan-01 steps 1, 2, 6).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: prompt-render
+
+context:
+  valid_modes: ["render", "list", "resolve_names"]
+  # The harness catalog (§6.3.3). `list` reports it; scripts/check-prompt-catalog.sh
+  # checks it against the prompt and qset files in workflow/prompts/src.
+  catalog:
+    - {name: decide.fallback, kind: chat, owner: harness}
+    - {name: episode.digest, kind: chat, owner: harness}
+    - {name: guard.content, kind: system_one, owner: harness}
+    - {name: guard.input, kind: system_one, owner: harness}
+    - {name: guard.output, kind: system_one, owner: harness}
+    - {name: guard.tool, kind: system_one, owner: harness}
+    - {name: loop, kind: chat, owner: harness}
+    - {name: memory.command, kind: system_one, owner: harness}
+    - {name: memory.extract, kind: chat, owner: harness}
+    - {name: memory.gate, kind: system_one, owner: harness}
+    - {name: memory.match, kind: system_one, owner: harness}
+    - {name: memory.merge, kind: chat, owner: harness}
+    - {name: rag.answer, kind: chat, owner: harness}
+    - {name: rewrite, kind: chat, owner: harness}
+    - {name: route, kind: system_one, owner: harness}
+    - {name: session.title, kind: chat, owner: harness}
+    - {name: summarize, kind: chat, owner: harness}
+    - {name: system.base, kind: chat, owner: harness}
+    - {name: tools, kind: system_one, owner: harness}
+  ok: false
+  data:
+  error:
+
+input:
+  mode: render
+  agent_id:
+  name:
+  variables: {}
+  resolved_refs: {}
+  # resolve_names
+  names: []
+  overrides: {}
+  catalogs: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "prompt-render: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: mode-list
+      skip_if: "{{ mode != 'list' }}"
+      set:
+        - ok: true
+        - data: "{{ catalog }}"
+
+    - task_name: mode-resolve-names
+      skip_if: "{{ mode != 'resolve_names' }}"
+      set:
+        - _aid: "{{ str(agent_id or '') }}"
+        - _agent: "{{ (catalogs or {}).get('agent') or {} }}"
+        - _harness: "{{ (catalogs or {}).get('harness') or {} }}"
+        - _order: >-
+            {{ [(_agent, 'prompt.' + _aid + '.', _aid), (_agent, 'qset.' + _aid + '.', _aid),
+                (_agent, 'prompt.', _aid), (_agent, 'qset.', _aid),
+                (_harness, 'prompt.', 'harness'), (_harness, 'qset.', 'harness')] }}
+        - _found: >-
+            {{ {n: next(((cat, pre + n, owner) for cat, pre, owner in _order
+                         if cat.get('package') and (pre + n) in (cat.get('wfspecs') or [])), None)
+                for n in sorted(set(str(x) for x in (names or []) if x))} }}
+        - _pins: "{{ {k: (v or {}).get('version') for k, v in (overrides or {}).items() if isinstance(v, dict) and v.get('version')} }}"
+        - ok: true
+        - data:
+            resolved_refs: >-
+              {{ {n: {'wfspec': hit[0]['package'] + '/' + ((_pins[n] + '/') if n in _pins else '') + hit[1],
+                      'version': _pins.get(n) or hit[0].get('version'),
+                      'owner': hit[2]}
+                  for n, hit in _found.items() if hit} }}
+            missing: "{{ [n for n, hit in _found.items() if not hit] }}"
+
+    - task_name: mode-render
+      skip_if: "{{ mode != 'render' }}"
+      tasks:
+        - task_name: find-ref
+          set:
+            - ref#: "{{ (resolved_refs or {}).get(name) if isinstance(resolved_refs, dict) else None }}"
+
+        - task_name: reject-unresolved-name
+          raise:
+            if: "{{ not (isinstance(ref, dict) and ref.get('wfspec')) }}"
+            type: error
+            error_type: AbortError
+            message: "prompt-render: '{{ name }}' is not in resolved_refs (was agent-registry load skipped?)"
+
+        - task_name: render-prompt
+          workflow:
+            ref: "{{ ref['wfspec'] }}"
+            mode: inline
+            input: "{{ variables or {} }}"
+          output:
+            set:
+              - rendered: "{{ _ }}"
+
+        # A prompt that renders something without a kind is a broken prompt, not
+        # an expected failure.
+        - task_name: reject-malformed-prompt
+          raise:
+            if: "{{ not (isinstance(rendered, dict) and rendered.get('kind') in ['chat', 'system_one']) }}"
+            type: error
+            error_type: AbortError
+            message: "prompt-render: '{{ name }}' ({{ ref['wfspec'] }}) returned no chat/system_one kind"
+
+        - task_name: stamp-version
+          set:
+            - ok: true
+            - data: "{{ dict(rendered, version=ref.get('version'), name=name) }}"

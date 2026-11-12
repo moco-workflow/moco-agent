@@ -1,0 +1,243 @@
+test_type: integration-test
+
+# agent-config's model roles (inference, decision, classifier, embedding): what the
+# user tier may set, and how a catalog pick brings its provider (design §6.1.1). Split
+# from agent-config.test.yaml, whose aliases hit the YAML parser's alias limit.
+#
+# agent-config (plan-04 steps 2-7, design §6.1). The registry (`load-registry`), the
+# defaults (`load-defaults`), the two tier rows (`read-agent-tier`, `read-user-tier`),
+# the access check (`authorize-write`) and the writes are mocked by task name, so the
+# merge, allowlist and versioning rules are tested against pinned fixtures.
+
+wfspec:
+  name: agent-config
+
+test_data:
+  registry: &registry
+    ok: true
+    data:
+      definition:
+        agent_id: skeleton
+        harness: ">=0.2"
+        profiles: [chat, rag]
+        router: {default_profile: chat}
+        models: {inference: {model: deepseek-flash}}
+        limits: {retire_after_idle_sec: 3600}
+        access: {admin_user_ids: [root]}
+      profiles:
+        chat: {name: chat, kind: loop, loop: {prompt: loop, tools: null}}
+        rag: {name: rag, kind: loop, loop: {prompt: rag.answer, tools: null}}
+      resolved_refs: {loop: {wfspec: agent-harness-prompts/prompt.loop, version: "0.3.0"}}
+      versions: {harness: "0.3.0", agent: "0.2.0"}
+  defaults: &defaults
+    version: "0.3.0"
+    defaults:
+      models:
+        inference: {provider: deepseek, model: deepseek-v4-pro, max_tokens: 1200, temperature: 0.2}
+        decision: null
+      limits: {turn_budget_sec: 110, max_queued_messages: 1, retire_after_idle_sec: 86400}
+      memory: {short_term: {recent_turns: 6}}
+      access: {denied_user_ids: [], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat]}
+      profiles: [chat]
+    catalog:
+      providers:
+        - id: deepseek
+          kind: inference
+          models:
+            - {id: deepseek-v4-pro, tools: true, json_mode: true}
+            - {id: deepseek-flash, tools: true, json_mode: true}
+            - {id: tiny-chat, tools: false, json_mode: false}
+        - id: openai
+          kind: inference
+          base_urls: ["https://api.openai.com/v1"]
+          apikey_secret_key: OPENAI_KEY
+          models:
+            - {id: gpt-4o, max_tokens: 900, tools: true, json_mode: true}
+        - id: laya-embed
+          kind: classifier
+          base_urls: ["http://mocopi-4:8000", "http://localhost:8001"]
+          apikey_secret_key: LAYA_KEY
+          models:
+            - {id: laya}
+        - id: ollama-embed
+          kind: embedding
+          base_urls: ["http://mocopi-3:11434/v1", "http://localhost:11434/v1"]
+          apikey_secret_key: OLLAMA_KEY
+          models:
+            - {id: nomic-embed-text, embed_dim: 768}
+        - id: openai-embed
+          kind: embedding
+          base_urls: ["https://api.openai.com/v1"]
+          apikey_secret_key: OPENAI_KEY
+          models:
+            - {id: text-embedding-3-small, embed_dim: 1536}
+  agent_row: &agent_row
+    schema_version: 1
+    version: 3
+    sections: {limits: {turn_budget_sec: 90}, models: {inference: {temperature: 0.5}}}
+  user_row: &user_row
+    schema_version: 1
+    version: 7
+    sections: {persona_text: "Answer in French.", disabled_profiles: [rag]}
+  resolve_mocks: &resolve_mocks
+    - {step_name: load-registry, _: *registry}
+    - {step_name: load-defaults, _: *defaults}
+    - {step_name: read-agent-tier, _: null}
+    - {step_name: read-user-tier, _: null}
+
+test_cases:
+  - id: a-user-picked-model-from-another-provider-brings-its-endpoint
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: {schema_version: 1, version: 1, sections: {models: {inference: {base_url: "https://api.deepseek.com", apikey_secret_key: DS_KEY}}}}}
+      - {step_name: read-user-tier, _: {schema_version: 1, version: 1, sections: {models: {inference: {model: gpt-4o}, decision: {model: deepseek-v4-pro}}}}}
+    expect:
+      assert:
+        # another provider: its endpoint and key; the agent tier's temperature survives
+        - "{{ data['config']['models']['inference'] == {'provider': 'openai', 'model': 'gpt-4o', 'max_tokens': 1200, 'temperature': 0.2, 'base_url': 'https://api.openai.com/v1', 'apikey_secret_key': 'OPENAI_KEY'} }}"
+        # the decision role was null; a catalog model there gets the catalog endpoint too
+        - "{{ data['config']['models']['decision']['provider'] == 'deepseek' and data['config']['models']['decision']['model'] == 'deepseek-v4-pro' }}"
+        - "{{ data['tiers']['user']['models']['inference'] == {'model': 'gpt-4o'} and 'persona_text' in data['user_settable'] }}"
+
+  - id: a-user-picked-model-from-the-same-provider-keeps-the-agent-endpoint
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: {schema_version: 1, version: 1, sections: {models: {inference: {base_url: "https://gw.internal/ds", apikey_secret_key: DS_KEY}}}}}
+      - {step_name: read-user-tier, _: {schema_version: 1, version: 1, sections: {models: {inference: {model: deepseek-v4-pro}}}}}
+    expect:
+      assert:
+        - "{{ data['config']['models']['inference']['base_url'] == 'https://gw.internal/ds' and data['config']['models']['inference']['apikey_secret_key'] == 'DS_KEY' }}"
+        - "{{ data['config']['models']['inference']['model'] == 'deepseek-v4-pro' }}"
+
+  - id: user-picks-for-classifier-and-embedding-bring-their-catalog-provider
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - step_name: read-user-tier
+        _:
+          schema_version: 1
+          version: 1
+          sections:
+            models:
+              classifier: {model: laya, base_url: "http://localhost:8001"}
+              embedding: {model_name: text-embedding-3-small}
+    expect:
+      assert:
+        # the picked catalog endpoint; the provider's key
+        - "{{ data['config']['models']['classifier'] == {'model': 'laya', 'base_url': 'http://localhost:8001', 'provider': 'laya-embed', 'apikey_secret_key': 'LAYA_KEY'} }}"
+        # no endpoint picked: the provider's first; the model's embed_dim; no max_tokens
+        - "{{ data['config']['models']['embedding'] == {'model_name': 'text-embedding-3-small', 'provider': 'openai-embed', 'base_url': 'https://api.openai.com/v1', 'apikey_secret_key': 'OPENAI_KEY', 'embed_dim': 1536} }}"
+
+  - id: a-user-may-switch-endpoint-within-the-same-provider
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: {schema_version: 1, version: 1, sections: {models: {embedding: {provider: ollama-embed, model_name: nomic-embed-text, embed_dim: 768, base_url: "http://mocopi-3:11434/v1", apikey_secret_key: AGENT_KEY}}}}}
+      - {step_name: read-user-tier, _: {schema_version: 1, version: 1, sections: {models: {embedding: {model_name: nomic-embed-text, base_url: "http://localhost:11434/v1"}}}}}
+    expect:
+      assert:
+        # same provider: the agent's key stays, only the endpoint moves
+        - "{{ data['config']['models']['embedding'] == {'provider': 'ollama-embed', 'model_name': 'nomic-embed-text', 'embed_dim': 768, 'base_url': 'http://localhost:11434/v1', 'apikey_secret_key': 'AGENT_KEY'} }}"
+
+  - id: a-user-secret-name-wins-over-the-catalogs
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: {schema_version: 1, version: 1, sections: {models: {inference: {model: gpt-4o, apikey_secret_key: MY_OWN_KEY, max_tokens: 800}}}}}
+    expect:
+      assert:
+        - "{{ data['config']['models']['inference']['provider'] == 'openai' and data['config']['models']['inference']['apikey_secret_key'] == 'MY_OWN_KEY' }}"
+        - "{{ data['config']['models']['inference']['max_tokens'] == 800 and data['config']['models']['inference']['base_url'] == 'https://api.openai.com/v1' }}"
+
+  - id: a-user-may-pick-catalog-classifier-and-embedding-models-and-endpoints
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial: {models: {classifier: {model: laya, base_url: "http://localhost:8001"}, embedding: {model_name: nomic-embed-text, base_url: "http://localhost:11434/v1"}}}
+    mocks: *resolve_mocks
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: a-user-may-set-a-custom-model-and-endpoint-for-any-role
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial:
+        models:
+          classifier: {provider: mine, model: other, base_url: "http://localhost:9999", apikey_secret_key: MY_KEY}
+          embedding: {model_name: my-embed, base_url: "https://emb.example/v1", embed_dim: 384}
+    mocks: *resolve_mocks
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: user-model-formats-are-checked
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial: {models: {inference: {base_url: "ftp://x"}, embedding: {embed_dim: 0}, classifier: {enabled: false}}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        # enabled is agent-tier only
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.models.classifier.enabled', '$.models.embedding.embed_dim', '$.models.inference.base_url'] }}"
+
+  - id: a-session-still-picks-catalog-models-only
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: session
+      partial: {models: {inference: {model: gpt-unknown}}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ [e['path'] for e in data['errors']] == ['$.models.inference.model'] }}"
+
+  - id: a-custom-endpoint-on-a-catalog-model-stands-as-typed
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: {schema_version: 1, version: 1, sections: {models: {classifier: {provider: mine, model: laya, base_url: "http://my-laya:8000", apikey_secret_key: MY_KEY}}}}}
+    expect:
+      assert:
+        # laya is a catalog model, but the URL is not one of its provider's: no catalog fill
+        - "{{ data['config']['models']['classifier'] == {'provider': 'mine', 'model': 'laya', 'base_url': 'http://my-laya:8000', 'apikey_secret_key': 'MY_KEY'} }}"
+
+  - id: a-user-may-set-secret-name-max-tokens-and-temperature
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial: {models: {inference: {apikey_secret_key: MY_KEY, max_tokens: 800, temperature: 0.3}, embedding: {apikey_secret_key: global/EMBED_KEY}}}
+    mocks: *resolve_mocks
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: user-secret-name-max-tokens-and-temperature-are-checked
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial: {models: {inference: {apikey_secret_key: "bad key!", max_tokens: 0, temperature: 3}, classifier: {max_tokens: 5}}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        # classifier max_tokens is not a user path at all
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.models.classifier.max_tokens', '$.models.inference.apikey_secret_key', '$.models.inference.max_tokens', '$.models.inference.temperature'] }}"
+

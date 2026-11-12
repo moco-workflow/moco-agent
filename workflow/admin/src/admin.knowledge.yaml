@@ -1,0 +1,174 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.KNOWLEDGE — agent-admin's knowledge area (plan-16 step 5)
+# ================================================================================
+#   op               in                                     data out
+#   list_sources     —                                      {sources}: shared + the caller's
+#                                                            private, every status (with the
+#                                                            refresh state: refreshing,
+#                                                            refresh_error, refresh_every_hours)
+#   get_source       name, scope                            {source}
+#   register_source  name, scope, description, keywords,    {source, indexer}
+#                    index_sources, embed_model_info?, every_hours?
+#   reindex_source   name, scope                            {source, indexer}
+#   refresh_source   name, scope                            {source, indexer, table_name}:
+#                                                            re-index while it keeps serving
+#   set_source_refresh name, scope, every_hours             {source} (0 / null: off)
+#   delete_source    name, scope                            {removed}
+#   move_source      —                                      not_available yet
+#   check_sitemap    url                                    {url, is_sitemap, entry_count, reason,
+#                                                            checked: [probe, ...]}
+# Writes go through knowledge (and so source-registry, which checks access: shared
+# sources need an admin). The resolved config gives access lists and the pgvector
+# secret. Old-UI scope names are accepted: global → shared, user → private.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.knowledge
+
+context:
+  valid_ops: ["list_sources", "get_source", "register_source", "reindex_source", "delete_source", "move_source", "check_sitemap",
+              "refresh_source", "set_source_refresh"]
+  manage_ops: {register_source: register, reindex_source: reindex, delete_source: delete, refresh_source: refresh,
+               set_source_refresh: set_refresh}
+  ok: false
+  data:
+  error:
+  cfg: {}
+  probes: []
+
+input:
+  op:
+  agent_id:
+  name:
+  scope: shared
+  description: ""
+  keywords: []
+  index_sources: []
+  embed_model_info:
+  every_hours:
+  url:
+  # register_source, kind wfspec (phase 2): the source.* retriever and its config
+  kind:
+  wfspec_name:
+  source_config: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.knowledge: invalid op '{{ op }}'"
+
+    - task_name: normalise-scope
+      set:
+        - kscope: "{{ {'global': 'shared', 'user': 'private'}.get(scope, scope) }}"
+
+    - task_name: resolve-config
+      skip_if: "{{ op not in manage_ops }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - cfg: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+
+    - task_name: op-list
+      skip_if: "{{ op != 'list_sources' }}"
+      workflow:
+        ref: agent-harness-knowledge/source-registry
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", scope: both}
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: >-
+              {{ {'sources': [dict({k: s.get(k) for k in ['name', 'scope', 'kind', 'status', 'description', 'keywords', 'node_count', 'indexed_at', 'error',
+                                                            'table_name', 'embed_model_info', 'updated_at', 'updated_by',
+                                                            'refreshing', 'refresh_error', 'refresh_failed_at']},
+                                   refresh_every_hours=(s.get('refresh') or {}).get('every_hours'))
+                              for s in (((_ or {}).get('data') or {}).get('sources') or [])]} }}
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: op-get
+      skip_if: "{{ op != 'get_source' }}"
+      workflow:
+        ref: agent-harness-knowledge/source-registry
+        mode: inline
+        input: {mode: get, agent_id: "{{ agent_id }}", name: "{{ name }}", scope: "{{ kscope }}"}
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: op-manage
+      skip_if: "{{ op not in manage_ops }}"
+      workflow:
+        ref: agent-harness-knowledge/knowledge
+        mode: inline
+        input:
+          mode: "{{ manage_ops[op] }}"
+          agent_id: "{{ agent_id }}"
+          config: "{{ cfg }}"
+          name: "{{ name }}"
+          scope: "{{ kscope }}"
+          description: "{{ description }}"
+          keywords: "{{ keywords }}"
+          index_sources: "{{ index_sources }}"
+          embed_model_info: "{{ embed_model_info }}"
+          every_hours: "{{ every_hours }}"
+          kind: "{{ kind or 'pgvector' }}"
+          wfspec_name: "{{ wfspec_name }}"
+          source_config: "{{ source_config or {} }}"
+      output:
+        set:
+          - ok: "{{ (_ or {}).get('ok') }}"
+          - data: "{{ (_ or {}).get('data') }}"
+          - error: "{{ (_ or {}).get('error') }}"
+
+    - task_name: op-move
+      skip_if: "{{ op != 'move_source' }}"
+      set:
+        - error: {code: not_available, message: "move_source is not implemented yet; re-register in the target scope", retryable: false}
+
+    # The URL as given, then <url>/sitemap.xml: the first that really is a sitemap.
+    - task_name: op-check-sitemap
+      skip_if: "{{ op != 'check_sitemap' }}"
+      tasks:
+        - task_name: probe-candidates
+          loop:
+            in: "{{ [str(url or '').strip()] + ([str(url).strip().rstrip('/') + '/sitemap.xml'] if url and not str(url).strip().endswith('.xml') else []) }}"
+            foreach: candidate
+            do:
+              task_name: probe-one
+              workflow:
+                ref: agent-harness-knowledge/sitemap-probe
+                mode: inline
+                input: {url: "{{ candidate }}"}
+              output:
+                data: "{{ dict(_ or {}, url=candidate) }}"
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - _probe_failed: true
+                  output:
+                    data: "{{ {'url': candidate, 'is_sitemap': False, 'error': str(_.get('error_message'))[:300]} }}"
+          output:
+            set:
+              - probes: "{{ list(_ or []) }}"
+        - task_name: shape-sitemap
+          set:
+            - _hit: "{{ next((p for p in probes if p.get('is_sitemap')), None) }}"
+            - ok: true
+            # Every probe goes along as `checked`, so a UI can say what was tried.
+            - data: "{{ dict(_hit or (probes[-1] if probes else {'url': url, 'is_sitemap': False}), checked=probes) }}"

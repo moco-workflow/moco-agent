@@ -1,0 +1,60 @@
+test_type: integration-test
+
+# knowledge-migrate-legacy (plan-06 §5.2, phase 3): old `domain:<name>` rows become
+# harness sources through knowledge register (re-indexed into the harness table name);
+# existing names, bad names and rows without sources are skipped; dry_run writes
+# nothing; old tables are reported, never dropped. State, registry, config and
+# register calls are mocked by task name.
+
+wfspec:
+  name: knowledge-migrate-legacy
+
+test_data:
+  legacy_keys: &legacy_keys [{key: "domain:My-Notes"}, {key: "domain:taken"}, {key: "domain:empty"}, {key: "domain:bad name"}]
+  legacy_row: &legacy_row >-
+    {{ {'domain:My-Notes': {'name': 'My-Notes', 'description': 'mine', 'table_name': 'kb_my_notes', 'sources': [{'kind': 'site', 'url': 'http://x'}], 'embed_model_info': {'model_name': 'm'}},
+        'domain:taken': {'name': 'taken', 'table_name': 'kb_taken', 'sources': [{'kind': 'site'}]},
+        'domain:empty': {'name': 'empty', 'table_name': 'kb_empty', 'sources': []},
+        'domain:bad name': {'name': 'bad name', 'table_name': 'kb_bad_name', 'sources': [{'kind': 'site'}]}}[legacy_key] }}
+
+test_cases:
+  - id: a-dry-run-reports-and-writes-nothing
+    input: {agent_id: moco-assistant, scope: private}
+    mocks:
+      - {step_name: list-legacy-keys, _: *legacy_keys}
+      - {step_name: read-legacy-row, _: *legacy_row}
+      - {step_name: list-sources, _: {ok: true, data: {sources: [{name: taken}]}}}
+      - {step_name: resolve-config, _: "{{ 1 / 0 }}"}
+      - {step_name: register-source, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data:
+            found: [My-Notes, taken, empty, bad name]
+            migrated: [{name: my-notes, would_register: true}]
+            skipped: [{name: taken, reason: exists}, {name: empty, reason: no_sources}, {name: bad name, reason: bad_name}]
+            old_tables: [kb_bad_name, kb_empty, kb_my_notes, kb_taken]
+            dry_run: true
+
+  - id: a-real-run-registers-with-the-stored-sources
+    input: {agent_id: moco-assistant, scope: private, dry_run: false}
+    mocks:
+      - {step_name: list-legacy-keys, _: *legacy_keys}
+      - {step_name: read-legacy-row, _: *legacy_row}
+      - {step_name: list-sources, _: {ok: true, data: {sources: [{name: taken}]}}}
+      - {step_name: resolve-config, _: {ok: true, data: {config: {access: {}}}}}
+      - step_name: register-source
+        _: >-
+          {{ {'ok': True, 'data': {'source': {'table_name': 'kb_u_00000000_my_notes'}, 'indexer': 'wf-1'}}
+             if migrate_item['row']['sources'] == [{'kind': 'site', 'url': 'http://x'}] else {'ok': False, 'error': {'code': 'wrong_input'}} }}
+    expect:
+      assert:
+        - "{{ ok == True and data['migrated'] == [{'name': 'my-notes', 'ok': True, 'source': 'kb_u_00000000_my_notes', 'indexer': 'wf-1', 'error': None}] }}"
+
+  - id: nothing-to-migrate
+    input: {agent_id: moco-assistant, scope: shared}
+    mocks:
+      - {step_name: list-legacy-keys, _: []}
+    expect:
+      output:
+        - data: {found: [], migrated: [], skipped: [], old_tables: [], dry_run: true}

@@ -1,0 +1,86 @@
+test_type: integration-test
+
+# knowledge-refresh (plan-17 step 12, design §6.16): which shared sources are due
+# (ready pgvector, every_hours set, last attempt old enough, not refreshing), oldest
+# first and bounded; each refreshed through the first agent whose config lists it; a
+# source no agent lists is skipped; nothing due resolves no agent. The registry list,
+# the agent list, the config resolves and the refresh calls are mocked by task name.
+
+wfspec:
+  name: knowledge-refresh
+
+test_data:
+  configs: &configs
+    - {ok: true, data: {config: {knowledge: {sources: [k8s-runbooks]}, access: {}}}}
+    - {ok: true, data: {config: {knowledge: {sources: [moco-docs]}, access: {}}}}
+  agents: &agents {ok: true, data: {agents: [{agent_id: ops-assistant}, {agent_id: moco-assistant}]}}
+
+test_cases:
+  - id: due-sources-are-refreshed-through-an-agent-that-lists-them
+    input: {}
+    mocks:
+      - step_name: list-shared-sources
+        _: >-
+          {{ {'ok': True, 'data': {'sources': [
+               {'name': 'moco-docs', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}], 'every_hours': 24},
+                'indexed_at': (now() - dt.timedelta(hours=25)).isoformat()},
+               {'name': 'fresh', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}], 'every_hours': 24},
+                'indexed_at': (now() - dt.timedelta(hours=2)).isoformat()},
+               {'name': 'manual', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}]},
+                'indexed_at': '2026-01-01T00:00:00'},
+               {'name': 'busy', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}], 'every_hours': 1},
+                'indexed_at': '2026-01-01T00:00:00', 'refreshing': {'table_name': 'kbr_busy', 'started_at': (now() - dt.timedelta(minutes=5)).isoformat()}},
+               {'name': 'retried-too-soon', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}], 'every_hours': 24},
+                'indexed_at': '2026-01-01T00:00:00', 'refresh_failed_at': (now() - dt.timedelta(hours=1)).isoformat()},
+               {'name': 'jira', 'status': 'ready', 'kind': 'wfspec', 'refresh': {'sources': [{'kind': 'x'}], 'every_hours': 1}}]}} }}
+      - {step_name: list-agents, _: *agents}
+      - {step_name: resolve-agent-config, _: "{{ [{'ok': True, 'data': {'config': {'knowledge': {'sources': ['moco-docs']}, 'access': {}}}}, {'ok': True, 'data': {'config': {'knowledge': {'sources': ['k8s-runbooks']}, 'access': {}}}}][0 if refresh_aid == 'moco-assistant' else 1] }}"}
+      - {step_name: refresh-source, _: {ok: true, data: {table_name: kbr_moco_docs}}}
+    expect:
+      output:
+        - ok: true
+        - data: {due: [moco-docs], started: [{name: moco-docs, agent_id: moco-assistant, table_name: kbr_moco_docs}], skipped: [], errors: []}
+
+  - id: nothing-due-resolves-no-agent
+    input: {}
+    mocks:
+      - step_name: list-shared-sources
+        _: "{{ {'ok': True, 'data': {'sources': [{'name': 'moco-docs', 'status': 'ready', 'kind': 'pgvector', 'refresh': {'sources': [{'kind': 'site'}], 'every_hours': 24}, 'indexed_at': now().isoformat()}]}} }}"
+      - {step_name: list-agents, _: "{{ 1 / 0 }}"}
+      - {step_name: resolve-agent-config, _: "{{ 1 / 0 }}"}
+      - {step_name: refresh-source, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {due: [], started: [], skipped: [], errors: []}
+
+  - id: oldest-first-and-bounded-and-a-source-nobody-lists-is-skipped
+    input: {max_sources: 2}
+    mocks:
+      - step_name: list-shared-sources
+        _:
+          ok: true
+          data:
+            sources:
+              - {name: c, status: ready, kind: pgvector, refresh: {sources: [{kind: site}], every_hours: 1}, indexed_at: "2026-03-01T00:00:00"}
+              - {name: orphan, status: ready, kind: pgvector, refresh: {sources: [{kind: site}], every_hours: 1}, indexed_at: "2026-01-01T00:00:00"}
+              - {name: moco-docs, status: ready, kind: pgvector, refresh: {sources: [{kind: site}], every_hours: 1}, indexed_at: "2026-02-01T00:00:00"}
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: moco-assistant}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {knowledge: {sources: [moco-docs, c]}, access: {}}}}}
+      - {step_name: refresh-source, _: {ok: true, data: {table_name: kbr_moco_docs}}}
+    expect:
+      output:
+        - data: {due: [orphan, moco-docs], started: [{name: moco-docs, agent_id: moco-assistant, table_name: kbr_moco_docs}], skipped: [{name: orphan, reason: unused}], errors: []}
+
+  - id: a-refused-refresh-is-an-error-entry-not-a-raise
+    input: {}
+    mocks:
+      - step_name: list-shared-sources
+        _: {ok: true, data: {sources: [{name: moco-docs, status: ready, kind: pgvector, refresh: {sources: [{kind: site}], every_hours: 1}}]}}
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: moco-assistant}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {knowledge: {sources: [moco-docs]}, access: {}}}}}
+      - {step_name: refresh-source, _: {ok: false, data: null, error: {code: forbidden, message: "not admin", retryable: false}}}
+    expect:
+      output:
+        - ok: true
+        - data: {due: [moco-docs], started: [], skipped: [], errors: [{name: moco-docs, error: {code: forbidden, message: "not admin", retryable: false}}]}

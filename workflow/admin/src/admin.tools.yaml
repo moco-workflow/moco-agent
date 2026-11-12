@@ -1,0 +1,197 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.TOOLS — agent-admin's tools area (plan-16 phase 2, design §6.15)
+# ================================================================================
+#   op              in                              → owner call
+#   list_tools      scope?, status?, toolset?       tool-registry list (scope both by default)
+#   get_tool        name, scope                     tool-registry get
+#   save_tool       name, scope, manifest           tool-registry save (a new draft version)
+#   validate_tool   name, scope                     tool-registry validate (draft → enabled)
+#   enable_tool / disable_tool / deprecate_tool {by} / delete_tool    tool-registry lifecycle
+#   list_toolsets   scope?                          tool-registry list_toolsets
+#   save_toolset    scope, toolset                  tool-registry save_toolset
+#   dry_run_tool    name, scope, arguments          tool-executor dry_run (no dispatch)
+#   revoke_grant    name, session_id?               tool-policy revoke (the caller's own grants)
+#   set_tool_pref   name, permission                tool-policy set_pref (the caller's own, phase 3)
+#   clear_tool_pref name                            tool-policy clear_pref
+#   list_tool_prefs —                               tool-policy list_prefs
+#   list_providers / get_provider / preview_provider {kind?, endpoint, credential} /
+#   register_provider {kind?, endpoint, credential, import_spec, sync} /
+#   update_provider {kind, endpoint, credential, import_spec, sync} / sync_provider /
+#   accept_provider_drift / reject_provider_drift / disable_provider / enable_provider /
+#   delete_provider
+#                                                   tool-provider (admin, phase 3)
+#   seed_tools      —                               seed-tools (the agent's tools.<id> data)
+#   tool_stats      name?                           tool-stats-rollup stats
+# Writes are authorised by the owners against the agent's resolved access lists
+# (agent-config resolve, here): shared/agent scope needs an admin.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.tools
+
+context:
+  registry_ops:
+    list_tools: list
+    get_tool: get
+    save_tool: save
+    validate_tool: validate
+    enable_tool: enable
+    disable_tool: disable
+    deprecate_tool: deprecate
+    delete_tool: delete
+    list_toolsets: list_toolsets
+    save_toolset: save_toolset
+  other_ops: ["dry_run_tool", "revoke_grant", "seed_tools", "tool_stats", "set_tool_pref", "clear_tool_pref", "list_tool_prefs"]
+  pref_ops: {set_tool_pref: set_pref, clear_tool_pref: clear_pref, list_tool_prefs: list_prefs}
+  provider_ops: {list_providers: list, get_provider: get, preview_provider: preview, register_provider: register,
+                 update_provider: update,
+                 sync_provider: sync, accept_provider_drift: accept_drift, reject_provider_drift: reject_drift,
+                 disable_provider: disable, enable_provider: enable, delete_provider: delete}
+  res: {}
+  cfg: {}
+  found_tool: {}
+
+input:
+  op:
+  agent_id:
+  name:
+  scope:
+  status:
+  toolset:
+  manifest: {}
+  by:
+  arguments: {}
+  session_id:
+  permission:
+  # providers (phase 3)
+  endpoint:
+  credential: {}
+  import_spec: {}
+  sync: {}
+  kind:            # mcp (default) | activity | workflow
+
+output:
+  ok: "{{ bool(res.get('ok')) }}"
+  data: "{{ res.get('data') }}"
+  error: "{{ res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in registry_ops and op not in other_ops and op not in provider_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.tools: invalid op '{{ op }}'"
+
+    - task_name: resolve-config
+      skip_if: "{{ op in ['tool_stats', 'seed_tools'] }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - cfg: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+
+    - task_name: call-registry
+      skip_if: "{{ op not in registry_ops }}"
+      workflow:
+        ref: agent-harness-tools/tool-registry
+        mode: inline
+        input:
+          mode: "{{ registry_ops[op] }}"
+          agent_id: "{{ agent_id }}"
+          name: "{{ name }}"
+          scope: "{{ scope or ('both' if op in ['list_tools', 'list_toolsets'] else 'agent') }}"
+          status: "{{ status }}"
+          toolset: "{{ toolset }}"
+          manifest: "{{ manifest }}"
+          by: "{{ by }}"
+          definition_access: "{{ cfg.get('access') or {} }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    # dry_run: the stored manifest (agent scope, else shared), rendered, not dispatched.
+    - task_name: find-tool
+      skip_if: "{{ op != 'dry_run_tool' }}"
+      workflow:
+        ref: agent-harness-tools/tool-registry
+        mode: inline
+        input: {mode: get, agent_id: "{{ agent_id }}", name: "{{ name }}", scope: "{{ scope or 'agent' }}"}
+      output:
+        set:
+          - found_tool: "{{ (((_ or {}).get('data') or {}).get('tool')) or {} }}"
+          - res: "{{ {} if (_ or {}).get('ok') else (_ or {}) }}"
+
+    - task_name: dry-run-tool
+      skip_if: "{{ op != 'dry_run_tool' or not found_tool }}"
+      workflow:
+        ref: agent-harness-tools/tool-executor
+        mode: inline
+        input: {mode: dry_run, agent_id: "{{ agent_id }}", config: "{{ cfg }}", manifest: "{{ found_tool }}", arguments: "{{ arguments }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: revoke-grant
+      skip_if: "{{ op != 'revoke_grant' }}"
+      workflow:
+        ref: agent-harness-tools/tool-policy
+        mode: inline
+        input: {mode: revoke, agent_id: "{{ agent_id }}", config: "{{ cfg }}", name: "{{ name }}", session_id: "{{ session_id }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: tool-pref
+      skip_if: "{{ op not in pref_ops }}"
+      workflow:
+        ref: agent-harness-tools/tool-policy
+        mode: inline
+        input: {mode: "{{ pref_ops[op] }}", agent_id: "{{ agent_id }}", config: "{{ cfg }}", name: "{{ name }}", permission: "{{ permission }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: provider-op
+      skip_if: "{{ op not in provider_ops }}"
+      workflow:
+        ref: agent-harness-tools/tool-provider
+        mode: inline
+        input:
+          mode: "{{ provider_ops[op] }}"
+          agent_id: "{{ agent_id }}"
+          config: "{{ cfg }}"
+          name: "{{ name }}"
+          scope: "{{ scope or ('both' if op == 'list_providers' else 'shared') }}"
+          endpoint: "{{ endpoint }}"
+          credential: "{{ credential or {} }}"
+          import_spec: "{{ import_spec or {} }}"
+          sync: "{{ sync or {} }}"
+          kind: "{{ kind or 'mcp' }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: seed-agent-tools
+      skip_if: "{{ op != 'seed_tools' }}"
+      workflow:
+        ref: agent-harness-tools/seed-tools
+        mode: inline
+        input: {agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: read-tool-stats
+      skip_if: "{{ op != 'tool_stats' }}"
+      workflow:
+        ref: agent-harness-tools/tool-stats-rollup
+        mode: inline
+        input: {mode: stats, name: "{{ name }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"

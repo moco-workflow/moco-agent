@@ -1,0 +1,89 @@
+test_type: integration-test
+
+# model-readiness (F70): static, per role. builtin.secret.list is mocked by task name
+# (list-user-secrets, list-global-secrets); a run that should not list uses a 1/0
+# sentinel.
+
+wfspec:
+  name: model-readiness
+
+test_cases:
+  - id: a-fresh-agent-is-missing-its-key
+    input:
+      agent_id: moco-assistant
+      config:
+        profiles: [chat, rag]
+        models:
+          inference: {provider: default, model: null, base_url: null, apikey_secret_key: MY_LLM_TOKEN}
+          decision: null
+          classifier: {model: null, base_url: null, enabled: true}
+          embedding: {model_name: null, embed_dim: 768, base_url: null}
+    mocks:
+      - {step_name: list-user-secrets, _: []}
+      - {step_name: list-global-secrets, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['ready'] == False }}"
+        - "{{ data['roles']['inference']['status'] == 'missing' and data['roles']['inference']['reason'] == 'secret_missing' }}"
+        - "{{ data['roles']['inference']['secret'] == {'name': 'MY_LLM_TOKEN', 'scope': 'user', 'exists': False} }}"
+        - "{{ data['roles']['inference']['fix']['secret_name'] == 'MY_LLM_TOKEN' and 'moco secret upload MY_LLM_TOKEN' in data['roles']['inference']['hint'] }}"
+        - "{{ data['roles']['decision']['status'] == 'inherited' }}"
+        - "{{ data['roles']['classifier']['status'] == 'off' and data['roles']['classifier']['reason'] == 'classifier_unset' }}"
+        - "{{ data['roles']['embedding']['status'] == 'unknown' and data['roles']['embedding']['reason'] == 'env_default' }}"
+
+  - id: no-key-name-is-missing
+    input:
+      config: {profiles: [chat], models: {inference: {model: m, base_url: "https://x", apikey_secret_key: null}}}
+    mocks:
+      - {step_name: list-user-secrets, _: "{{ 1 / 0 }}"}
+      - {step_name: list-global-secrets, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['ready'] == False and data['roles']['inference']['reason'] == 'no_secret_name' }}"
+        - "{{ data['roles']['inference']['fix']['fields'] == ['models.inference.model', 'models.inference.base_url', 'models.inference.apikey_secret_key'] }}"
+        - "{{ data['roles']['embedding']['status'] == 'off' }}"
+
+  - id: a-stored-key-on-the-worker-default-is-unknown-but-ready
+    input:
+      config: {profiles: [chat], models: {inference: {model: null, base_url: null, apikey_secret_key: MY_LLM_TOKEN}}}
+    mocks:
+      - {step_name: list-user-secrets, _: [MY_LLM_TOKEN, OTHER]}
+    expect:
+      assert:
+        - "{{ data['ready'] == True and data['roles']['inference']['status'] == 'unknown' }}"
+
+  - id: a-full-setup-is-ready
+    input:
+      config:
+        profiles: [chat, rag]
+        models:
+          inference: {model: deepseek-v4-pro, base_url: "https://api.deepseek.com", apikey_secret_key: global/DEEPSEEK}
+          decision: {model: small, base_url: "https://api.deepseek.com", apikey_secret_key: global/DEEPSEEK}
+          classifier: {worker_default: true, enabled: true}
+          embedding: {model_name: nomic-embed-text, base_url: "http://ollama:11434/v1", embed_dim: 768}
+    mocks:
+      - {step_name: list-user-secrets, _: "{{ 1 / 0 }}"}
+      - {step_name: list-global-secrets, _: [DEEPSEEK]}
+    expect:
+      assert:
+        - "{{ data['ready'] == True }}"
+        - "{{ [data['roles'][r]['status'] for r in ['inference', 'decision', 'classifier', 'embedding']] == ['ready', 'ready', 'ready', 'ready'] }}"
+        - "{{ data['roles']['classifier']['reason'] == 'worker_default' and data['roles']['inference']['secret']['scope'] == 'global' }}"
+
+  - id: a-missing-global-key-needs-an-admin
+    input:
+      config: {models: {inference: {model: m, base_url: "https://x", apikey_secret_key: global/SHARED}}}
+    mocks:
+      - {step_name: list-global-secrets, _: []}
+    expect:
+      assert:
+        - "{{ data['roles']['inference']['reason'] == 'secret_missing' and data['roles']['inference']['hint'] == 'An admin needs to store the shared secret global/SHARED.' }}"
+
+  - id: a-disabled-classifier-is-off
+    input:
+      config: {models: {inference: {model: m, base_url: "https://x", apikey_secret_key: K}, classifier: {base_url: "http://localhost:8002", enabled: false}}}
+    mocks:
+      - {step_name: list-user-secrets, _: [K]}
+    expect:
+      assert:
+        - "{{ data['roles']['classifier']['reason'] == 'classifier_disabled' and data['ready'] == True }}"

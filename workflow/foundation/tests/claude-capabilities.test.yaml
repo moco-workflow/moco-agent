@@ -1,0 +1,46 @@
+test_type: integration-test
+
+# claude-capabilities (plan-10 step 12, design §6.9.12): only auto, non-user-credential,
+# activity/mcp tools are bridged; the trace records the bridged versions and why others
+# were excluded.
+
+wfspec:
+  name: claude-capabilities
+
+test_cases:
+  - id: only-auto-service-activity-and-mcp-tools-are-bridged
+    input:
+      offerable:
+        - {name: k8s_list_pods, version: 3, effective_permission: auto, credential: {mode: service}, binding: {activity: {type: k8s.list}}}
+        - {name: k8s_get_deployment, version: 1, effective_permission: auto, credential: {mode: service}, binding: {activity: {type: k8s.get}}}
+        - {name: k8s_get_secret, version: 2, effective_permission: approve, binding: {activity: {type: k8s.get}}}
+        - {name: jira_search, version: 1, effective_permission: auto, credential: {mode: user, secret_key: JIRA}, binding: {activity: {type: http.request}}}
+        - {name: docs_search, version: 1, effective_permission: auto, binding: {mcp: {provider: Docs-Server, endpoint: "https://mcp.example.com/docs", tool_name: search}}}
+        - {name: knowledge_search, version: 1, effective_permission: auto, binding: {builtin: {module: knowledge}}}
+    expect:
+      output:
+        - moco_tools: [k8s.get, k8s.list]
+        - mcp_servers: {docs_server: {type: http, url: "https://mcp.example.com/docs"}}
+        - mcp_tools: [mcp__docs_server__search]
+      assert:
+        - "{{ trace['tools'] == [{'name': 'k8s_list_pods', 'version': 3}, {'name': 'k8s_get_deployment', 'version': 1}, {'name': 'docs_search', 'version': 1}] }}"
+        - "{{ sorted((e['name'], e['reason']) for e in trace['excluded']) == [('jira_search', 'user credential'), ('k8s_get_secret', 'not auto'), ('knowledge_search', 'binding has no claude form')] }}"
+
+  - id: an-activity-provider-tool-with-fixed-input-is-not-bridged
+    input:
+      offerable:
+        - {name: moco_http_request, version: 1, effective_permission: auto, binding: {activity: {type: http.request, input_template: {}, merge_args: true}}}
+        - {name: moco_sql_query, version: 1, effective_permission: auto, binding: {activity: {type: sql.query, input_template: {connection_string_secret_key: "global/DB"}, merge_args: true}}}
+    expect:
+      output:
+        - moco_tools: [http.request]
+      assert:
+        - "{{ trace['excluded'] == [{'name': 'moco_sql_query', 'reason': 'fixed input'}] }}"
+
+  - id: nothing-offerable-bridges-nothing
+    input: {offerable: []}
+    expect:
+      output:
+        - moco_tools: []
+        - mcp_servers: {}
+        - mcp_tools: []

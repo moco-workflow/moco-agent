@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-HARNESS-MEASURE — run a chosen set of the phase-0 measurements
+# ================================================================================
+#
+# The package's main wfspec (`moco publish` requires one named after the package).
+#
+#   moco run agent-harness-measure --tier dev -i '{"only": ["M1", "M3", "M5", "M6"]}'
+#
+# Each measurement runs as a `sync` child with `on_error: {catch: true}`, so one failing
+# measurement is reported and the rest still run. Per-measurement inputs go in
+# `inputs`, e.g. {"M1": {"backend": "laya", "base_url": "..."}}.
+#
+# M2 and M4 are left out of the default set: M2's set/inline numbers need
+# wall-clock timing around separate runs, and M4 needs a working model key and
+# the skeleton deployed -- scripts/measure.sh drives both.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-harness-measure
+
+context:
+  drivers:
+    M1: measure-m1-system-one
+    M2: measure-m2-child-overhead
+    M3: measure-m3-list-states
+    M4: measure-m4-turns
+    M5: measure-m5-llama-query
+    M6: measure-m6-driver
+  results: []
+  report: {}
+
+input:
+  only: ["M1", "M3", "M5", "M6"]
+  inputs: {}
+
+output: '{{ report }}'
+
+main:
+  tasks:
+    - task_name: reject-unknown-measurement
+      raise:
+        if: "{{ any(m not in drivers for m in only) }}"
+        type: error
+        error_type: AbortError
+        message: "Unknown measurement(s): {{ [m for m in only if m not in drivers] }}; known: {{ sorted(drivers) }}"
+
+    - task_name: run-each
+      loop:
+        in: "{{ [m for m in sorted(drivers) if m in only] }}"
+        foreach: item
+        do:
+          task_name: run-driver
+          workflow:
+            ref: "{{ drivers[item] }}"
+            mode: sync
+            input: "{{ (inputs or {}).get(item) or {} }}"
+          output:
+            set:
+              - r: "{{ {'measurement': item, 'result': _} }}"
+            data:
+              r: '{{ r }}'
+          on_error:
+            catch: true
+            do:
+              set:
+                - r: "{{ {'measurement': item, 'result': {'result': 'error', **_}} }}"
+      output:
+        as: results
+
+    - task_name: collect
+      set:
+        - report: "{{ {x['r']['measurement']: x['r']['result'] for x in (results or []) if isinstance(x, dict) and x.get('r')} }}"

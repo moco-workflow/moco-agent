@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# DEMO-ECHO — echo a message back; a workflow tool (header.metadata.tool)
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: demo-echo
+  metadata:
+    tool:
+      description: "Echo a message back exactly as given, with the time it was received. Use to test that workflow tools work, or when asked to echo."
+      parameters:
+        type: object
+        properties:
+          message: {type: string, description: "The text to echo."}
+        required: [message]
+      side_effects: none
+      timeout_sec: 30
+
+input:
+  message: ""
+
+output:
+  echo: "{{ message }}"
+  received_at: "{{ received_at }}"
+
+main:
+  task_name: stamp
+  set:
+    - received_at: "{{ now().isoformat() }}"

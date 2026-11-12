@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SEED-KNOWLEDGE — register and index moco-docs, once (plan-18 step 2)
+# ================================================================================
+#   moco run agent-moco-assistant/seed-knowledge --tier dev
+# Idempotent: an existing moco-docs source (any status) is left alone and reported.
+# Otherwise `knowledge register` creates the shared row and starts the indexer over
+# the moco documentation site. A shared source needs an admin: run it as one.
+# The old agent's seed-knowledge also wrote config and notes; config is now the
+# definition, and notes become seed memory in phase 2 (plan-18 §4).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: seed-knowledge
+
+input:
+  agent_id: moco-assistant
+  docs_url: "http://localhost:8080/docs"
+
+context:
+  existing: {}
+  registered: {}
+
+output:
+  existing: "{{ existing.get('data') }}"
+  registered: "{{ registered }}"
+
+main:
+  tasks:
+    - task_name: find-source
+      workflow:
+        ref: agent-harness-knowledge/source-registry
+        mode: inline
+        input: {mode: get, agent_id: "{{ agent_id }}", name: moco-docs, scope: shared}
+      output:
+        set:
+          - existing: "{{ _ or {} }}"
+    - task_name: resolve-config
+      skip_if: "{{ bool(existing.get('ok')) }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - config: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+    - task_name: register-docs
+      skip_if: "{{ bool(existing.get('ok')) }}"
+      workflow:
+        ref: agent-harness-knowledge/knowledge
+        mode: inline
+        input:
+          mode: register
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          name: moco-docs
+          scope: shared
+          description: "Moco workflow platform documentation"
+          keywords: [workflow, wfspec, activity, retry, expression, state machine, temporal, deploy, cli]
+          index_sources:
+            - {kind: site, url: "{{ docs_url }}", max_depth: 3, limit: 200}
+      output:
+        set:
+          - registered: "{{ _ }}"

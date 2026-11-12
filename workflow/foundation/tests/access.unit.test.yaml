@@ -1,0 +1,253 @@
+test_type: unit-test
+
+# access authorize, phase 1 (plan-04 step 1, design §6.13).
+#
+# Every rule lives in the named task `decide-access`, which reads the caller as
+# `uid` (identify-caller derives it from __user_info__, which a test cannot set).
+# `valid` is set by check-definition-access, covered by the integration suite.
+# Each rule is covered for a guest, a plain user, an admin and a denied user,
+# including the "None" and "" identities a missing user_id turns into.
+
+wfspec:
+  name: access
+
+test_data:
+  acc: &acc
+    denied_user_ids: [mallory]
+    guest_user_ids: [guest, "None", ""]
+    admin_user_ids: [root, guest]   # guest is listed on purpose: deny must still win
+    guest_profiles: [chat]
+  # the same lists, plus the computed namespace-admin flag (F48)
+  acc_ns: &acc_ns
+    denied_user_ids: [mallory]
+    guest_user_ids: [guest, "None", ""]
+    admin_user_ids: [root, guest]
+    guest_profiles: [chat]
+    caller_is_namespace_admin: true
+
+test_groups:
+
+  - step_name: decide-access
+    test_cases:
+
+      # ── denied users: nothing at all ────────────────────────────────────
+      - id: a-denied-user-cannot-even-chat
+        input: {uid: mallory, action: chat, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: denied_user}
+
+      # ── guests: a shared identity reads and chats, never writes ─────────
+      - id: a-guest-may-chat
+        input: {uid: guest, action: chat, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-missing-user-id-is-a-guest
+        input: {uid: "None", action: write, scope: user, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_read_only}
+
+      - id: an-empty-user-id-is-a-guest
+        input: {uid: "", action: feedback, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_no_feedback}
+
+      - id: a-guest-may-read
+        input: {uid: guest, action: read, scope: shared, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-guest-cannot-write-even-its-own-scope
+        input: {uid: guest, action: write, scope: user, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_read_only}
+
+      - id: a-guest-may-use-a-guest-profile
+        input: {uid: guest, action: use_profile, resource: chat, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-guest-cannot-use-another-profile
+        input: {uid: guest, action: use_profile, resource: rag, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_profile}
+
+      - id: a-guest-may-call-a-side-effect-free-tool
+        input: {uid: guest, action: call_tool, resource: {side_effects: none}, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-guest-cannot-call-a-tool-with-side-effects
+        input: {uid: guest, action: call_tool, resource: {side_effects: write}, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_side_effects}
+
+      - id: a-tool-without-declared-side-effects-counts-as-having-them
+        input: {uid: guest, action: call_tool, resource: {}, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_side_effects}
+
+      - id: a-guest-on-the-admin-list-is-still-not-an-admin
+        input: {uid: guest, action: admin, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+      # ── plain users: their own scopes, not the shared ones ──────────────
+      - id: a-user-may-write-its-own-scope
+        input: {uid: ada, action: write, scope: user, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-user-may-write-its-session
+        input: {uid: ada, action: write, scope: session, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-user-cannot-write-the-agent-scope
+        input: {uid: ada, action: write, scope: agent, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+      - id: a-user-cannot-write-the-shared-scope
+        input: {uid: ada, action: write, scope: shared, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+      - id: a-user-may-use-any-profile
+        input: {uid: ada, action: use_profile, resource: rag, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-user-may-give-feedback
+        input: {uid: ada, action: feedback, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-user-may-call-a-tool-with-side-effects
+        input: {uid: ada, action: call_tool, resource: {side_effects: write}, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-user-is-not-an-admin
+        input: {uid: ada, action: admin, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+      # ── admins ──────────────────────────────────────────────────────────
+      - id: an-admin-may-write-the-agent-scope
+        input: {uid: root, action: write, scope: agent, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: an-admin-may-administer
+        input: {uid: root, action: admin, definition_access: *acc, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-denied-admin-is-denied
+        input:
+          uid: root
+          action: write
+          scope: agent
+          valid: true
+          mode: authorize
+          definition_access:
+            denied_user_ids: [root]
+            guest_user_ids: []
+            admin_user_ids: [root]
+            guest_profiles: []
+        expect:
+          output:
+            - data: {allow: false, reason: denied_user}
+
+      # ── namespace admins (F48): the computed caller_is_namespace_admin flag ──
+      - id: a-namespace-admin-may-write-the-agent-scope
+        input: {uid: ada, action: write, scope: agent, definition_access: *acc_ns, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-namespace-admin-may-administer
+        input: {uid: ada, action: admin, definition_access: *acc_ns, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: true, reason: ok}
+
+      - id: a-guest-flagged-as-namespace-admin-is-still-a-guest
+        input: {uid: guest, action: write, scope: agent, definition_access: *acc_ns, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: guest_read_only}
+
+      - id: a-denied-user-flagged-as-namespace-admin-is-denied
+        input: {uid: mallory, action: admin, definition_access: *acc_ns, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: denied_user}
+
+      - id: only-a-true-flag-counts
+        input: {uid: ada, action: admin, definition_access: {denied_user_ids: [], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat], caller_is_namespace_admin: "true"}, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+      - id: a-false-flag-is-not-an-admin
+        input: {uid: ada, action: write, scope: shared, definition_access: {denied_user_ids: [], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat], caller_is_namespace_admin: false}, valid: true, mode: authorize}
+        expect:
+          output:
+            - data: {allow: false, reason: not_admin}
+
+  - step_name: identify-role
+    test_cases:
+      - id: a-namespace-admin-is-an-admin
+        input: {uid: ada, definition_access: *acc_ns, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: admin}
+      - id: a-guest-flagged-as-namespace-admin-is-a-guest
+        input: {uid: guest, definition_access: *acc_ns, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: guest}
+      - id: a-denied-id-is-denied-even-if-admin
+        input: {uid: mallory, definition_access: {denied_user_ids: [mallory], guest_user_ids: [], admin_user_ids: [mallory], guest_profiles: []}, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: denied}
+      - id: a-guest-on-the-admin-list-is-a-guest
+        input: {uid: guest, definition_access: *acc, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: guest}
+      - id: an-admin
+        input: {uid: root, definition_access: *acc, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: admin}
+      - id: anyone-else-is-a-user
+        input: {uid: ada, definition_access: *acc, valid: true, mode: identify}
+        expect:
+          output:
+            - data: {role: user}

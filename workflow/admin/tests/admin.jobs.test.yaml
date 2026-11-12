@@ -1,0 +1,53 @@
+test_type: integration-test
+
+# admin.jobs (plan-13 step 7): reads through job-manager; a cancel that had to write
+# the row nudges the session, one the entity took does not; answer_job finds the job's
+# session and resolves through admin.pending, and refuses a job that is not waiting.
+
+wfspec:
+  name: admin.jobs
+
+test_cases:
+  - id: list-jobs-reads-through-job-manager
+    input: {op: list_jobs, agent_id: moco-assistant, session_id: s1}
+    mocks:
+      - {step_name: read-jobs, _: {ok: true, data: {jobs: [{job_id: j1, status: running}]}, error: null}}
+    expect:
+      assert:
+        - "{{ ok == True and data['jobs'][0]['job_id'] == 'j1' }}"
+
+  - id: a-cancel-the-entity-took-sends-nothing-more
+    input: {op: cancel_job, agent_id: moco-assistant, job_id: j1}
+    mocks:
+      - {step_name: cancel-job, _: {ok: true, data: {cancelled: true, via: event, job: {job_id: j1, session_id: s1}}, error: null}}
+      - {step_name: nudge-session-after-row-cancel, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['via'] == 'event' }}"
+
+  - id: a-cancel-written-to-the-row-nudges-the-session
+    input: {op: cancel_job, agent_id: moco-assistant, job_id: j1}
+    mocks:
+      - {step_name: cancel-job, _: {ok: true, data: {cancelled: true, via: row, job: {job_id: j1, session_id: s1, status: cancelled}}, error: null}}
+      - {step_name: nudge-session-after-row-cancel, _: "{{ {'sent': True} if session_id is None else 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['via'] == 'row' }}"
+
+  - id: answer-job-resolves-through-the-jobs-session
+    input: {op: answer_job, agent_id: moco-assistant, job_id: j1, decision: approve}
+    mocks:
+      - {step_name: read-job-to-answer, _: {ok: true, data: {job: {job_id: j1, session_id: s1, status: awaiting_input}}}}
+      - {step_name: answer-through-pending, _: "{{ {'ok': True, 'data': {'session': job_row.get('session_id')}, 'error': None} }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data == {'session': 's1'} }}"
+
+  - id: answer-job-refuses-a-job-that-is-not-waiting
+    input: {op: answer_job, agent_id: moco-assistant, job_id: j1, decision: approve}
+    mocks:
+      - {step_name: read-job-to-answer, _: {ok: true, data: {job: {job_id: j1, session_id: s1, status: running}}}}
+      - {step_name: answer-through-pending, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job j1 is not waiting for an answer", retryable: false}

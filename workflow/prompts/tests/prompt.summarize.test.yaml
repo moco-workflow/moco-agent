@@ -1,0 +1,25 @@
+test_type: integration-test
+
+wfspec:
+  name: prompt.summarize
+
+test_cases:
+
+  - id: summary-and-exchanges-are-fenced-with-the-word-limit
+    input:
+      summary: "User is setting up retries."
+      exchanges: [{role: user, content: "what about backoff?"}, {role: assistant, content: "It doubles."}]
+      max_words: 120
+    expect:
+      output:
+        - kind: chat
+        - response_format: null
+      assert:
+        - "{{ 'at most 120 words' in messages[0]['content'] and '{max_words}' not in messages[0]['content'] }}"
+        - "{{ messages[1]['content'] == '<data>\\nEarlier summary:\\nUser is setting up retries.\\n\\nNew exchanges:\\nuser: what about backoff?\\nassistant: It doubles.\\n</data>' }}"
+
+  - id: a-first-summary-says-none-yet
+    input: {exchanges: [{role: user, content: "hi"}]}
+    expect:
+      assert:
+        - "{{ 'Earlier summary:\\n(none yet)' in messages[1]['content'] }}"

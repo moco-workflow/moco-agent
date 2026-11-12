@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.USAGE — agent-admin's usage report (plan-16 phase 2, design §6.10.5)
+# ================================================================================
+#   op            in        data out
+#   usage_report  limit?    {sessions, totals: {turns, llm_calls, classifier_calls,
+#                            tool_calls, tokens_in, tokens_out}, by_route: {route: {sessions, turns}},
+#                            tools: [tool_stats rows]}
+# The caller's own sessions with this agent (session-store list reads the caller's
+# namespace), summed from meta.usage, grouped by each session's last route; plus the
+# deployment's per-tool stats (tool-stats-rollup stats). Read-only.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.usage
+
+context:
+  sessions: []
+  tool_stats: []
+  usage_keys: ["turns", "llm_calls", "classifier_calls", "tool_calls", "tokens_in", "tokens_out"]
+
+input:
+  op: usage_report
+  agent_id:
+  limit: 200
+
+output:
+  ok: true
+  data: "{{ data }}"
+  error:
+
+main:
+  tasks:
+    - task_name: list-sessions
+      workflow:
+        ref: agent-harness-session/session-store
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", limit: "{{ limit }}"}
+      output:
+        set:
+          - sessions: "{{ (((_ or {}).get('data') or {}).get('sessions')) or [] }}"
+
+    - task_name: read-tool-stats
+      workflow:
+        ref: agent-harness-tools/tool-stats-rollup
+        mode: inline
+        input: {mode: stats}
+      output:
+        set:
+          - tool_stats: "{{ (((_ or {}).get('data') or {}).get('stats')) or [] }}"
+      on_error:
+        catch: true
+
+    - task_name: sum-usage
+      set:
+        - _u: "{{ [m.get('usage') or {} for m in sessions if isinstance(m, dict)] }}"
+        - _routes: "{{ sorted(set(str(m.get('last_route') or 'none') for m in sessions if isinstance(m, dict))) }}"
+        - data: >-
+            {{ {'sessions': len(sessions),
+                'totals': {k: sum(int(u.get(k) or 0) for u in _u) for k in usage_keys},
+                'by_route': {r: {'sessions': len([m for m in sessions if str(m.get('last_route') or 'none') == r]),
+                                 'turns': sum(int((m.get('usage') or {}).get('turns') or 0) for m in sessions if str(m.get('last_route') or 'none') == r)}
+                             for r in _routes},
+                'tools': tool_stats} }}

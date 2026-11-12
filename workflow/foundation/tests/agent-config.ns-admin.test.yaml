@@ -1,0 +1,165 @@
+test_type: integration-test
+
+# agent-config and namespace admins (F48, design §6.13): `resolve` stamps the
+# computed access keys after every tier; validate keeps them, and the
+# definition-only `namespace_admins`, out of every tier's reach; a flagged caller
+# passes the real `access` check. The lookup (`resolve-namespace-admin`) is mocked
+# by task name. A separate suite: agent-config.test.yaml is at the YAML parser's
+# alias limit.
+
+wfspec:
+  name: agent-config
+
+test_data:
+  registry: &registry
+    ok: true
+    data:
+      definition:
+        agent_id: skeleton
+        harness: ">=0.2"
+        profiles: [chat]
+        router: {default_profile: chat}
+        access: {admin_user_ids: [root]}
+      profiles:
+        chat: {name: chat, kind: loop, loop: {prompt: loop, tools: null}}
+      resolved_refs: {}
+      versions: {harness: "0.3.0", agent: "0.2.0"}
+  defaults_on: &defaults_on
+    version: "0.3.0"
+    defaults:
+      models: {inference: {provider: deepseek, model: deepseek-v4-pro}}
+      access: {denied_user_ids: [mallory], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat], namespace_admins: true}
+      profiles: [chat]
+    catalog: {providers: []}
+  defaults_off: &defaults_off
+    version: "0.3.0"
+    defaults:
+      models: {inference: {provider: deepseek, model: deepseek-v4-pro}}
+      access: {denied_user_ids: [], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat], namespace_admins: false}
+      profiles: [chat]
+    catalog: {providers: []}
+
+test_cases:
+
+  # ── resolve ─────────────────────────────────────────────────────────────
+  - id: resolve-flags-a-namespace-admin-beside-the-admin-list
+    input: {mode: resolve, agent_id: skeleton}
+    mocks: &admin_mocks
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults_on}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: resolve-namespace-admin, _: {namespace_id: team-a, is_admin: true}}
+      - {step_name: write-agent-tier, _: null}
+    expect:
+      assert:
+        - "{{ data['config']['access']['caller_is_namespace_admin'] == True }}"
+        - "{{ data['config']['access']['namespace_id'] == 'team-a' }}"
+        - "{{ data['config']['access']['admin_user_ids'] == ['root'] and data['config']['access']['namespace_admins'] == True }}"
+
+  - id: resolve-records-a-non-admin-as-false
+    input: {mode: resolve, agent_id: skeleton}
+    mocks: &user_mocks
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults_on}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: resolve-namespace-admin, _: {namespace_id: team-a, is_admin: false}}
+      - step_name: write-agent-tier
+        _: "{{ 1 / 0 }}"
+    expect:
+      assert:
+        - "{{ data['config']['access']['caller_is_namespace_admin'] == False }}"
+        - "{{ data['config']['access']['namespace_id'] == 'team-a' }}"
+
+  # The lookup mock is a sentinel: had it run, the flag would be true.
+  - id: with-namespace-admins-off-there-is-no-lookup
+    input: {mode: resolve, agent_id: skeleton}
+    mocks: &off_mocks
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults_off}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: resolve-namespace-admin, _: {namespace_id: team-a, is_admin: true}}
+    expect:
+      assert:
+        - "{{ data['config']['access']['caller_is_namespace_admin'] == False }}"
+        - "{{ data['config']['access']['namespace_id'] is None }}"
+
+  # A row written before validate refused the computed keys is overwritten, never trusted.
+  - id: computed-keys-in-a-stored-row-are-overwritten
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults_off}
+      - {step_name: read-agent-tier, _: {schema_version: 1, version: 2, sections: {access: {caller_is_namespace_admin: true, namespace_id: evil}}}}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      assert:
+        - "{{ data['config']['access']['caller_is_namespace_admin'] == False }}"
+        - "{{ data['config']['access']['namespace_id'] is None }}"
+
+  - id: a-failing-lookup-is-not-an-admin
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults_on}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: resolve-namespace-admin, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['config']['access']['caller_is_namespace_admin'] == False }}"
+
+  # ── save: through the real `access` (the caller is on no list) ──────────
+  - id: a-namespace-admin-may-save-the-agent-tier
+    input: {mode: save, agent_id: skeleton, scope: agent, patch: {limits: {turn_budget_sec: 60}}}
+    mocks: *admin_mocks
+    expect:
+      output:
+        - ok: true
+        - error: null
+        - data: {config_version: "d0.3.0+a0.2.0+g1+u0"}
+
+  - id: a-plain-user-still-may-not-save-the-agent-tier
+    input: {mode: save, agent_id: skeleton, scope: agent, patch: {limits: {turn_budget_sec: 60}}}
+    mocks: *user_mocks
+    expect:
+      output:
+        - ok: false
+        - error: {code: forbidden, message: "not allowed to write the agent tier (not_admin)", retryable: false}
+
+  # ── validate ────────────────────────────────────────────────────────────
+  - id: the-agent-tier-cannot-switch-off-namespace-admins-or-forge-the-flag
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: agent
+      partial: {access: {namespace_admins: false, caller_is_namespace_admin: true, namespace_id: x, admin_user_ids: [ada]}}
+    mocks: *off_mocks
+    expect:
+      assert:
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.access.caller_is_namespace_admin', '$.access.namespace_admins', '$.access.namespace_id'] }}"
+
+  - id: the-agent-tier-may-still-edit-the-admin-list
+    input: {mode: validate, agent_id: skeleton, scope: agent, partial: {access: {admin_user_ids: [ada]}}}
+    mocks: *off_mocks
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: the-agent-tier-cannot-replace-the-whole-access-section
+    input: {mode: validate, agent_id: skeleton, scope: agent, partial: {access: null}}
+    mocks: *off_mocks
+    expect:
+      assert:
+        - "{{ [e['path'] for e in data['errors']] == ['$.access'] }}"
+
+  - id: a-user-cannot-forge-the-flag
+    input: {mode: validate, agent_id: skeleton, scope: user, partial: {access: {caller_is_namespace_admin: true}}}
+    mocks: *off_mocks
+    expect:
+      assert:
+        - "{{ [e['path'] for e in data['errors']] == ['$.access.caller_is_namespace_admin'] }}"

@@ -1,0 +1,51 @@
+test_type: unit-test
+
+# agent-config decide-write (plan-04 steps 6): the row a save or reset writes.
+# Unit-tested because a mock cannot capture what the write activity was given.
+
+wfspec:
+  name: agent-config
+
+test_data:
+  cur: &cur
+    rows:
+      user: {schema_version: 1, version: 7, sections: {persona_text: "old", models: {inference: {model: deepseek-flash, temperature: 0.3}}}}
+      agent: null
+    versions: {harness: "0.3.0", agent: "0.2.0", agent_row: 0, user_row: 7}
+
+test_groups:
+  - step_name: decide-write
+    test_cases:
+
+      - id: save-merges-the-patch-field-by-field-and-bumps-the-version
+        input:
+          valid: true
+          mode: save
+          scope: user
+          cur: *cur
+          authz: {allow: true}
+          change_errors: []
+          patch: {models: {inference: {temperature: 0.9}}}
+        expect:
+          assert:
+            - "{{ do_write == True and error is None }}"
+            - "{{ new_row['version'] == 8 and new_row['schema_version'] == 1 }}"
+            - "{{ new_row['sections'] == {'persona_text': 'old', 'models': {'inference': {'model': 'deepseek-flash', 'temperature': 0.9}}} }}"
+
+      - id: reset-of-a-section-drops-only-it
+        input: {valid: true, mode: reset, scope: user, section: models, cur: *cur, authz: {allow: true}, patch: {}}
+        expect:
+          assert:
+            - "{{ new_row['sections'] == {'persona_text': 'old'} and new_row['version'] == 8 }}"
+
+      - id: a-full-reset-empties-the-row-but-never-restarts-the-version
+        input: {valid: true, mode: reset, scope: user, section: null, cur: *cur, authz: {allow: true}, patch: {}}
+        expect:
+          assert:
+            - "{{ new_row['sections'] == {} and new_row['version'] == 8 }}"
+
+      - id: a-first-save-starts-the-row-at-version-1
+        input: {valid: true, mode: save, scope: agent, cur: *cur, authz: {allow: true}, change_errors: [], patch: {limits: {turn_budget_sec: 60}}}
+        expect:
+          assert:
+            - "{{ new_row['version'] == 1 and new_row['sections'] == {'limits': {'turn_budget_sec': 60}} }}"

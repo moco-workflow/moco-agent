@@ -1,0 +1,341 @@
+test_type: integration-test
+
+# memory-store (plan-07 steps 1-2, design §6.4.3-4): item lifecycle (legal and
+# illegal), slug sanitising, evidence dedupe/clamp, caps that skip pinned items,
+# tombstones, touch, the agent-scope snapshot and mem-version bump, guests write
+# nothing. Every write task is mocked by its exact name.
+
+wfspec:
+  name: memory-store
+
+test_data:
+  allow: &allow {ok: true, data: {allow: true, reason: ok}}
+  deny: &deny {ok: true, data: {allow: false, reason: guest_write}}
+  lesson: &lesson
+    schema_version: 1
+    key: "mem:lesson:retry-timeout"
+    kind: lesson
+    slug: retry-timeout
+    scope: user
+    title: "Retry timeout_sec is per attempt"
+    text: "timeout_sec applies to each attempt."
+    tags: [retry]
+    pinned: false
+    evidence: [{session_id: s1, turn: 2, ts: "2026-10-01T10:00:00", source: curated}]
+    status: active
+    negative_feedback: 0
+    created_at: "2026-10-01T10:00:00"
+    updated_at: "2026-10-01T10:00:00"
+  conflicted: &conflicted {schema_version: 1, key: "mem:fact:deploy-tool", kind: fact, slug: deploy-tool, scope: user, title: t, status: conflicted, conflicts_with: ["mem:fact:x"], evidence: []}
+  retired: &retired {schema_version: 1, key: "mem:fact:old", kind: fact, slug: old, scope: user, title: t, status: retired, evidence: []}
+
+test_cases:
+
+  # ── save ────────────────────────────────────────────────────────────────
+  - id: save-creates-an-active-item-with-a-sanitised-slug
+    input: {mode: save, agent_id: ops, scope: user, item: {kind: Lesson, title: "Retry timeout_sec is PER attempt!", text: "x", tags: [Retry, "Activity Options", retry], evidence: [{session_id: s1, turn: 2}]}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: []}
+      - {step_name: write-item, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['created'] == True and data['item']['key'] == 'mem:lesson:retry-timeout-sec-is-per-attempt' }}"
+        - "{{ data['item']['status'] == 'active' and data['item']['tags'] == ['retry', 'activity-options'] and data['item']['schema_version'] == 1 }}"
+        - "{{ len(data['item']['evidence']) == 1 and data['evicted'] == [] }}"
+
+  - id: a-guest-writes-nothing
+    input: {mode: save, agent_id: ops, scope: user, item: {kind: fact, title: x}}
+    mocks:
+      - {step_name: authorize-write, _: *deny}
+      - {step_name: read-current, _: "{{ 1 / 0 }}"}
+      - {step_name: write-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: saving-over-a-retired-item-is-invalid-state
+    input: {mode: save, agent_id: ops, scope: user, key: "mem:fact:old", item: {kind: fact, slug: old, title: t}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *retired}
+      - {step_name: write-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-save-at-the-cap-retires-the-weakest-unpinned-item
+    input: {mode: save, agent_id: ops, scope: user, item: {kind: fact, title: new fact}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: "{{ [{'key': 'mem:fact:k' + str(i)} for i in range(300)] }}"}
+      - {step_name: write-item, _: null}
+      # One row for every key: all identical, so only the pinned flag differs.
+      - {step_name: read-cap-row, _: {key: "mem:fact:k1", status: active, pinned: false, evidence: [], updated_at: "2026-01-01T00:00:00"}}
+      - {step_name: write-eviction, _: null}
+      # An evicted fact leaves the promotion pool, whatever the flag.
+      - {step_name: delete-evicted-pool-row, _: "{{ None if pool_ns == 'agent.ops.memory-pool' and pool_victim == 'mem:fact:k1' else 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['created'] == True and data['evicted'] == ['mem:fact:k1'] }}"
+
+  - id: pinned-items-are-never-evicted
+    input: {mode: enforce_caps, agent_id: ops, scope: user}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: list-cap-keys, _: "{{ [{'key': 'mem:fact:k' + str(i)} for i in range(310)] }}"}
+      - {step_name: read-cap-row, _: {key: "mem:fact:k1", status: active, pinned: true, evidence: []}}
+      - {step_name: write-eviction, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {evicted: [], decayed: []}
+
+  - id: an-unused-weak-item-decays-a-fresh-or-pinned-one-does-not
+    input: {mode: enforce_caps, agent_id: ops, scope: user}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: list-cap-keys, _: [{key: "mem:fact:old"}, {key: "mem:fact:new"}, {key: "mem:fact:pinned"}, {key: "mem:fact:used"}]}
+      - step_name: read-cap-row
+        _: >-
+          {{ {'mem:fact:old': {'key': 'mem:fact:old', 'status': 'active', 'evidence': [{'session_id': 's1'}], 'created_at': '2025-01-01T00:00:00', 'updated_at': '2025-01-01T00:00:00'},
+              'mem:fact:new': {'key': 'mem:fact:new', 'status': 'active', 'evidence': [{'session_id': 's1'}], 'created_at': now().isoformat(), 'updated_at': now().isoformat()},
+              'mem:fact:pinned': {'key': 'mem:fact:pinned', 'status': 'active', 'pinned': True, 'evidence': [], 'created_at': '2025-01-01T00:00:00', 'updated_at': '2025-01-01T00:00:00'},
+              'mem:fact:used': {'key': 'mem:fact:used', 'status': 'active', 'evidence': [{'session_id': 's1'}], 'created_at': '2025-01-01T00:00:00', 'updated_at': '2025-01-01T00:00:00', 'last_used_at': now().isoformat()}}[cap_key] }}
+      - {step_name: write-eviction, _: "{{ None if victim['key'] == 'mem:fact:old' else 1 / 0 }}"}
+      - {step_name: delete-evicted-pool-row, _: "{{ None if pool_victim == 'mem:fact:old' else 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {evicted: [], decayed: ["mem:fact:old"]}
+
+  # ── add_evidence / lifecycle ────────────────────────────────────────────
+  - id: add-evidence-dedupes-by-session-and-turn-and-stays-active
+    input: {mode: add_evidence, agent_id: ops, scope: user, key: "mem:lesson:retry-timeout", evidence: [{session_id: s1, turn: 2}, {session_id: s2, turn: 5, source: curated}]}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *lesson}
+      - {step_name: write-item, _: null}
+    expect:
+      assert:
+        - "{{ [(e['session_id'], e['turn']) for e in data['item']['evidence']] == [('s1', 2), ('s2', 5)] and data['item']['status'] == 'active' }}"
+
+  - id: evidence-keeps-the-newest-ten
+    input: {mode: add_evidence, agent_id: ops, scope: user, key: "mem:lesson:retry-timeout", evidence: [{session_id: s0, turn: 1}, {session_id: s1, turn: 1}, {session_id: s2, turn: 1}, {session_id: s3, turn: 1}, {session_id: s4, turn: 1}, {session_id: s5, turn: 1}, {session_id: s6, turn: 1}, {session_id: s7, turn: 1}, {session_id: s8, turn: 1}, {session_id: s9, turn: 1}, {session_id: s10, turn: 1}, {session_id: s11, turn: 1}]}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *lesson}
+      - {step_name: write-item, _: null}
+    expect:
+      assert:
+        - "{{ len(data['item']['evidence']) == 10 }}"
+
+  - id: retire-an-active-item
+    input: {mode: retire, agent_id: ops, scope: user, key: "mem:lesson:retry-timeout", reason: forget}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *lesson}
+      - {step_name: write-item, _: null}
+      # A retired lesson leaves the promotion pool, even with promotion off.
+      - {step_name: delete-pool-row, _: "{{ None if pool_ns == 'agent.ops.memory-pool' else 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['item']['status'] == 'retired' and data['item']['retired_reason'] == 'forget' }}"
+
+  - id: retiring-a-retired-item-is-invalid-state
+    input: {mode: retire, agent_id: ops, scope: user, key: "mem:fact:old"}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *retired}
+      - {step_name: write-item, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: resolve-a-conflict-to-active
+    input: {mode: resolve_conflict, agent_id: ops, scope: user, key: "mem:fact:deploy-tool", to: active}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *conflicted}
+      - {step_name: write-item, _: null}
+    expect:
+      assert:
+        - "{{ data['item']['status'] == 'active' and data['item']['conflicts_with'] == [] }}"
+
+  - id: resolving-an-active-item-is-invalid-state
+    input: {mode: resolve_conflict, agent_id: ops, scope: user, key: "mem:lesson:retry-timeout", to: retired}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *lesson}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: negative-feedback-is-counted
+    input: {mode: feedback, agent_id: ops, scope: user, key: "mem:lesson:retry-timeout", delta: 2}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *lesson}
+      - {step_name: write-item, _: null}
+    expect:
+      assert:
+        - "{{ data['item']['negative_feedback'] == 2 }}"
+
+  - id: get-an-unknown-key-is-not-found
+    input: {mode: get, agent_id: ops, scope: user, key: "mem:fact:nope"}
+    mocks:
+      - {step_name: read-current, _: null}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  - id: a-bad-key-is-invalid-input
+    input: {mode: get, agent_id: ops, scope: user, key: "mem:../x"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  # ── agent scope ─────────────────────────────────────────────────────────
+  - id: an-agent-scope-write-bumps-mem-version
+    input: {mode: save, agent_id: ops, scope: agent, item: {kind: lesson, title: "Use helm", pinned: true}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: []}
+      - {step_name: write-item, _: null}
+      - {step_name: read-version-for-bump, _: {schema_version: 1, version: 7}}
+      - {step_name: bump-mem-version, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['item']['scope'] == 'agent' and data['item']['pinned'] == True }}"
+
+  - id: the-agent-scope-snapshot-carries-the-version-and-live-items
+    input: {mode: agent_scope_snapshot, agent_id: ops}
+    mocks:
+      - {step_name: list-item-keys, _: [{key: "mem:lesson:use-helm"}]}
+      - {step_name: read-item, _: {schema_version: 1, key: "mem:lesson:use-helm", status: active, scope: agent}}
+      - {step_name: read-mem-version, _: {schema_version: 1, version: 8}}
+    expect:
+      assert:
+        - "{{ data['version'] == 8 and [i['key'] for i in data['items']] == ['mem:lesson:use-helm'] * 4 }}"
+
+  # ── list / touch / tombstones ───────────────────────────────────────────
+  - id: list-filters-by-status
+    input: {mode: list, agent_id: ops, scope: user, kinds: [fact], status: active}
+    mocks:
+      - {step_name: list-item-keys, _: [{key: "mem:fact:old"}]}
+      - {step_name: read-item, _: *retired}
+    expect:
+      output:
+        - ok: true
+        - data: {items: []}
+
+  - id: touch-stamps-last-used
+    input: {mode: touch, agent_id: ops, keys: ["mem:lesson:retry-timeout"]}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-touch-row, _: *lesson}
+      - {step_name: write-touch-row, _: null}
+    expect:
+      output:
+        - data: {touched: ["mem:lesson:retry-timeout"]}
+
+  - id: a-tombstone-hashes-the-normalised-statement
+    input: {mode: tombstone, agent_id: ops, statement: "I deploy with  HELM!"}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-tombstone, _: null}
+    expect:
+      assert:
+        - "{{ bool(re.fullmatch(r'[0-9a-f]{32}', data['hash'])) }}"
+
+  - id: the-same-statement-differently-written-has-the-same-hash
+    input: {mode: tombstone, agent_id: ops, statement: "i deploy with helm"}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: write-tombstone, _: null}
+    expect:
+      # the hash of "i deploy with helm" (python: the same two polynomials)
+      assert:
+        - "{{ data['hash'] == '019441c708f0ad8f11557f59fcb62c0b' }}"
+
+  - id: list-tombstones-returns-hashes
+    input: {mode: list_tombstones, agent_id: ops}
+    mocks:
+      - {step_name: list-tombstone-keys, _: [{key: "mem-tombstone:abc"}]}
+    expect:
+      output:
+        - data: {hashes: [abc]}
+
+  # ── F50 closed: an owner_user_id input is ignored ───────────────────────
+  - id: an-owner-user-id-input-lists-only-the-callers-scope
+    input: {mode: list, agent_id: ops, scope: user, kinds: [fact], owner_user_id: bob, definition_access: {}}
+    mocks:
+      - {step_name: list-item-keys, _: "{{ [{'key': 'mem:fact:' + ('own-ns' if namespace == 'agent.ops' and not ns_global else 'wrong-ns')}] }}"}
+      - {step_name: read-item, _: "{{ {'schema_version': 1, 'key': item_key, 'status': 'active'} }}"}
+    expect:
+      assert:
+        - "{{ ok == True and [i['key'] for i in data['items']] == ['mem:fact:own-ns'] }}"
+
+  # ── promotion pool (§6.16, opt-in) ──────────────────────────────────────
+  - id: with-promotion-on-an-active-fact-is-mirrored-to-the-pool
+    input: {mode: save, agent_id: ops, scope: user, promotion_pool: true, item: {kind: fact, title: "Deploys use helm", text: "x", tags: [helm], evidence: [{session_id: s1, turn: 1}]}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: []}
+      - {step_name: write-item, _: null}
+      - step_name: write-pool-row
+        _: "{{ None if pool_ns == 'agent.ops.memory-pool' and mkey == 'mem:fact:deploys-use-helm' else 1 / 0 }}"
+      - {step_name: delete-pool-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['item']['key'] == 'mem:fact:deploys-use-helm' }}"
+
+  - id: without-promotion-nothing-is-pooled
+    input: {mode: save, agent_id: ops, scope: user, item: {kind: fact, title: "Deploys use helm"}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: []}
+      - {step_name: write-item, _: null}
+      - {step_name: write-pool-row, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-pool-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+
+  - id: profiles-and-episodes-are-never-pooled
+    input: {mode: save, agent_id: ops, scope: user, promotion_pool: true, item: {kind: profile, title: "Prefers kubectl"}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: null}
+      - {step_name: count-scope-keys, _: []}
+      - {step_name: write-item, _: null}
+      - {step_name: write-pool-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+
+  - id: a-conflicted-fact-leaves-the-pool
+    input: {mode: save, agent_id: ops, scope: user, promotion_pool: true, key: "mem:fact:deploy-tool", item: {kind: fact, slug: deploy-tool, title: t, status: conflicted}}
+    mocks:
+      - {step_name: authorize-write, _: *allow}
+      - {step_name: read-current, _: *conflicted}
+      - {step_name: write-item, _: null}
+      - {step_name: write-pool-row, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-pool-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == True and data['item']['status'] == 'conflicted' }}"
+
+  - id: list-pool-returns-the-pool-rows
+    input: {mode: list_pool, agent_id: ops, limit: 10}
+    mocks:
+      - {step_name: list-pool-keys, _: [{key: "pool:alice:mem:fact:a"}, {key: "pool:bob:mem:fact:b"}, {key: "other"}]}
+      - {step_name: read-pool-row, _: "{{ {'user_id': pool_key.split(':')[1], 'key': ':'.join(pool_key.split(':')[2:]), 'kind': 'fact', 'status': 'active'} }}"}
+    expect:
+      assert:
+        - "{{ ok == True and [(i['user_id'], i['key']) for i in data['items']] == [('alice', 'mem:fact:a'), ('bob', 'mem:fact:b')] }}"

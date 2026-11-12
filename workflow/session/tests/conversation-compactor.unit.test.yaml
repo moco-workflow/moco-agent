@@ -1,0 +1,18 @@
+test_type: unit-test
+
+wfspec:
+  name: conversation-compactor
+
+test_groups:
+  - step_name: shape-result
+    test_cases:
+      - id: a-title-is-unquoted-and-clamped
+        input: {mode: title, llm: {ok: true, data: {content: "  \"Configuring retries for moco activities in long-running production workflows\"  "}}}
+        expect:
+          assert:
+            - "{{ title == 'Configuring retries for moco activities in long-running prod' and len(title) == 60 }}"
+      - id: a-failed-call-gives-no-text
+        input: {mode: compact, llm: {ok: false}}
+        expect:
+          assert:
+            - "{{ text == '' and title == '' }}"

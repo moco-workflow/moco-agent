@@ -1,0 +1,706 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-EXECUTOR — validate → authorise → dispatch → shape → screen → audit (§6.9.9)
+# ================================================================================
+#
+#   mode           in                                         data out
+#   ────────────── ────────────────────────────────────────── ──────────────────────────
+#   call           session_id, turn, call: {id, name,          {status, content, truncated,
+#                  arguments}, manifest (tool-policy offerable  artifact_ref, sources,
+#                  entry), question, counts?, approval_token?,  elapsed_ms, audit, pending,
+#                  approved_pending_id?, budget_sec, config     job_request: null, warning}
+#   dry_run        manifest, arguments                         {validated, problems,
+#                                                               rendered_binding, would_require}
+#   read_artifact  session_id, artifact_ref, offset?, limit?   {content, next_offset, total}
+#
+#   status  ok | error | needs_approval | needs_input | needs_credential | denied |
+#           async_started. `error` results carry content "error: <code>: …" so
+#   the model can self-correct; the call's code is in audit.error.
+#
+# THE TOOL-CALL STATE MACHINE (§6.9.9), as one sequence that stops at the first verdict:
+#   parse        arguments: a JSON string (from the model) or a mapping
+#   validate     required keys, primitive types, enum (the enforced JSON Schema subset)
+#                → error invalid_arguments, returned to the model
+#   availability status enabled | deprecated (deprecated warns) → else error unavailable
+#   limits       counts.turn[name] ≥ policy.limits.per_turn, or counts.session[name] ≥
+#                per_session → error limit_exceeded
+#   authorise    effective_permission (tool-policy): deny → denied. guard
+#                check_tool_call (when config.guard.checks has it) may escalate auto →
+#                approve. approve needs approval_token == approved_pending_id + ':' +
+#                args_hash -- the hash of THESE arguments, so an approval can never be
+#                replayed for changed ones → else needs_approval with `pending`
+#   ask_user     the built-in → needs_input; the loop opens a user_input action
+#   dispatch     builtin (knowledge retrieve, builtin.now, read_artifact, memory recall /
+#                remember -- unavailable unless memory.long_term.enabled) | wfspec (`tool.*`, sync child) | activity
+#                (input_template rendered by tool-render, then tool-dispatch as a sync
+#                child) | mcp (tool-dispatch). Timeout = min(execution.timeout_sec,
+#                budget_sec - 2). Retried only when policy.idempotent, only on a
+#                transient error (timeout, 5xx, connection), up to retry.max_attempts
+#   async        execution.mode async (phase 3), AFTER authorise -- an approval is still
+#                asked in the turn: with allow_async → async_started + job_request
+#                {wfspec: agent-harness-tools/tool-job, input: {call, manifest, question, approval_token,
+#                approved_pending_id, turn}}, nothing dispatched; without it → error
+#                unavailable. tool-job calls again with run_now: the same approval token
+#                re-validates (it binds the id to THESE arguments), and the tool runs
+#                with the job's budget. The session starts the job (F6).
+#   config       a template's `config` is config.tools.config.<name> over
+#                config.tools.config['*'] (an agent's shared tool settings, e.g. one
+#                k8s connection for every k8s tool)
+#   shape        result.shape / result.sources rendered by tool-render
+#   artifact     content longer than result.max_chars is stored whole as
+#                session:<sid>:artifact:<id> (topic session-artifact, deleted with the
+#                session); the model gets the first max_chars and the artifact_ref
+#   screen       guard screen_content {source: tool}: neutralised, replaced on a likely
+#                injection (not for current_time / ask_user)
+#   audit        {turn, tool, version, args_hash, status, approved_by, grant_used,
+#                elapsed_ms, ts, error, warning}, ALWAYS returned
+#
+# AGENT LAYER (§4.1): it never writes a session row except artifacts (the session
+# writes the audit rows in commit_turn, F33) and never calls the Orchestration layer:
+# `pending` and the audit record are returned, the loop and the session act on them.
+# The tool.before hook runs in the loop, before this call.
+#
+# args_hash: there is no hash function in the sandbox, so two 61-bit polynomial
+# hashes (bases 31 and 37, mod 2^61 - 1) of the canonical JSON, as 32 hex digits.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-executor
+
+context:
+  valid_modes: ["call", "dry_run", "read_artifact"]
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  artifact_ref_pattern: "^art_[a-f0-9]{12}$"
+  json_type_checks: ["string", "number", "integer", "boolean", "array", "object"]
+  hash_mod: 2305843009213693951
+  dispatch_margin_sec: 2
+  default_read_limit: 4000
+  schema_version: 1
+  # Seeded: tasks are skipped on many paths.
+  ok: true
+  data:
+  error:
+  args: {}
+  parse_failed: false
+  verdict:
+  guard_result: {}
+  attempts: []
+  raw_result:
+  dispatch_error:
+  shaped:
+  shape_error:
+  rendered_input:
+  render_error:
+  rendered_summary:
+  rendered_sources: []
+  artifact_row:
+  screened: {}
+  artifact: {}
+  knowledge_result: {}
+  args_hash: ""
+  arg_problems: []
+  perm: deny
+  escalated: false
+  needs_ok: false
+  approved: false
+  check_guard: false
+  timeout_sec: 1
+  max_attempts: 1
+  tool_config: {}
+  full_content: ""
+  content: ""
+  truncated: false
+  artifact_ref:
+  sources: []
+  transient: false
+
+input:
+  mode: call
+  agent_id:
+  config: {}
+  resolved_refs: {}
+  session_id:
+  turn: 0
+  call: {}
+  manifest: {}
+  question: ""
+  counts: {}
+  approval_token:
+  approved_pending_id:
+  budget_sec: 30
+  # Async tools (§6.9.9, phase 3): the loop allows one background job per turn, in a
+  # profile with loop.async_tools; tool-job sets run_now to run the tool inside the job.
+  allow_async: false
+  run_now: false
+  # dry_run
+  arguments: {}
+  # read_artifact
+  artifact_ref:
+  offset: 0
+  limit:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "tool-executor: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: start
+      set:
+        - started_at: "{{ now() }}"
+        - m: "{{ manifest if isinstance(manifest, dict) else {} }}"
+        - tname: "{{ str(m.get('name') or (call or {}).get('name') or '') }}"
+        - pol: "{{ m.get('policy') or {} }}"
+        - binding: "{{ m.get('binding') or {} }}"
+        - bkind: "{{ next((k for k in ['builtin', 'wfspec', 'activity', 'mcp'] if k in binding), None) }}"
+        - builtin_module: "{{ ((binding.get('builtin') or {}).get('module')) if bkind == 'builtin' else None }}"
+        - sid: '{{ str(session_id or "").strip() }}'
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - sessions_ns: "agent.{{ agent_id }}.sessions"
+        - raw_args: "{{ (call or {}).get('arguments') if mode == 'call' else arguments }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # READ_ARTIFACT (also the read_artifact built-in, below)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-read-artifact
+      skip_if: "{{ mode != 'read_artifact' }}"
+      tasks:
+        - task_name: check-artifact-ref
+          set:
+            - _bad: >-
+                {{ 'session_id must match ' + session_id_pattern if not re.match(session_id_pattern, sid) else
+                   'artifact_ref must match ' + artifact_ref_pattern if not re.match(artifact_ref_pattern, str(artifact_ref or '')) else None }}
+            - ok: "{{ _bad is None }}"
+            - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+        - task_name: read-artifact-row
+          skip_if: "{{ not ok }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "session:{{ sid }}:artifact:{{ artifact_ref }}"}
+          output:
+            set:
+              - artifact: "{{ _ if isinstance(_, dict) else {} }}"
+        - task_name: page-artifact
+          skip_if: "{{ not ok }}"
+          set:
+            - _text: "{{ str(artifact.get('content') or '') }}"
+            - _off: "{{ max(0, int(offset or 0)) }}"
+            - _lim: "{{ max(1, min(int(limit or default_read_limit), 20000)) }}"
+            - ok: "{{ bool(artifact) }}"
+            - error: "{{ None if artifact else {'code': 'not_found', 'message': 'no artifact ' + str(artifact_ref) + ' in this session', 'retryable': False} }}"
+            - data: >-
+                {{ {'content': _text[_off:_off + _lim],
+                    'next_offset': (_off + _lim) if _off + _lim < len(_text) else None,
+                    'total': len(_text)} if artifact else None }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CALL / DRY_RUN — parse and validate the arguments
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: parse-arguments
+      skip_if: "{{ mode == 'read_artifact' }}"
+      set:
+        - args: >-
+            {{ raw_args if isinstance(raw_args, dict) else
+               {} if raw_args is None or str(raw_args).strip() == '' else json.loads(str(raw_args)) }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - parse_failed: true
+
+    - task_name: validate-arguments
+      skip_if: "{{ mode == 'read_artifact' }}"
+      set:
+        - _params: "{{ m.get('parameters') or {} }}"
+        - _props: "{{ _params.get('properties') or {} }}"
+        - arg_problems: >-
+            {{ ['arguments are not a JSON object'] if parse_failed or not isinstance(args, dict) else
+               ['missing required argument ' + r for r in (_params.get('required') or []) if r not in args]
+               + [k + ' must be ' + str(_props[k].get('type')) for k, v in args.items()
+                  if k in _props and not ((_props[k].get('type') not in json_type_checks)
+                     or (_props[k]['type'] == 'string' and isinstance(v, str))
+                     or (_props[k]['type'] == 'integer' and isinstance(v, int) and not isinstance(v, bool))
+                     or (_props[k]['type'] == 'number' and isinstance(v, (int, float)) and not isinstance(v, bool))
+                     or (_props[k]['type'] == 'boolean' and isinstance(v, bool))
+                     or (_props[k]['type'] == 'array' and isinstance(v, list))
+                     or (_props[k]['type'] == 'object' and isinstance(v, dict)))]
+               + [k + ' must be one of ' + ', '.join(json.dumps(e) for e in _props[k]['enum']) for k, v in args.items()
+                  if k in _props and isinstance(_props[k].get('enum'), list) and v not in _props[k]['enum']] }}
+        - _canon: "{{ json.dumps(args if isinstance(args, dict) else {}, sort_keys=True, separators=(',', ':'), default=str) }}"
+        - args_hash: >-
+            {{ '%016x%016x' % (sum(ord(c) * pow(31, i, hash_mod) for i, c in enumerate(_canon)) % hash_mod,
+                               sum(ord(c) * pow(37, i, hash_mod) for i, c in enumerate(_canon)) % hash_mod) }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DRY_RUN — render the binding, report what a call would need
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: dry-run-render
+      skip_if: "{{ mode != 'dry_run' or bkind != 'activity' or bool(arg_problems) }}"
+      workflow:
+        ref: tool-render
+        mode: inline
+        input:
+          template: "{{ (binding.get('activity') or {}).get('input_template') or {} }}"
+          args: "{{ args }}"
+          config: >-
+            {{ dict((((config or {}).get('tools') or {}).get('config') or {}).get('*') or {},
+                    **((((config or {}).get('tools') or {}).get('config') or {}).get(tname) or {})) }}
+          user_id: "{{ uid }}"
+      output:
+        set:
+          # merge_args (activity providers): the model's arguments are the input and
+          # the rendered template -- the admin's fixed values -- wins.
+          - rendered_input: >-
+              {{ dict(args or {}, **((_ or {}).get('rendered') or {})) if (binding.get('activity') or {}).get('merge_args') is True
+                 else (_ or {}).get('rendered') }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - render_error: "{{ str(_.get('error_message'))[:300] }}"
+
+    - task_name: shape-dry-run
+      skip_if: "{{ mode != 'dry_run' }}"
+      set:
+        - ok: true
+        - data: >-
+            {{ {'validated': not arg_problems and render_error is None,
+                'problems': arg_problems + ([('input_template: ' + render_error)] if render_error else []),
+                'rendered_binding': ({'activity': {'type': (binding.get('activity') or {}).get('type'), 'input': rendered_input}}
+                                     if bkind == 'activity' else binding),
+                'would_require': 'approve' if pol.get('permission') != 'auto' else 'auto'} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CALL — availability, limits, authorisation
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: pre-authorise
+      skip_if: "{{ mode != 'call' }}"
+      set:
+        - _counts: "{{ counts or {} }}"
+        - _lim: "{{ pol.get('limits') or {} }}"
+        - perm: "{{ m.get('effective_permission') or pol.get('permission') or 'deny' }}"
+        - verdict#: >-
+            {{ ('error', 'invalid_input', 'the call names ' + str((call or {}).get('name')) + ' but the manifest is ' + str(m.get('name')))
+                 if str((call or {}).get('name') or '') != str(m.get('name') or '') else
+               ('error', 'invalid_arguments', '; '.join(arg_problems)) if arg_problems else
+               ('error', 'unavailable', 'tool ' + tname + ' is ' + str(m.get('status')))
+                 if m.get('status') not in ['enabled', 'deprecated'] else
+               ('error', 'limit_exceeded', 'tool ' + tname + ' may be called ' + str(_lim.get('per_turn')) + ' times per turn')
+                 if _lim.get('per_turn') is not None and int(((_counts.get('turn') or {}).get(tname)) or 0) >= int(_lim['per_turn']) else
+               ('error', 'limit_exceeded', 'tool ' + tname + ' may be called ' + str(_lim.get('per_session')) + ' times per session')
+                 if _lim.get('per_session') is not None and int(((_counts.get('session') or {}).get(tname)) or 0) >= int(_lim['per_session']) else
+               ('denied', 'denied', 'tool ' + tname + ' is not allowed here') if perm == 'deny' else None }}
+        - check_guard: >-
+            {{ verdict is None and perm == 'auto' and pol.get('side_effects') != 'none'
+               and 'check_tool_call' in ((((config or {}).get('guard') or {}).get('checks')) or []) }}
+
+    - task_name: guard-tool-call
+      skip_if: "{{ mode != 'call' or not check_guard }}"
+      workflow:
+        ref: agent-harness-loop/guard
+        mode: inline
+        input:
+          mode: check_tool_call
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          resolved_refs: "{{ resolved_refs }}"
+          question: "{{ question }}"
+          tool: {name: "{{ tname }}", description: "{{ m.get('description') }}", side_effects: "{{ pol.get('side_effects') }}"}
+          arguments: "{{ args }}"
+      output:
+        set:
+          - guard_result: "{{ ((_ or {}).get('data') or {}) }}"
+
+    - task_name: authorise
+      skip_if: "{{ mode != 'call' or verdict is not None }}"
+      set:
+        - escalated#: "{{ bool(guard_result.get('escalate')) }}"
+        - needs_ok: "{{ perm == 'approve' or escalated }}"
+        - approved: >-
+            {{ needs_ok and approval_token is not None and approved_pending_id is not None
+               and str(approval_token) == str(approved_pending_id) + ':' + args_hash }}
+        - verdict: >-
+            {{ ('needs_approval', 'needs_approval', 'approval required') if needs_ok and not approved else
+               ('needs_input', 'needs_input', 'the assistant asked the user')
+                 if bkind == 'builtin' and builtin_module == 'loop' else None }}
+
+    - task_name: render-approval-summary
+      skip_if: "{{ mode != 'call' or verdict is None or verdict[0] != 'needs_approval' or not pol.get('approval_template') }}"
+      workflow:
+        ref: tool-render
+        mode: inline
+        input:
+          template: "{{ pol.get('approval_template') }}"
+          args: "{{ args }}"
+          config: >-
+            {{ dict((((config or {}).get('tools') or {}).get('config') or {}).get('*') or {},
+                    **((((config or {}).get('tools') or {}).get('config') or {}).get(tname) or {})) }}
+          user_id: "{{ uid }}"
+      output:
+        set:
+          - rendered_summary: "{{ (_ or {}).get('rendered') }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - rendered_summary:
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CALL — dispatch by binding
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-dispatch
+      skip_if: "{{ mode != 'call' or verdict is not None }}"
+      set:
+        - _left: "{{ int(budget_sec) - int((now() - started_at).total_seconds()) - dispatch_margin_sec }}"
+        - timeout_sec#: "{{ max(1, min(int(((m.get('execution') or {}).get('timeout_sec')) or 30), _left)) }}"
+        - max_attempts: >-
+            {{ max(1, int((((m.get('execution') or {}).get('retry') or {}).get('max_attempts')) or 1))
+               if pol.get('idempotent') is True else 1 }}
+        # The tool's own config section, over the agent's shared tool settings ('*').
+        - tool_config: >-
+            {{ dict((((config or {}).get('tools') or {}).get('config') or {}).get('*') or {},
+                    **((((config or {}).get('tools') or {}).get('config') or {}).get(tname) or {})) }}
+        - is_async#: "{{ ((m.get('execution') or {}).get('mode')) == 'async' and run_now is not True }}"
+        - verdict: >-
+            {{ ('async_started', 'async_started', tname + ' runs in the background') if is_async and allow_async is True else
+               ('error', 'unavailable', tname + ' runs as a background job, which is not available here '
+                                        '(only in profiles that allow it, and one job per turn)') if is_async else
+               ('error', 'timeout', 'no time left in the turn budget for ' + tname) if _left < 1 else
+               ('error', 'unavailable', 'memory tools need long-term memory, which this agent has not enabled')
+                 if bkind == 'builtin' and builtin_module == 'memory'
+                    and (((config or {}).get('memory') or {}).get('long_term') or {}).get('enabled') is not True else
+               ('error', 'unavailable', 'tool ' + tname + ' has no binding') if bkind is None else None }}
+
+    - task_name: render-input
+      skip_if: "{{ mode != 'call' or verdict is not None or bkind != 'activity' }}"
+      workflow:
+        ref: tool-render
+        mode: inline
+        input:
+          template: "{{ (binding.get('activity') or {}).get('input_template') or {} }}"
+          args: "{{ args }}"
+          config: "{{ tool_config }}"
+          user_id: "{{ uid }}"
+      output:
+        set:
+          # merge_args (activity providers): the model's arguments are the input and
+          # the rendered template -- the admin's fixed values -- wins.
+          - rendered_input: >-
+              {{ dict(args or {}, **((_ or {}).get('rendered') or {})) if (binding.get('activity') or {}).get('merge_args') is True
+                 else (_ or {}).get('rendered') }}
+      on_error:
+        catch: true
+        do:
+          set:
+            - verdict: "{{ ('error', 'invalid_template', 'input_template: ' + str(_.get('error_message'))[:300]) }}"
+
+    - task_name: builtin-knowledge
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module != 'knowledge' }}"
+      workflow:
+        ref: agent-harness-knowledge/knowledge
+        mode: inline
+        input:
+          mode: retrieve
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          sources: "{{ list(((config or {}).get('knowledge') or {}).get('sources') or []) }}"
+          query: "{{ str(args.get('query') or question or '') }}"
+          budget_sec: "{{ timeout_sec }}"
+      output:
+        set:
+          - knowledge_result: "{{ ((_ or {}).get('data') or {}) }}"
+          - raw_result: "{{ ((_ or {}).get('data') or {}).get('passages') or [] }}"
+
+    - task_name: builtin-artifact
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module != 'tool-executor' }}"
+      activity:
+        type: builtin.state.get_state
+        input:
+          in_global_ns: false
+          namespace: "{{ sessions_ns }}"
+          key: "session:{{ sid }}:artifact:{{ str(args.get('artifact_ref') or '') }}"
+      output:
+        set:
+          - _row: "{{ _ if isinstance(_, dict) else {} }}"
+          - _off: "{{ max(0, int(args.get('offset') or 0)) }}"
+          - _lim: "{{ max(1, min(int(args.get('limit') or default_read_limit), 20000)) }}"
+          - _text: "{{ str(_row.get('content') or '') }}"
+          - verdict: "{{ None if _row else ('error', 'not_found', 'no artifact ' + str(args.get('artifact_ref')) + ' in this session') }}"
+          - raw_result: >-
+              {{ (_text[_off:_off + _lim]
+                  + (('\n[more: call read_artifact with offset ' + str(_off + _lim) + ' of ' + str(len(_text)) + ']')
+                     if _off + _lim < len(_text) else '')) if _row else None }}
+
+    - task_name: builtin-memory-recall
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module != 'memory' or (binding.get('builtin') or {}).get('mode') != 'recall' }}"
+      workflow:
+        ref: agent-harness-memory/memory
+        mode: inline
+        input: {mode: recall, agent_id: "{{ agent_id }}", config: "{{ config }}", query: "{{ str(args.get('query') or question or '') }}", k: 5}
+      output:
+        set:
+          - _d: "{{ ((_ or {}).get('data') or {}) }}"
+          - raw_result: >-
+              {{ ['[' + str(i.get('kind')) + '] ' + str(i.get('title') or '') + ': ' + str(i.get('text') or '')
+                  for i in ((_d.get('profile') or []) + (_d.get('items') or [])) if isinstance(i, dict)] or ['Nothing remembered about that.'] }}
+          - verdict: "{{ None if (_ or {}).get('ok') else ('error', 'tool_failed', str(((_ or {}).get('error') or {}).get('message') or 'recall failed')) }}"
+
+    - task_name: builtin-memory-remember
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module != 'memory' or (binding.get('builtin') or {}).get('mode') != 'remember' }}"
+      workflow:
+        ref: agent-harness-memory/memory
+        mode: inline
+        input: {mode: remember, agent_id: "{{ agent_id }}", config: "{{ config }}", session_id: "{{ sid }}", statement: "{{ str(args.get('text') or '') }}", kind: "{{ args.get('kind') or 'fact' }}"}
+      output:
+        set:
+          - raw_result: >-
+              {{ ('Remembered (' + str(((_ or {}).get('data') or {}).get('verdict')) + ').') if (_ or {}).get('ok') else None }}
+          - verdict: "{{ None if (_ or {}).get('ok') else ('error', 'tool_failed', str(((_ or {}).get('error') or {}).get('message') or 'remember failed')) }}"
+
+    - task_name: builtin-now
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module != 'builtin.now' }}"
+      set:
+        - raw_result: "{{ now().isoformat() }}"
+
+    # wfspec / activity / mcp: up to max_attempts tries; only a transient error retries.
+    - task_name: dispatch-attempts
+      skip_if: "{{ mode != 'call' or verdict is not None or bkind not in ['wfspec', 'activity', 'mcp'] }}"
+      loop:
+        in: "{{ list(range(max_attempts)) }}"
+        foreach: attempt
+        do:
+          tasks:
+            - task_name: dispatch-wfspec
+              skip_if: "{{ bkind != 'wfspec' }}"
+              workflow:
+                ref: "{{ (binding.get('wfspec') or {}).get('name') }}"
+                mode: sync
+                input:
+                  args: "{{ args }}"
+                  config: "{{ tool_config }}"
+                  user_id: "{{ uid }}"
+                  question: "{{ question }}"
+                  # The manifest's binding.wfspec: a generic tool wfspec (tool.mcp-call)
+                  # reads its target from it. Others ignore it (undeclared inputs are fine).
+                  binding: "{{ binding.get('wfspec') or {} }}"
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ timeout_sec }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - raw_result: "{{ _ }}"
+                  - dispatch_error:
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - dispatch_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:400] }}"
+
+            - task_name: dispatch-activity
+              skip_if: "{{ bkind not in ['activity', 'mcp'] }}"
+              workflow:
+                ref: tool-dispatch
+                mode: sync
+                input:
+                  kind: "{{ bkind }}"
+                  activity_type: "{{ (binding.get('activity') or {}).get('type') }}"
+                  input: "{{ rendered_input }}"
+                  endpoint: "{{ (binding.get('mcp') or {}).get('endpoint') }}"
+                  tool_name: "{{ (binding.get('mcp') or {}).get('tool_name') }}"
+                  arguments: "{{ args }}"
+                options:
+                  retry_policy:
+                    timeout_sec: "{{ timeout_sec }}"
+                    max_attempts: 1
+              output:
+                set:
+                  - raw_result: "{{ (_ or {}).get('result') }}"
+                  - dispatch_error:
+              on_error:
+                catch: true
+                do:
+                  set:
+                    - dispatch_error: "{{ str(_.get('error_type')) + ': ' + str(_.get('error_message'))[:400] }}"
+
+            - task_name: record-attempt
+              set:
+                - transient: >-
+                    {{ dispatch_error is not None
+                       and bool(re.search(r'(?i)timeout|timed out|\b5\d\d\b|connect|temporar|unavailable|reset by peer', dispatch_error)) }}
+                - attempts: "{{ attempts + [{'attempt': attempt + 1, 'error': dispatch_error}] }}"
+
+            - task_name: stop-retrying
+              raise:
+                if: "{{ dispatch_error is None or not transient }}"
+                type: break
+
+    - task_name: settle-dispatch
+      skip_if: "{{ mode != 'call' or verdict is not None or bkind not in ['wfspec', 'activity', 'mcp'] }}"
+      set:
+        - verdict: >-
+            {{ None if dispatch_error is None else
+               ('error', 'timeout' if re.search(r'(?i)timeout|timed out', dispatch_error) else 'tool_failed', dispatch_error) }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CALL — shape, artifact, screen
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: shape-result
+      skip_if: "{{ mode != 'call' or verdict is not None or not ((m.get('result') or {}).get('shape')) }}"
+      workflow:
+        ref: tool-render
+        mode: inline
+        input:
+          template: "{{ (m.get('result') or {}).get('shape') }}"
+          args: "{{ args }}"
+          result: "{{ raw_result }}"
+          config: "{{ tool_config }}"
+          user_id: "{{ uid }}"
+      output:
+        set:
+          - shaped: "{{ (_ or {}).get('rendered') }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - verdict: "{{ ('error', 'invalid_template', 'result.shape: ' + str(_.get('error_message'))[:300]) }}"
+
+    - task_name: render-sources
+      skip_if: "{{ mode != 'call' or verdict is not None or not ((m.get('result') or {}).get('sources')) }}"
+      workflow:
+        ref: tool-render
+        mode: inline
+        input:
+          template: "{{ (m.get('result') or {}).get('sources') }}"
+          args: "{{ args }}"
+          result: "{{ raw_result }}"
+          config: "{{ tool_config }}"
+          user_id: "{{ uid }}"
+      output:
+        set:
+          - rendered_sources: "{{ [s for s in ((_ or {}).get('rendered') or []) if isinstance(s, dict)] }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - rendered_sources: []
+
+    - task_name: plan-content
+      skip_if: "{{ mode != 'call' or verdict is not None }}"
+      set:
+        - _value: "{{ shaped if (m.get('result') or {}).get('shape') else raw_result }}"
+        # knowledge_search reads like the rag fence: numbered passages.
+        - full_content: >-
+            {{ '\n\n'.join('[' + str(p.get('n')) + '] ' + str(p.get('title') or p.get('source') or '') + '\n' + str(p.get('text') or '')
+                           for p in (_value or []) if isinstance(p, dict))
+                 if builtin_module == 'knowledge' else
+               '\n'.join(str(x) for x in (_value or []))
+                 if builtin_module == 'memory' and isinstance(_value, list) else
+               _value if isinstance(_value, str) else
+               json.dumps(_value, sort_keys=True, default=str, ensure_ascii=False) }}
+        - _max: "{{ int(((m.get('result') or {}).get('max_chars')) or 8000) }}"
+        - truncated: "{{ len(full_content) > _max and builtin_module != 'tool-executor' }}"
+        - artifact_ref: "{{ ('art_' + str(uuid4()).replace('-', '')[:12]) if truncated else None }}"
+        - artifact_row: >-
+            {{ {'schema_version': schema_version, 'id': artifact_ref, 'tool': tname, 'turn': turn,
+                'call_id': (call or {}).get('id'), 'content': full_content, 'created_at': now().isoformat()}
+               if truncated else None }}
+        - content: >-
+            {{ (full_content[:_max] + '\n[truncated: ' + str(len(full_content)) + ' chars in all; call read_artifact with '
+                + 'artifact_ref ' + str(artifact_ref) + ' and offset ' + str(_max) + ' for more]') if truncated else full_content }}
+        - sources: >-
+            {{ [{'title': p.get('title'), 'url': p.get('url'), 'source': p.get('source')}
+                for p in (raw_result or []) if isinstance(p, dict)] if builtin_module == 'knowledge' else rendered_sources }}
+
+    - task_name: write-artifact
+      skip_if: "{{ mode != 'call' or verdict is not None or artifact_row is None }}"
+      activity:
+        type: builtin.state.set_state
+        input:
+          in_global_ns: false
+          namespace: "{{ sessions_ns }}"
+          key: "session:{{ sid }}:artifact:{{ artifact_ref }}"
+          value: "{{ artifact_row }}"
+          topic: session-artifact
+
+    - task_name: screen-result
+      skip_if: "{{ mode != 'call' or verdict is not None or builtin_module in ['builtin.now'] or not content }}"
+      workflow:
+        ref: agent-harness-loop/guard
+        mode: inline
+        input:
+          mode: screen_content
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          resolved_refs: "{{ resolved_refs }}"
+          items: [{text: "{{ content }}", n: 1}]
+          source: tool
+      output:
+        set:
+          - screened: "{{ ((_ or {}).get('data') or {}) }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CALL — the result and its audit record
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: shape-call
+      skip_if: "{{ mode != 'call' }}"
+      set:
+        - _item: "{{ ((screened.get('items') or [{}])[0]) if screened else {} }}"
+        - status#: "{{ 'ok' if verdict is None else verdict[0] }}"
+        - _final: >-
+            {{ (str(_item.get('text')) if _item.get('text') is not None else content) if verdict is None else
+               ('error: ' + verdict[1] + ': ' + verdict[2]) if verdict[0] == 'error' else
+               ('denied: ' + verdict[2]) if verdict[0] == 'denied' else
+               ('started: ' + str(m.get('title') or tname) + ' is running in the background as a job. Its result will be '
+                'posted to this conversation when it is ready; tell the user so, and do not wait for it.')
+                 if verdict[0] == 'async_started' else '' }}
+        - _warning: "{{ ('tool ' + tname + ' is deprecated' + ((', use ' + str(m.get('deprecated_by'))) if m.get('deprecated_by') else '')) if m.get('status') == 'deprecated' else None }}"
+        - _elapsed: "{{ int((now() - started_at).total_seconds() * 1000) }}"
+        - _summary: >-
+            {{ str(rendered_summary) if rendered_summary else
+               'Run ' + str(m.get('title') or tname) + ' with ' + json.dumps(args, sort_keys=True, default=str) + '?' }}
+        - ok: true
+        - data: >-
+            {{ {'status': status,
+                'content': _final,
+                'truncated': bool(verdict is None and truncated),
+                'artifact_ref': artifact_ref if verdict is None else None,
+                'sources': sources if verdict is None else [],
+                'elapsed_ms': _elapsed,
+                'warning': _warning,
+                'screen': {'action': _item.get('action'), 'injection_p': _item.get('injection_p'),
+                           'degraded': screened.get('degraded')} if screened else None,
+                'pending': ({'kind': 'tool_call', 'summary': _summary,
+                             'detail': {'call': {'id': (call or {}).get('id'), 'name': tname, 'arguments': args},
+                                        'args_hash': args_hash, 'call_version': m.get('version'),
+                                        'side_effects': pol.get('side_effects'), 'escalated': escalated},
+                             'offer_session_grant': pol.get('allow_session_grant') is True and not escalated}
+                            if status == 'needs_approval' else
+                            {'kind': 'user_input', 'summary': str(args.get('question') or ''),
+                             'detail': {'call': {'id': (call or {}).get('id'), 'name': tname, 'arguments': args},
+                                        'args_hash': args_hash}}
+                            if status == 'needs_input' else None),
+                'job_request': ({'wfspec': 'agent-harness-tools/tool-job',
+                                 'summary': str(m.get('title') or tname) + ' ' + json.dumps(args, sort_keys=True, default=str)[:160],
+                                 'input': {'call': {'id': (call or {}).get('id'), 'name': tname, 'arguments': args},
+                                           'manifest': m, 'question': question, 'turn': turn,
+                                           'approval_token': approval_token if approved else None,
+                                           'approved_pending_id': approved_pending_id if approved else None}}
+                                if status == 'async_started' else None),
+                'audit': {'turn': turn, 'tool': tname, 'version': m.get('version'), 'call_id': (call or {}).get('id'),
+                          'args_hash': args_hash, 'status': status,
+                          'approved_by': uid if approved else None,
+                          'grant_used': bool(m.get('grant_used')), 'elapsed_ms': _elapsed,
+                          'ts': now().isoformat(), 'attempts': len(attempts) or None,
+                          'error': ({'code': verdict[1], 'message': verdict[2]} if verdict is not None and verdict[0] in ['error', 'denied'] else None),
+                          'truncated': bool(verdict is None and truncated), 'warning': _warning}} }}

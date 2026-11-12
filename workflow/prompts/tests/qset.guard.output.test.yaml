@@ -1,0 +1,19 @@
+test_type: integration-test
+
+wfspec:
+  name: qset.guard.output
+
+test_cases:
+  - id: with-passages-both-questions-are-asked
+    input: {question: "how?", answer: "like this [1]", passages: [{n: 1, text: "doc text"}]}
+    expect:
+      assert:
+        - "{{ sorted(questions) == ['answered', 'grounded'] }}"
+        - "{{ state == 'Question: how?\\n\\nAnswer: like this [1]\\n\\nSource passages:\\n[1] doc text' }}"
+        - "{{ all(q.get('instructions') for q in questions.values()) }}"
+
+  - id: without-passages-only-answered-is-asked
+    input: {question: "hi", answer: "hello", passages: []}
+    expect:
+      assert:
+        - "{{ sorted(questions) == ['answered'] and 'Source passages' not in state }}"

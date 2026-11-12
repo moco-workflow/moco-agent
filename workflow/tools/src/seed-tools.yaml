@@ -1,0 +1,234 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SEED-TOOLS — install an agent package's tool manifests and toolsets (§6.16)
+# ================================================================================
+#
+#   in         out
+#   ────────── ──────────────────────────────────────────────────────────────────
+#   agent_id   {ok, data: {source, toolsets: [{name, ok, error}],
+#                          tools: [{name, action: unchanged|enabled|failed, status, error}]},
+#               error}
+#
+# Run at deploy (scripts/dev-stage.sh) and by an admin. An agent package that offers
+# tools ships them as DATA: a wfspec `tools.<agent_id>` whose output is
+# {tools: [manifest], toolsets: [toolset]} -- no logic wfspecs (design §16). Each
+# toolset is written with tool-registry save_toolset and each tool with save →
+# validate, all at AGENT scope (namespace agent.<id>). The harness built-ins need no
+# seeding: they are tool-catalog data, merged into every read.
+#
+# IDEMPOTENT. A tool that is already `enabled` and whose stored manifest holds every
+# authored field unchanged (mappings compared key by key, since save fills
+# defaults) is left alone -- a redeploy does not bump versions and so does not
+# disturb a held approval (§6.9.5 versioning). A tool that fails validation stays a
+# draft (never offered) and its problems are reported.
+#
+# AUTHORITY: the caller, through tool-registry → access (agent-scope writes need an
+# admin: admin_user_ids or a namespace admin, F48). config comes from agent-config
+# resolve, so the agent's own access lists decide.
+#
+# Last, it installs the harness's offline jobs as platform schedules (agent-schedules,
+# plan-17 step 1). They run as this caller, the deploying admin. A failed install is
+# reported in `data.schedules`; it does not fail the tool seeding.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: seed-tools
+
+context:
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  cfg_result: {}
+  cat_agent: {}
+  seed: {}
+  toolset_results: []
+  schedules_result: {}
+  tool_results: []
+  saved_tool: {}
+  validated_tool: {}
+  stored_tool: {}
+  tool_unchanged: false
+  ok: false
+  data:
+  error:
+
+input:
+  agent_id:
+  # false skips the schedule install (an agent seeded on its own, after the harness).
+  install_schedules: true
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: check-agent
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - valid: "{{ bool(re.match(agent_id_pattern, aid)) }}"
+        - seed_name: "tools.{{ aid }}"
+        - error: "{{ None if valid else {'code': 'invalid_input', 'message': 'agent_id must match ' + agent_id_pattern, 'retryable': False} }}"
+
+    - task_name: resolve-config
+      skip_if: "{{ not valid }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ aid }}"}
+      output:
+        set:
+          - cfg_result: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: catalog-agent
+      skip_if: "{{ not valid or cfg_result.get('ok') != True }}"
+      workflow:
+        ref: agent-harness-foundation/package-catalog
+        mode: sync
+        input: {package_name: "agent-{{ aid }}"}
+        options:
+          retry_policy: {timeout_sec: 60, max_attempts: 1}
+      output:
+        set:
+          - cat_agent: "{{ _ or {} }}"
+
+    - task_name: plan-seed
+      set:
+        - config: "{{ ((cfg_result.get('data') or {}).get('config')) or {} }}"
+        - has_seed#: "{{ valid and cfg_result.get('ok') == True and seed_name in (cat_agent.get('wfspecs') or []) }}"
+        - error: >-
+            {{ error if not valid else
+               {'code': 'config_failed', 'message': 'cannot resolve config for ' + aid + ': ' + str(cfg_result.get('error')), 'retryable': False}
+                 if cfg_result.get('ok') != True else None }}
+
+    - task_name: load-seed
+      skip_if: "{{ not has_seed }}"
+      workflow:
+        ref: "agent-{{ aid }}/{{ seed_name }}"
+        mode: inline
+      output:
+        set:
+          - seed: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: save-toolsets
+      skip_if: "{{ not has_seed or not (seed.get('toolsets') or []) }}"
+      loop:
+        in: "{{ [t for t in (seed.get('toolsets') or []) if isinstance(t, dict)] }}"
+        foreach: toolset_def
+        do:
+          task_name: save-toolset
+          workflow:
+            ref: tool-registry
+            mode: inline
+            input:
+              mode: save_toolset
+              agent_id: "{{ aid }}"
+              scope: agent
+              toolset: "{{ toolset_def }}"
+              definition_access: "{{ config.get('access') or {} }}"
+      output:
+        set:
+          - toolset_results: >-
+              {{ [{'name': d.get('name'), 'ok': (r or {}).get('ok') == True, 'error': (r or {}).get('error')}
+                  for d, r in zip([t for t in (seed.get('toolsets') or []) if isinstance(t, dict)], _ or [])] }}
+
+    - task_name: seed-each-tool
+      skip_if: "{{ not has_seed or not (seed.get('tools') or []) }}"
+      loop:
+        in: "{{ [t for t in (seed.get('tools') or []) if isinstance(t, dict) and t.get('name')] }}"
+        foreach: manifest_def
+        do:
+          tasks:
+            - task_name: read-stored-tool
+              workflow:
+                ref: tool-registry
+                mode: inline
+                input: {mode: get, agent_id: "{{ aid }}", name: "{{ manifest_def['name'] }}", scope: agent}
+              output:
+                set:
+                  - stored_tool: "{{ ((_ or {}).get('data') or {}).get('tool') or {} }}"
+
+            - task_name: compare-tool
+              set:
+                - tool_unchanged: >-
+                    {{ stored_tool.get('status') == 'enabled'
+                       and all((isinstance(v, dict) and isinstance(stored_tool.get(k), dict)
+                                and all(stored_tool[k].get(kk) == vv for kk, vv in v.items()))
+                               or stored_tool.get(k) == v
+                               for k, v in manifest_def.items()) }}
+
+            - task_name: save-tool
+              skip_if: "{{ tool_unchanged }}"
+              workflow:
+                ref: tool-registry
+                mode: inline
+                input:
+                  mode: save
+                  agent_id: "{{ aid }}"
+                  name: "{{ manifest_def['name'] }}"
+                  scope: agent
+                  manifest: "{{ manifest_def }}"
+                  definition_access: "{{ config.get('access') or {} }}"
+              output:
+                set:
+                  - saved_tool: "{{ _ or {} }}"
+
+            - task_name: validate-tool
+              skip_if: "{{ tool_unchanged or saved_tool.get('ok') != True }}"
+              workflow:
+                ref: tool-registry
+                mode: inline
+                input:
+                  mode: validate
+                  agent_id: "{{ aid }}"
+                  name: "{{ manifest_def['name'] }}"
+                  scope: agent
+                  definition_access: "{{ config.get('access') or {} }}"
+              output:
+                set:
+                  - validated_tool: "{{ _ or {} }}"
+
+            - task_name: record-tool
+              set:
+                - tool_results: >-
+                    {{ tool_results + [
+                         {'name': manifest_def['name'], 'action': 'unchanged', 'status': 'enabled', 'error': None}
+                           if tool_unchanged else
+                         {'name': manifest_def['name'], 'action': 'failed', 'status': 'draft' if saved_tool.get('ok') else None,
+                          'error': (validated_tool.get('error') if saved_tool.get('ok') else saved_tool.get('error'))}
+                           if saved_tool.get('ok') != True or validated_tool.get('ok') != True else
+                         {'name': manifest_def['name'], 'action': 'enabled', 'status': 'enabled', 'error': None}] }}
+                - saved_tool: {}
+                - validated_tool: {}
+
+    # Install (or refresh) the harness's schedules: idempotent, keeps what an admin
+    # paused or resumed (agent-schedules). Runs as this caller -- the deploying admin.
+    - task_name: install-schedules
+      skip_if: "{{ install_schedules is not True }}"
+      workflow:
+        ref: agent-harness-ops/agent-schedules
+        mode: inline
+        input: {mode: install}
+      on_error:
+        catch: true
+        do:
+          set:
+            - schedules_result: "{{ {'ok': False, 'error': {'code': 'schedules_failed', 'message': _['error_message'], 'retryable': True}} }}"
+      output:
+        set:
+          - schedules_result: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: shape-report
+      set:
+        - ok: "{{ error is None and all(t['ok'] for t in toolset_results) and all(t['action'] != 'failed' for t in tool_results) }}"
+        - error: >-
+            {{ error if error is not None else
+               {'code': 'seed_failed', 'message': 'some tools or toolsets were not installed (see data)', 'retryable': False}
+                 if not ok else None }}
+        - data: >-
+            {{ None if not valid else
+               dict({'source': ('agent-' + aid + '/' + seed_name) if has_seed else None,
+                     'toolsets': toolset_results, 'tools': tool_results},
+                    **({'schedules': {'ok': schedules_result.get('ok'), 'error': schedules_result.get('error'),
+                                      'jobs': (schedules_result.get('data') or {}).get('jobs')}}
+                       if schedules_result else {})) }}

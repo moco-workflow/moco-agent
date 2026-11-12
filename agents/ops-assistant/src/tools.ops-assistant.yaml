@@ -1,0 +1,226 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOLS.OPS-ASSISTANT — ops-assistant's tool manifests and toolset, as DATA (§16)
+# ================================================================================
+# Installed at agent scope by the harness's `seed-tools` (deploy). No logic
+# wfspecs: every tool is an `activity` binding over the allowlisted k8s.get /
+# k8s.list. The cluster connection is deployment data, read by the templates from
+# `config` = the definition's tools.config['*'] (secret NAMES only, §4.3):
+#   {api_server, token_secret_key, ca_cert_secret_key?, namespace?}
+# credential.mode: service, secret global/K8S_TOKEN -- tool-registry validate checks
+# that the global secret exists, so the tools stay drafts (never offered) until an
+# operator stores it.
+#
+# k8s_get_secret is a READ that needs approval: a human says yes before the
+# assistant sees a Secret, which is the toolset's approve-and-resume path.
+# `#literal`: the templates are rendered by tool-executor, not by this data wfspec.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: tools.ops-assistant
+
+context:
+  toolsets:
+    - name: k8s-readonly
+      description: "Read-only Kubernetes: pods, deployments, events, and secrets with approval."
+      tools: [k8s_list_pods, k8s_get_deployment, k8s_list_deployments, k8s_list_events, k8s_get_secret]
+      always_offer: [k8s_list_pods]
+
+  tools#literal:
+    - name: k8s_list_pods
+      title: List pods
+      description: >-
+        List the pods in a Kubernetes namespace with their phase, readiness, restarts and node.
+        Use it for "what is running", "is X up", "why is my pod crashing" questions.
+      parameters:
+        type: object
+        properties:
+          namespace: {type: string, description: "The namespace; the cluster default when omitted."}
+          label_selector: {type: string, description: "e.g. app=web"}
+          limit: {type: integer, description: "At most this many pods (default 50)."}
+      examples: [{args: {namespace: staging, label_selector: app=web}, note: "pods of the web app in staging"}]
+      binding:
+        activity:
+          type: k8s.list
+          input_template:
+            connection:
+              api_server: "{{ config['api_server'] }}"
+              token_secret_key: "{{ config['token_secret_key'] }}"
+              ca_cert_secret_key: "{{ config.get('ca_cert_secret_key') }}"
+              namespace: "{{ config.get('namespace') or 'default' }}"
+            namespace: "{{ args.get('namespace') or config.get('namespace') or 'default' }}"
+            api_version: v1
+            kind: Pod
+            label_selector: "{{ args.get('label_selector') }}"
+            limit: "{{ args.get('limit') or 50 }}"
+      result:
+        shape: >-
+          {{ [{'name': i['metadata']['name'], 'phase': (i.get('status') or {}).get('phase'),
+               'ready': sum(1 for c in ((i.get('status') or {}).get('containerStatuses') or []) if c.get('ready')),
+               'containers': len(((i.get('spec') or {}).get('containers') or [])),
+               'restarts': sum(int(c.get('restartCount') or 0) for c in ((i.get('status') or {}).get('containerStatuses') or [])),
+               'node': (i.get('spec') or {}).get('nodeName')} for i in (result.get('items') or [])] }}
+        max_chars: 6000
+      credential: {mode: service, secret_key: global/K8S_TOKEN, connect_hint: "An operator must store the cluster token as global secret K8S_TOKEN."}
+      policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 4, per_session: 60}}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+      tags: [k8s, kubernetes, pods, running, crash, restart, status]
+      toolsets: [k8s-readonly]
+
+    - name: k8s_get_deployment
+      title: Get deployment
+      description: "Show one deployment: desired, ready and available replicas, image and rollout conditions."
+      parameters:
+        type: object
+        properties:
+          name: {type: string}
+          namespace: {type: string}
+        required: [name]
+      examples: [{args: {name: web, namespace: staging}, note: "status of deployment web"}]
+      binding:
+        activity:
+          type: k8s.get
+          input_template:
+            connection:
+              api_server: "{{ config['api_server'] }}"
+              token_secret_key: "{{ config['token_secret_key'] }}"
+              ca_cert_secret_key: "{{ config.get('ca_cert_secret_key') }}"
+              namespace: "{{ config.get('namespace') or 'default' }}"
+            namespace: "{{ args.get('namespace') or config.get('namespace') or 'default' }}"
+            api_version: apps/v1
+            kind: Deployment
+            name: "{{ args['name'] }}"
+            not_found_ok: true
+      result:
+        shape: >-
+          {{ {'found': False, 'name': result.get('name')} if not result.get('found') else
+             {'name': result['resource']['metadata']['name'],
+              'replicas': (result['resource'].get('spec') or {}).get('replicas'),
+              'ready': (result['resource'].get('status') or {}).get('readyReplicas', 0),
+              'available': (result['resource'].get('status') or {}).get('availableReplicas', 0),
+              'images': [c.get('image') for c in (((result['resource'].get('spec') or {}).get('template') or {}).get('spec') or {}).get('containers') or []],
+              'conditions': [{'type': c.get('type'), 'status': c.get('status'), 'reason': c.get('reason')}
+                             for c in ((result['resource'].get('status') or {}).get('conditions') or [])]} }}
+        max_chars: 4000
+      credential: {mode: service, secret_key: global/K8S_TOKEN, connect_hint: "An operator must store the cluster token as global secret K8S_TOKEN."}
+      policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 4, per_session: 60}}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+      tags: [k8s, kubernetes, deployment, rollout, replicas, image]
+      toolsets: [k8s-readonly]
+
+    - name: k8s_list_deployments
+      title: List deployments
+      description: "List the deployments in a namespace with ready / desired replicas."
+      parameters:
+        type: object
+        properties:
+          namespace: {type: string}
+      binding:
+        activity:
+          type: k8s.list
+          input_template:
+            connection:
+              api_server: "{{ config['api_server'] }}"
+              token_secret_key: "{{ config['token_secret_key'] }}"
+              ca_cert_secret_key: "{{ config.get('ca_cert_secret_key') }}"
+              namespace: "{{ config.get('namespace') or 'default' }}"
+            namespace: "{{ args.get('namespace') or config.get('namespace') or 'default' }}"
+            api_version: apps/v1
+            kind: Deployment
+            limit: 100
+      result:
+        shape: >-
+          {{ [{'name': i['metadata']['name'], 'replicas': (i.get('spec') or {}).get('replicas'),
+               'ready': (i.get('status') or {}).get('readyReplicas', 0)} for i in (result.get('items') or [])] }}
+        max_chars: 4000
+      credential: {mode: service, secret_key: global/K8S_TOKEN, connect_hint: "An operator must store the cluster token as global secret K8S_TOKEN."}
+      policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 4, per_session: 60}}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+      tags: [k8s, kubernetes, deployments, list]
+      toolsets: [k8s-readonly]
+
+    - name: k8s_list_events
+      title: List events
+      description: "Recent events in a namespace (warnings first): scheduling failures, image pulls, OOM kills, probes."
+      parameters:
+        type: object
+        properties:
+          namespace: {type: string}
+          field_selector: {type: string, description: "e.g. involvedObject.name=web-7d9f"}
+      binding:
+        activity:
+          type: k8s.list
+          input_template:
+            connection:
+              api_server: "{{ config['api_server'] }}"
+              token_secret_key: "{{ config['token_secret_key'] }}"
+              ca_cert_secret_key: "{{ config.get('ca_cert_secret_key') }}"
+              namespace: "{{ config.get('namespace') or 'default' }}"
+            namespace: "{{ args.get('namespace') or config.get('namespace') or 'default' }}"
+            api_version: v1
+            kind: Event
+            field_selector: "{{ args.get('field_selector') }}"
+            limit: 100
+      result:
+        shape: >-
+          {{ sorted([{'type': i.get('type'), 'reason': i.get('reason'), 'object': (i.get('involvedObject') or {}).get('name'),
+                      'message': str(i.get('message') or '')[:200], 'count': i.get('count'), 'last': i.get('lastTimestamp')}
+                     for i in (result.get('items') or [])], key=lambda e: (e['type'] != 'Warning', str(e['last'] or '')))[:40] }}
+        max_chars: 6000
+      credential: {mode: service, secret_key: global/K8S_TOKEN, connect_hint: "An operator must store the cluster token as global secret K8S_TOKEN."}
+      policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 3, per_session: 40}}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+      tags: [k8s, kubernetes, events, warning, crash, oom, failing, pending]
+      toolsets: [k8s-readonly]
+
+    - name: k8s_get_secret
+      title: Read a secret's keys
+      description: >-
+        Show which keys a Kubernetes Secret holds and their sizes (never the values).
+      parameters:
+        type: object
+        properties:
+          name: {type: string}
+          namespace: {type: string}
+        required: [name]
+      binding:
+        activity:
+          type: k8s.get
+          input_template:
+            connection:
+              api_server: "{{ config['api_server'] }}"
+              token_secret_key: "{{ config['token_secret_key'] }}"
+              ca_cert_secret_key: "{{ config.get('ca_cert_secret_key') }}"
+              namespace: "{{ config.get('namespace') or 'default' }}"
+            namespace: "{{ args.get('namespace') or config.get('namespace') or 'default' }}"
+            api_version: v1
+            kind: Secret
+            name: "{{ args['name'] }}"
+            not_found_ok: true
+      result:
+        # Keys and sizes only: a Secret's values never reach the model.
+        shape: >-
+          {{ {'found': False, 'name': result.get('name')} if not result.get('found') else
+             {'name': result['resource']['metadata']['name'], 'type': result['resource'].get('type'),
+              'keys': {k: len(str(v)) for k, v in (result['resource'].get('data') or {}).items()}} }}
+        max_chars: 2000
+      credential: {mode: service, secret_key: global/K8S_TOKEN, connect_hint: "An operator must store the cluster token as global secret K8S_TOKEN."}
+      policy:
+        side_effects: read
+        permission: approve
+        idempotent: true
+        allow_session_grant: false
+        approval_template: "Read the keys of secret {{ args['name'] }} in namespace {{ args.get('namespace') or config.get('namespace') or 'default' }}?"
+        limits: {per_turn: 2, per_session: 10}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+      tags: [k8s, kubernetes, secret, credentials, keys]
+      toolsets: [k8s-readonly]
+
+output:
+  tools: "{{ tools }}"
+  toolsets: "{{ toolsets }}"
+
+main:
+  task_name: emit-tools
+  set:
+    - _loaded: true

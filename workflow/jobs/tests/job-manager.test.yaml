@@ -1,0 +1,233 @@
+test_type: integration-test
+
+# job-manager (plan-13, design §6.12): start (limit, row then entity, a failed
+# start fails the row), report (row first; no event when the row refuses; wake for
+# pending/complete, plain signal for progress), send, cancel (by event, by row when
+# the entity is gone, a finished job), reconcile.
+
+wfspec:
+  name: job-manager
+
+test_data:
+  created: &created
+    {ok: true, data: {job: {schema_version: 1, job_id: job-x, session_id: s1, status: queued}}, error: null}
+
+test_cases:
+
+  # ── start ───────────────────────────────────────────────────────────────
+  - id: start-writes-the-row-then-starts-the-entity
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder, wfspec: subagent.builder, job_input: {query: "build it"}, summary: "build it", config: {limits: {max_async_jobs: 1}}}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: []}}}
+      - {step_name: create-row, _: *created}
+      - {step_name: start-entity, _: {sent: true}}
+      - {step_name: fail-unstarted, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['job_id'].startswith('job-') and len(data['job_id']) == 16 }}"
+        - "{{ data['workflow_id'].startswith('agent-job-ops-') and data['workflow_id'].endswith('-' + data['job_id']) }}"
+
+  - id: start-over-the-limit-is-limit-exceeded-and-writes-nothing
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder, wfspec: subagent.builder, config: {limits: {max_async_jobs: 1}}}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: [{job_id: job-old, status: running}]}}}
+      - {step_name: create-row, _: "{{ 1 / 0 }}"}
+      - {step_name: start-entity, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: limit_exceeded, message: "a background job is already running in this session (job-old)", retryable: false}
+
+  - id: the-limit-comes-from-config
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder, wfspec: subagent.builder, config: {limits: {max_async_jobs: 2}}}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: [{job_id: job-old, status: running}]}}}
+      - {step_name: create-row, _: *created}
+      - {step_name: start-entity, _: {sent: true}}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+
+  - id: start-without-a-wfspec-is-invalid-input
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: []}}}
+      - {step_name: create-row, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_input, message: "start needs a session_id, a profile and a wfspec", retryable: false}
+
+  - id: an-entity-that-cannot-start-fails-the-row
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder, wfspec: subagent.builder}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: []}}}
+      - {step_name: create-row, _: *created}
+      - {step_name: start-entity, _: {sent: false}}
+      - {step_name: fail-unstarted, _: {ok: true}}
+    expect:
+      output:
+        - error: {code: start_failed, message: "the job entity could not be started", retryable: true}
+
+  - id: a-row-that-cannot-be-written-starts-nothing
+    input: {mode: start, agent_id: ops, session_id: s1, profile: builder, wfspec: subagent.builder}
+    mocks:
+      - {step_name: list-active, _: {ok: true, data: {jobs: []}}}
+      - {step_name: create-row, _: {ok: false, error: {code: already_exists, message: "job job-x already exists"}}}
+      - {step_name: start-entity, _: "{{ 1 / 0 }}"}
+      - {step_name: fail-unstarted, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: store_failed, message: "job job-x already exists", retryable: true}
+
+  # ── report ──────────────────────────────────────────────────────────────
+  - id: a-progress-report-writes-and-signals-without-waking
+    input: {mode: report, agent_id: ops, job_id: job-x, session_id: s1, to: running, progress: {message: "step 2"}}
+    mocks:
+      - {step_name: write-report, _: {ok: true, data: {job: {job_id: job-x, status: running}}}}
+      - {step_name: notify-session, _: {sent: false}}
+    expect:
+      assert:
+        - "{{ ok == True and data['kind'] == 'progress' and data['notified'] == False }}"
+
+  - id: a-pending-action-report-wakes-the-session
+    input: {mode: report, agent_id: ops, job_id: job-x, session_id: s1, to: awaiting_input, pending_action: {kind: plan_review, summary: "Plan ready"}}
+    mocks:
+      - {step_name: write-report, _: {ok: true, data: {job: {job_id: job-x, status: awaiting_input}}}}
+      - {step_name: notify-session, _: {sent: true}}
+    expect:
+      assert:
+        - "{{ ok == True and data['kind'] == 'pending_action' and data['notified'] == True and data['job']['status'] == 'awaiting_input' }}"
+
+  - id: a-completion-report-is-kind-complete
+    input: {mode: report, agent_id: ops, job_id: job-x, session_id: s1, to: completed, result: {answer: done}}
+    mocks:
+      - {step_name: write-report, _: {ok: true, data: {job: {job_id: job-x, status: completed}}}}
+      - {step_name: notify-session, _: {sent: true}}
+    expect:
+      assert:
+        - "{{ ok == True and data['kind'] == 'complete' }}"
+
+  - id: a-report-the-row-refuses-emits-nothing
+    input: {mode: report, agent_id: ops, job_id: job-x, session_id: s1, to: completed, result: {answer: done}}
+    mocks:
+      - {step_name: write-report, _: {ok: false, data: null, error: {code: invalid_state, message: "job job-x is cancelled; it cannot become completed", retryable: false}}}
+      - {step_name: notify-session, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: invalid_state, message: "job job-x is cancelled; it cannot become completed", retryable: false}
+
+  # ── send ────────────────────────────────────────────────────────────────
+  - id: send-signals-the-reply
+    input: {mode: send, agent_id: ops, job_id: job-x, decision: approve, pending_action: {kind: plan_review}}
+    mocks:
+      - {step_name: signal-reply, _: {sent: true}}
+    expect:
+      assert:
+        - "{{ ok == True and data == {'sent': True} }}"
+
+  - id: send-to-a-gone-entity-is-not-running
+    input: {mode: send, agent_id: ops, job_id: job-x, decision: approve}
+    mocks:
+      - {step_name: signal-reply, _: {sent: false}}
+    expect:
+      output:
+        - error: {code: not_running, message: "job job-x is not running", retryable: false}
+
+  # ── cancel ──────────────────────────────────────────────────────────────
+  - id: cancel-signals-a-live-entity-and-writes-nothing
+    input: {mode: cancel, agent_id: ops, job_id: job-x, reason: "session deleted"}
+    mocks:
+      - {step_name: read-to-cancel, _: {ok: true, data: {job: {job_id: job-x, status: awaiting_input}}}}
+      - {step_name: signal-cancel, _: {sent: true}}
+      - {step_name: cancel-row-directly, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['cancelled'] == True and data['via'] == 'event' }}"
+
+  - id: cancel-writes-the-row-when-the-entity-is-gone
+    input: {mode: cancel, agent_id: ops, job_id: job-x}
+    mocks:
+      - {step_name: read-to-cancel, _: {ok: true, data: {job: {job_id: job-x, status: running}}}}
+      - {step_name: signal-cancel, _: {sent: false}}
+      - {step_name: cancel-row-directly, _: {ok: true, data: {job: {job_id: job-x, status: cancelled}}}}
+    expect:
+      assert:
+        - "{{ ok == True and data['via'] == 'row' and data['job']['status'] == 'cancelled' }}"
+
+  - id: cancelling-a-finished-job-changes-nothing
+    input: {mode: cancel, agent_id: ops, job_id: job-x}
+    mocks:
+      - {step_name: read-to-cancel, _: {ok: true, data: {job: {job_id: job-x, status: completed}}}}
+      - {step_name: signal-cancel, _: "{{ 1 / 0 }}"}
+      - {step_name: cancel-row-directly, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['cancelled'] == False and data['via'] is None }}"
+
+  - id: cancelling-a-missing-job-is-not-found
+    input: {mode: cancel, agent_id: ops, job_id: job-x}
+    mocks:
+      - {step_name: read-to-cancel, _: {ok: true, data: {job: null}}}
+      - {step_name: signal-cancel, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - error: {code: not_found, message: "no job job-x", retryable: false}
+
+  # ── reconcile / pass-through ────────────────────────────────────────────
+  - id: reconcile-relays-undelivered-finished-and-awaiting-jobs
+    input: {mode: reconcile, agent_id: ops, session_id: s1}
+    mocks:
+      - step_name: list-session-jobs
+        _:
+          ok: true
+          data:
+            jobs:
+              - {job_id: j1, status: completed, delivered_at: null}
+              - {job_id: j2, status: completed, delivered_at: "2026-10-13T10:00:00"}
+              - {job_id: j3, status: awaiting_input, summary: "review"}
+              - {job_id: j4, status: running, summary: "working"}
+              - {job_id: j5, status: failed, delivered_at: null}
+    expect:
+      assert:
+        - "{{ ok == True and [j['job_id'] for j in data['to_relay']] == ['j1', 'j3', 'j5'] }}"
+        - "{{ [j['job_id'] for j in data['active']] == ['j3', 'j4'] and data['active'][1]['summary'] == 'working' }}"
+
+  # Stuck jobs (F50 closed: only the job's own user can fail its row, so the session
+  # does it here). Probed with a ping; dead → failed {entity_gone} and relayed.
+  - id: reconcile-fails-a-stuck-job-whose-entity-is-gone
+    input: {mode: reconcile, agent_id: ops, session_id: s1, config: {limits: {job_timeout_sec: 60}}}
+    mocks:
+      - step_name: list-session-jobs
+        _:
+          ok: true
+          data:
+            jobs:
+              - {job_id: j1, session_id: s1, status: running, updated_at: "2026-01-01T00:00:00"}
+              - {job_id: j2, session_id: s1, status: queued, updated_at: "2026-01-01T00:00:00"}
+              - {job_id: j3, session_id: s1, status: running, summary: fresh}
+      - {step_name: probe-job, _: "{{ {'sent': stuck['job_id'] == 'j2'} }}"}
+      - step_name: fail-job-row
+        _: "{{ {'ok': True, 'data': {'job': {'job_id': dead_job['job_id'], 'session_id': 's1', 'status': 'failed', 'delivered_at': None, 'error': {'code': 'entity_gone'}}}} if dead_job['job_id'] == 'j1' else 1 / 0 }}"
+    expect:
+      assert:
+        - "{{ ok == True and data['failed_stuck'] == ['j1'] }}"
+        - "{{ [j['job_id'] for j in data['to_relay']] == ['j1'] }}"
+        - "{{ sorted(j['job_id'] for j in data['active']) == ['j2', 'j3'] }}"
+
+  - id: reconcile-never-fails-a-job-on-a-probe-error
+    input: {mode: reconcile, agent_id: ops, session_id: s1}
+    mocks:
+      - step_name: list-session-jobs
+        _: {ok: true, data: {jobs: [{job_id: j1, status: queued, updated_at: "2026-01-01T00:00:00"}]}}
+      - {step_name: probe-job, _: "{{ 1 / 0 }}"}
+      - {step_name: fail-job-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['failed_stuck'] == [] and [j['job_id'] for j in data['active']] == ['j1'] }}"
+
+  - id: get-passes-through-to-the-store
+    input: {mode: get, agent_id: ops, job_id: job-x}
+    mocks:
+      - {step_name: store-passthrough, _: {ok: true, data: {job: {job_id: job-x, status: running}}, error: null}}
+    expect:
+      assert:
+        - "{{ ok == True and data['job']['status'] == 'running' }}"

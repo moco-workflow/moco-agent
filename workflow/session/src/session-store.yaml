@@ -1,0 +1,816 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SESSION-STORE — the only wfspec that knows how a session is stored (§6.10.4)
+# ================================================================================
+#
+#   mode         in                                                  data out
+#   ──────────── ─────────────────────────────────────────────────── ─────────────────
+#   create       session_id, overrides?, throwaway?                  {meta, created}
+#   get          session_id, parts? ([meta, context] + turns,        {meta, context, turns?,
+#                toolcalls)                                         toolcalls?}
+#   commit_turn  session_id, turn_entries, context, meta_patch,      {turn_count, duplicate}
+#                toolcalls?
+#   patch_meta   session_id, patch                                   {meta}
+#   list         limit?, status?, oldest_first?                      {sessions: [meta]}
+#   delete       session_id, config                                  {deleted_keys, retired_memory}
+#   submit_feedback session_id, turn, rating: up|down, comment?,     {feedback, memory}
+#                feedback_source: explicit|implicit, config, definition_access
+#
+# Rows (namespace `<uid>:agent.<agent_id>.sessions` -- `in_global_ns: false` puts
+# the caller's user id in front, so authority comes from __user_info__, never from
+# an input. Nobody else can address these rows (F50 closed): background work on
+# them runs as the user, see session-housekeep):
+#
+#   session:<sid>:meta       topic session            the commit marker
+#   session:<sid>:turns      topic session-turns      display transcript
+#   session:<sid>:context    topic session-context    conversation memory
+#   session:<sid>:toolcalls  topic session-toolcalls  tool audit (phase 2 writers)
+#
+# plus one GLOBAL row per session, `tool_audit:<uid>:<sid>` in `agent.<agent_id>.tool-audit`
+# (topic tool-audit): the slim audit tool-stats-rollup aggregates across users. Control
+# data only (tool, status, timing, flags, a capped error message) -- never arguments or
+# results, because every user can read a global namespace. Written with toolcalls,
+# deleted with the session.
+#
+# Every row carries `schema_version` (§4.3). Readers accept the current (1) and the
+# previous (0 = no schema_version) and upgrade on write; anything newer is refused
+# with `unsupported_schema_version`, because a newer writer's row must not be
+# rewritten in an older shape. List-valued rows are stored as
+# `{schema_version, entries}`; a bare list is read as v0.
+#
+# ROW STATE MACHINE on meta.status (§4.3): active <-> retired. `commit_turn`
+# needs `active`; `patch_meta {status}` checks the transition first. An illegal one
+# returns `invalid_state`, never a silent overwrite.
+#
+# ONE LIVE WRITER (P15): only the session entity calls commit_turn / patch_meta
+# for its own session, so the read-check-write here does not race.
+#
+# IDEMPOTENT commit_turn. Keys are deterministic, and the meta row -- written LAST
+# -- is the commit marker. A turn number at or below meta.turn_count is a re-run
+# and writes nothing. A re-run after a crash between the writes first drops
+# transcript entries at or above the turn being committed, so it cannot duplicate
+# them.
+#
+# PHASE 0 (plan-14 step 1). `patch_meta` is brought forward from phase 1 because
+# retiring must set `status: retired`. `list`, `put_context`, `get_turns`
+# (paging), `submit_feedback`, `rename`, `delete` are phase 1.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: session-store
+
+context:
+  live_session_ids:      # delete: null = the list failed, retire by the old rule
+  retired_memory: []
+  valid_modes: ["create", "get", "commit_turn", "patch_meta", "put_context", "list", "get_turns", "delete", "submit_feedback"]
+  audit_namespace_suffix: tool-audit
+  audit_fields: ["turn", "tool", "status", "elapsed_ms", "ts", "approved_by", "grant_used", "truncated"]
+  valid_ratings: ["up", "down"]
+  valid_feedback_sources: ["explicit", "implicit"]
+  turns_page_size: 500
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  topics:
+    meta: session
+    turns: session-turns
+    context: session-context
+    toolcalls: session-toolcalls
+  # Legal meta.status transitions.
+  status_transitions:
+    active: ["retired"]
+    retired: ["active"]
+  # Fields the store stamps itself; a caller's patch may not set them.
+  protected_meta_fields: ["session_id", "schema_version", "created_at", "turn_count", "updated_at", "throwaway"]
+  # The v1 row shapes, used to fill any field a v0 row lacks.
+  meta_defaults:
+    title: ""
+    status: active
+    throwaway: false
+    turn_count: 0
+    config_overrides: {}
+    pending_action_id:
+    jobs: []
+    last_route:
+    last_curated_turn: 0
+    usage: {}
+    config_version:
+  context_defaults:
+    summary: ""
+    summary_upto_turn: 0
+    summary_degraded: false
+    recent: []
+
+  # Seeded so every output is bound whichever branch ran.
+  ok: false
+  data:
+  error:
+  stored_meta:
+  meta:
+  context_row:
+  turns_row:
+  # Seeded for `list`, which skips the meta read the other modes start from.
+  found: false
+  proceed: false
+  feedback_authz: {}
+  extra_keys: []
+  grant_keys: []
+  fb_memory_result:
+
+input:
+  # submit_feedback
+  turn: 0
+  rating:
+  comment: ""
+  feedback_source: explicit
+  config: {}
+  definition_access: {}
+  mode: get
+  agent_id:
+  session_id:
+  # create
+  overrides: {}
+  throwaway: false
+  # get
+  parts: ["meta", "context"]
+  # commit_turn
+  turn_entries: []
+  context: {}
+  meta_patch: {}
+  toolcalls: []
+  # patch_meta
+  patch: {}
+  # list / get_turns
+  limit: 50
+  oldest_first: false
+  status:
+  page: 0
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "session-store: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    # Both ids reach persist_state keys and namespaces. This is the one place
+    # they are constrained (§4.3: the owner validates).
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - sid: '{{ str(session_id or "").strip() }}'
+        - _problem: >-
+            {{ 'agent_id must match ' + agent_id_pattern
+                 if not re.match(agent_id_pattern, aid) else
+               'session_id must match ' + session_id_pattern
+                 if mode != 'list' and not re.match(session_id_pattern, sid) else None }}
+        - valid#: "{{ _problem is None }}"
+        - error: "{{ None if valid else {'code': 'invalid_input', 'message': _problem, 'retryable': False} }}"
+        - uid: "{{ str(__user_info__.get('user_id')) }}"
+        - namespace: "{{ 'agent.' + aid + '.sessions' }}"
+        - audit_ns: "{{ 'agent.' + aid + '.' + audit_namespace_suffix }}"
+        - audit_key: "tool_audit:{{ uid }}:{{ sid }}"
+        - meta_key: "session:{{ sid }}:meta"
+        - turns_key: "session:{{ sid }}:turns"
+        - context_key: "session:{{ sid }}:context"
+        - toolcalls_key: "session:{{ sid }}:toolcalls"
+
+    # Every mode starts from the meta row: it says whether the session exists,
+    # what state it is in, and which schema version wrote it.
+    - task_name: read-meta
+      skip_if: "{{ not valid or mode == 'list' }}"
+      activity:
+        type: builtin.state.get_state
+        input:
+          in_global_ns: false
+          namespace: "{{ namespace }}"
+          key: "{{ meta_key }}"
+      output:
+        set:
+          - stored_meta: "{{ _ if isinstance(_, dict) else None }}"
+
+    # Reader side of versioning: accept v0 and v1, normalise to the v1 shape.
+    # v0 -> v1 also maps the old agent's `question_count` onto `turn_count`.
+    - task_name: normalize-meta
+      skip_if: "{{ not valid or mode == 'list' }}"
+      set:
+        - found#: "{{ stored_meta is not None }}"
+        - stored_version#: "{{ stored_meta.get('schema_version', 0) if found else None }}"
+        - supported: "{{ (not found) or stored_version in supported_schema_versions }}"
+        - meta: >-
+            {{ dict(dict(meta_defaults, **stored_meta),
+                    turn_count=stored_meta.get('turn_count', stored_meta.get('question_count', 0)) or 0)
+               if found and supported else None }}
+        - error: >-
+            {{ {'code': 'unsupported_schema_version',
+                'message': 'session row has schema_version ' + str(stored_version)
+                           + '; this store reads ' + str(supported_schema_versions),
+                'retryable': False}
+               if not supported else None }}
+        - proceed: "{{ supported }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CREATE — idempotent. An existing session is returned untouched.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-create
+      skip_if: '{{ not (valid and proceed and mode == "create") }}'
+      tasks:
+        - task_name: build-new-meta
+          skip_if: '{{ bool(found) }}'
+          set:
+            - _now: "{{ now().isoformat() }}"
+            - meta#: >-
+                {{ dict(meta_defaults,
+                        schema_version=schema_version,
+                        session_id=sid,
+                        throwaway=bool(throwaway),
+                        config_overrides=overrides or {},
+                        created_at=_now,
+                        updated_at=_now) }}
+        - task_name: write-new-meta
+          skip_if: '{{ bool(found) }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ meta_key }}"
+              value: "{{ meta }}"
+              topic: "{{ topics['meta'] }}"
+
+        - task_name: shape-create
+          set:
+            - ok: true
+            - data: "{{ {'meta': meta, 'created': not found} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GET — absence is an expected failure (not_found), not an error.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-get
+      skip_if: '{{ not (valid and proceed and mode == "get") }}'
+      tasks:
+        - task_name: read-context
+          skip_if: "{{ not (found and 'context' in (parts or [])) }}"
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ context_key }}"
+          output:
+            set:
+              - context_row: "{{ _ if isinstance(_, dict) else None }}"
+
+        - task_name: read-turns
+          skip_if: "{{ not (found and 'turns' in (parts or [])) }}"
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ turns_key }}"
+          output:
+            set:
+              - turns_row: "{{ _ }}"
+
+        - task_name: read-toolcalls
+          skip_if: "{{ not (found and 'toolcalls' in (parts or [])) }}"
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ toolcalls_key }}"
+          output:
+            set:
+              - toolcalls_row: "{{ _ }}"
+
+        - task_name: shape-get
+          set:
+            - ok: "{{ found }}"
+            - error: >-
+                {{ None if found else
+                   {'code': 'not_found', 'message': 'no session ' + sid, 'retryable': False} }}
+            - data: >-
+                {{ None if not found else
+                   {'meta': meta,
+                    'context': dict(context_defaults, **(context_row or {})),
+                    'turns': ((turns_row.get('entries') or []) if isinstance(turns_row, dict)
+                              else (turns_row or []))
+                             if 'turns' in (parts or []) else None,
+                    'toolcalls': ((toolcalls_row.get('entries') or []) if isinstance(toolcalls_row, dict)
+                                  else (toolcalls_row or []))
+                                 if 'toolcalls' in (parts or []) else None} }}
+    # ══════════════════════════════════════════════════════════════════════
+    # COMMIT_TURN — transcript, conversation memory, audit and meta in one call,
+    # so they can never disagree. Meta is written last: it is the commit marker.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-commit-turn
+      skip_if: '{{ not (valid and proceed and mode == "commit_turn") }}'
+      tasks:
+        - task_name: check-commit
+          set:
+            - _turns: "{{ [e.get('turn') for e in (turn_entries or []) if isinstance(e, dict) and isinstance(e.get('turn'), int)] }}"
+            - new_turn#: "{{ max(_turns) if _turns else None }}"
+            - first_new_turn: "{{ min(_turns) if _turns else None }}"
+            - _problem: >-
+                {{ ('not_found', 'no session ' + sid) if not found else
+                   ('invalid_input', 'turn_entries must carry integer turn numbers')
+                      if new_turn is None else
+                   ('invalid_state', 'session ' + sid + ' is ' + str(meta.get('status'))
+                                     + '; commit_turn needs active')
+                      if meta.get('status') != 'active' else None }}
+            - duplicate#: "{{ _problem is None and new_turn <= meta.get('turn_count', 0) }}"
+            - do_write: "{{ _problem is None and not duplicate }}"
+            - error: >-
+                {{ {'code': _problem[0], 'message': _problem[1], 'retryable': False}
+                   if _problem else None }}
+        - task_name: read-turns-to-append
+          skip_if: '{{ not do_write }}'
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ turns_key }}"
+          output:
+            set:
+              - turns_row: "{{ _ }}"
+
+        - task_name: read-toolcalls-to-append
+          skip_if: '{{ not (do_write and len(toolcalls or []) > 0) }}'
+          activity:
+            type: builtin.state.get_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ toolcalls_key }}"
+          output:
+            set:
+              - toolcalls_row: "{{ _ }}"
+
+        - task_name: build-commit
+          skip_if: '{{ not do_write }}'
+          set:
+            - _entries: "{{ (turns_row.get('entries') or []) if isinstance(turns_row, dict) else (turns_row or []) }}"
+            # Drop anything at or above this turn first: a re-run after a
+            # crash between writes must not duplicate the transcript.
+            - new_turns_row: >-
+                {{ {'schema_version': schema_version,
+                    'entries': [e for e in _entries if (e.get('turn') or 0) < first_new_turn]
+                               + list(turn_entries)} }}
+            - new_context_row: "{{ dict(dict(context_defaults, **(context or {})), schema_version=schema_version) }}"
+            - _calls: >-
+                {{ ((toolcalls_row.get('entries') or []) if isinstance(toolcalls_row, dict)
+                    else (toolcalls_row or []))
+                   if len(toolcalls or []) > 0 else [] }}
+            - new_toolcalls_row: >-
+                {{ {'schema_version': schema_version,
+                    'entries': [c for c in _calls if (c.get('turn') or 0) < first_new_turn]
+                               + list(toolcalls or [])} }}
+            # The global slim copy (header): rebuilt from the whole audit, so a re-run
+            # rewrites it identically.
+            - new_audit_row: >-
+                {{ {'schema_version': schema_version, 'user_id': uid, 'agent_id': aid, 'session_id': sid,
+                    'entries': [dict({k: c.get(k) for k in audit_fields if k in c},
+                                     **({'error': {'message': str((c.get('error') or {}).get('message') or '')[:300]}}
+                                        if isinstance(c.get('error'), dict) else {}))
+                                for c in new_toolcalls_row['entries'] if isinstance(c, dict)],
+                    'updated_at': now().isoformat()} }}
+            # usage is additive; protected fields are the store's to stamp.
+            - _patch: "{{ {k: v for k, v in (meta_patch or {}).items() if k not in protected_meta_fields and k not in ['usage', 'status']} }}"
+            - _usage: "{{ meta.get('usage') or {} }}"
+            - _add: "{{ (meta_patch or {}).get('usage') or {} }}"
+            - new_meta#: >-
+                {{ dict(dict(meta, **_patch),
+                        usage={k: (_usage.get(k) or 0) + (_add.get(k) or 0)
+                               for k in set(_usage) | set(_add)
+                               if isinstance(_usage.get(k, 0), (int, float))
+                                  and isinstance(_add.get(k, 0), (int, float))},
+                        turn_count=new_turn,
+                        schema_version=schema_version,
+                        updated_at=now().isoformat()) }}
+        - task_name: write-turns
+          skip_if: '{{ not do_write }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ turns_key }}"
+              value: "{{ new_turns_row }}"
+              topic: "{{ topics['turns'] }}"
+
+        - task_name: write-context
+          skip_if: '{{ not do_write }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ context_key }}"
+              value: "{{ new_context_row }}"
+              topic: "{{ topics['context'] }}"
+
+        - task_name: write-toolcalls
+          skip_if: '{{ not (do_write and len(toolcalls or []) > 0) }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ toolcalls_key }}"
+              value: "{{ new_toolcalls_row }}"
+              topic: "{{ topics['toolcalls'] }}"
+
+        # Stats only: a failed write must not fail the turn.
+        - task_name: write-tool-audit
+          skip_if: '{{ not (do_write and len(toolcalls or []) > 0) }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: true
+              namespace: "{{ audit_ns }}"
+              key: "{{ audit_key }}"
+              value: "{{ new_audit_row }}"
+              topic: tool-audit
+          on_error:
+            catch: true
+
+        - task_name: write-meta
+          skip_if: '{{ not do_write }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ meta_key }}"
+              value: "{{ new_meta }}"
+              topic: "{{ topics['meta'] }}"
+
+        - task_name: shape-commit
+          set:
+            - ok: "{{ error is None }}"
+            - data: >-
+                {{ None if error is not None else
+                   {'turn_count': new_turn if do_write else meta.get('turn_count'),
+                    'duplicate': duplicate} }}
+    # ══════════════════════════════════════════════════════════════════════
+    # PATCH_META — status transitions are checked; protected fields refused.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-patch-meta
+      skip_if: '{{ not (valid and proceed and mode == "patch_meta") }}'
+      tasks:
+        - task_name: check-patch
+          set:
+            - _patch: "{{ patch or {} }}"
+            - _bad: "{{ sorted(k for k in _patch if k in protected_meta_fields) }}"
+            - _from: "{{ meta.get('status') if found else None }}"
+            - _to: "{{ _patch.get('status', _from) }}"
+            - _problem: >-
+                {{ ('not_found', 'no session ' + sid) if not found else
+                   ('invalid_input', 'protected field(s): ' + ', '.join(_bad)) if _bad else
+                   ('invalid_state', 'session ' + sid + ': ' + str(_from) + ' -> ' + str(_to)
+                                     + ' is not a legal transition')
+                      if _to != _from and _to not in (status_transitions.get(_from) or []) else None }}
+            - do_write: "{{ _problem is None }}"
+            - error: >-
+                {{ {'code': _problem[0], 'message': _problem[1], 'retryable': False}
+                   if _problem else None }}
+            - _usage: "{{ (meta or {}).get('usage') or {} }}"
+            - _add: "{{ _patch.get('usage') or {} }}"
+            - new_meta#: >-
+                {{ dict(dict(meta, **{k: v for k, v in _patch.items() if k != 'usage'}),
+                        usage={k: (_usage.get(k) or 0) + (_add.get(k) or 0)
+                               for k in set(_usage) | set(_add)},
+                        schema_version=schema_version,
+                        updated_at=now().isoformat())
+                   if do_write else None }}
+        - task_name: write-patched-meta
+          skip_if: '{{ not do_write }}'
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ meta_key }}"
+              value: "{{ new_meta }}"
+              topic: "{{ topics['meta'] }}"
+
+        - task_name: shape-patch
+          set:
+            - ok: "{{ do_write }}"
+            - data: "{{ {'meta': new_meta} if do_write else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PUT_CONTEXT — the entity applies a compacted summary outside a turn
+    # (plan-14 step 15). Entity only: it is the one live writer of its rows.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-put-context
+      skip_if: '{{ not (valid and proceed and mode == "put_context") }}'
+      tasks:
+        - task_name: check-put-context
+          set:
+            - error: >-
+                {{ None if found else {'code': 'not_found', 'message': 'no session ' + sid, 'retryable': False} }}
+            - new_context_row: "{{ dict(dict(context_defaults, **(context or {})), schema_version=schema_version) }}"
+        - task_name: write-put-context
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "{{ context_key }}"
+              value: "{{ new_context_row }}"
+              topic: "{{ topics['context'] }}"
+        - task_name: shape-put-context
+          set:
+            - ok: "{{ bool(found) }}"
+            - data: "{{ {'written': True} if found else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST — this user's sessions with this agent, newest first (agent-admin).
+    # Keys first, then one read per meta row (list_states returns keys only).
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-list
+      skip_if: '{{ not (valid and mode == "list") }}'
+      tasks:
+        - task_name: list-meta-keys
+          skip_if: "{{ oldest_first is True }}"
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key_pattern: "session:*:meta"
+              order_by: last_update_time
+              order_direction: desc
+              limit: "{{ int(limit or 50) }}"
+          output:
+            set:
+              - meta_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+        # housekeep: the least recently updated first (retention candidates).
+        - task_name: list-meta-keys-oldest
+          skip_if: "{{ oldest_first is not True }}"
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key_pattern: "session:*:meta"
+              order_by: last_update_time
+              order_direction: asc
+              limit: "{{ int(limit or 50) }}"
+          output:
+            set:
+              - meta_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: read-metas
+          loop:
+            in: "{{ meta_keys }}"
+            foreach: mkey
+            execute_mode: parallel
+            do:
+              task_name: read-one-meta
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ namespace }}", key: "{{ mkey }}"}
+          output:
+            set:
+              - ok: true
+              - data: >-
+                  {{ {'sessions': [dict(dict(meta_defaults, **m), turn_count=m.get('turn_count', m.get('question_count', 0)) or 0)
+                                   for m in (_ or []) if isinstance(m, dict)
+                                   and m.get('schema_version', 0) in supported_schema_versions
+                                   and (status is None or m.get('status') == status)]} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # GET_TURNS — the transcript, one page of turns_page_size entries.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-get-turns
+      skip_if: '{{ not (valid and proceed and mode == "get_turns") }}'
+      tasks:
+        - task_name: read-all-turns
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key: "{{ turns_key }}"}
+          output:
+            set:
+              - turns_row: "{{ _ }}"
+        - task_name: shape-get-turns
+          set:
+            - _entries: "{{ ((turns_row.get('entries') or []) if isinstance(turns_row, dict) else (turns_row or [])) if found else [] }}"
+            - _p: "{{ max(0, int(page or 0)) }}"
+            - ok: "{{ found }}"
+            - error: "{{ None if found else {'code': 'not_found', 'message': 'no session ' + sid, 'retryable': False} }}"
+            - data: >-
+                {{ {'turns': _entries[_p * turns_page_size:(_p + 1) * turns_page_size],
+                    'next_page': (_p + 1) if len(_entries) > (_p + 1) * turns_page_size else None}
+                   if found else None }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SUBMIT_FEEDBACK — 👍/👎 on one turn (§6.10.5). Its own row
+    # `session:<sid>:feedback:<turn>` (topic session-feedback), so it never races the
+    # entity's writes. Explicit feedback needs `access feedback` (guests cannot);
+    # implicit feedback (the router's negative_feedback signal, written by the
+    # entity) skips it. Then memory: 👎 → memory feedback over the turn's
+    # used_memory (strength 1 explicit, 0.5 implicit); 👍 → memory record {trigger:
+    # feedback} with the exchange. Implicit feedback changes memory only when
+    # config.decisions.feedback.implicit_enabled. A memory failure never fails the
+    # feedback: the row is the record.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-submit-feedback
+      skip_if: '{{ not (valid and proceed and mode == "submit_feedback") }}'
+      tasks:
+        - task_name: authorize-feedback
+          skip_if: "{{ feedback_source == 'implicit' }}"
+          workflow:
+            ref: agent-harness-foundation/access
+            mode: inline
+            input: {mode: authorize, agent_id: "{{ aid }}", action: feedback, definition_access: "{{ definition_access }}"}
+          output:
+            set:
+              - feedback_authz: "{{ ((_ or {}).get('data') or {}) }}"
+
+        - task_name: read-feedback-turns
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key: "{{ turns_key }}"}
+          output:
+            set:
+              - turns_row: "{{ _ }}"
+
+        - task_name: plan-feedback
+          set:
+            - _entries: "{{ ((turns_row.get('entries') or []) if isinstance(turns_row, dict) else (turns_row or [])) if found else [] }}"
+            - fb_turn: "{{ [e for e in _entries if isinstance(e, dict) and e.get('turn') == int(turn or 0)] }}"
+            - fb_answer: "{{ next((e for e in fb_turn if e.get('role') == 'assistant'), {}) }}"
+            - fb_question: "{{ next((e for e in fb_turn if e.get('role') == 'user'), {}) }}"
+            - fb_problem#: >-
+                {{ ('not_found', 'no session ' + sid) if not found else
+                   ('forbidden', 'not allowed to give feedback (' + str(feedback_authz.get('reason')) + ')')
+                     if feedback_source != 'implicit' and not feedback_authz.get('allow') else
+                   ('invalid_input', 'rating must be up or down') if rating not in valid_ratings else
+                   ('invalid_input', 'source must be explicit or implicit') if feedback_source not in valid_feedback_sources else
+                   ('not_found', 'no answered turn ' + str(turn) + ' in session ' + sid) if not fb_answer else None }}
+            - fb_row: >-
+                {{ None if fb_problem is not None else
+                   {'schema_version': schema_version, 'session_id': sid, 'turn': int(turn), 'rating': rating,
+                    'comment': str(comment or '')[:1000], 'source': feedback_source,
+                    'used_memory': list(fb_answer.get('used_memory') or []),
+                    'by': str(__user_info__.get('user_id')), 'ts': now().isoformat()} }}
+            - fb_memory#: >-
+                {{ fb_row is not None and (feedback_source == 'explicit'
+                   or ((((config or {}).get('decisions') or {}).get('feedback') or {}).get('implicit_enabled') is True)) }}
+
+        - task_name: write-feedback
+          skip_if: "{{ fb_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "session:{{ sid }}:feedback:{{ int(turn) }}"
+              value: "{{ fb_row }}"
+              topic: session-feedback
+
+        - task_name: memory-feedback-down
+          skip_if: "{{ not fb_memory or rating != 'down' or not fb_row['used_memory'] }}"
+          workflow:
+            ref: agent-harness-memory/memory
+            mode: inline
+            input:
+              mode: feedback
+              agent_id: "{{ aid }}"
+              config: "{{ config }}"
+              session_id: "{{ sid }}"
+              used_memory: "{{ fb_row['used_memory'] }}"
+              rating: down
+              strength: "{{ 1 if feedback_source == 'explicit' else 0.5 }}"
+          output:
+            set:
+              - fb_memory_result: "{{ _ }}"
+          on_error:
+            catch: true
+
+        - task_name: memory-record-up
+          skip_if: "{{ not fb_memory or rating != 'up' }}"
+          workflow:
+            ref: agent-harness-memory/memory
+            mode: inline
+            input:
+              mode: record
+              agent_id: "{{ aid }}"
+              config: "{{ config }}"
+              session_id: "{{ sid }}"
+              trigger: feedback
+              exchanges: "{{ [{'role': 'user', 'content': fb_question.get('content'), 'turn': int(turn)}, {'role': 'assistant', 'content': fb_answer.get('content'), 'turn': int(turn)}] }}"
+              grounding: {grounded: true}
+          output:
+            set:
+              - fb_memory_result: "{{ _ }}"
+          on_error:
+            catch: true
+
+        - task_name: shape-feedback
+          set:
+            - ok: "{{ fb_problem is None }}"
+            - error: "{{ None if fb_problem is None else {'code': fb_problem[0], 'message': fb_problem[1], 'retryable': False} }}"
+            - data: "{{ {'feedback': fb_row, 'memory': fb_memory} if fb_problem is None else None }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DELETE — every row of the session. The caller (agent-admin) also signals
+    # the live entity to retire; any late write from it fails, because every
+    # write mode here requires the meta row to exist.
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-delete
+      skip_if: '{{ not (valid and proceed and mode == "delete") }}'
+      tasks:
+        # Every row of the session (§8): turns, context, toolcalls, feedback, the
+        # pending action, artifacts; and its tool grants. Meta goes LAST: it is the
+        # marker every other write mode checks, so a late entity write fails.
+        - task_name: list-session-rows
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key_pattern: "session:{{ sid }}:*"}
+          output:
+            set:
+              - extra_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict) and r.get('key') != meta_key] }}"
+
+        - task_name: list-session-grants
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key_pattern: "tool_grant:{{ sid }}:*"}
+          output:
+            set:
+              - grant_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+        - task_name: delete-rows
+          skip_if: "{{ not found }}"
+          loop:
+            in: "{{ sorted(set(extra_keys + [turns_key, context_key, toolcalls_key])) + grant_keys + [meta_key] }}"
+            foreach: dkey
+            do:
+              task_name: delete-one-row
+              activity:
+                type: builtin.state.del_state
+                input: {in_global_ns: false, namespace: "{{ namespace }}", key: "{{ dkey }}"}
+
+        # The global slim audit copy (header). Absent for a session without tool calls.
+        - task_name: delete-tool-audit
+          skip_if: "{{ not found }}"
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: true, namespace: "{{ audit_ns }}", key: "{{ audit_key }}"}
+          on_error:
+            catch: true
+
+        # Long-term memory goes too when no session that still exists is evidence
+        # for it (§6.4.2, F65): this session's meta row is gone by now, so the
+        # list is the user's remaining sessions.
+        - task_name: list-live-sessions
+          skip_if: "{{ not found or (((config or {}).get('memory') or {}).get('long_term') or {}).get('enabled') is not True }}"
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key_pattern: "session:*:meta"}
+          output:
+            set:
+              - live_session_ids: "{{ [str(r.get('key'))[len('session:'):-len(':meta')] for r in (_ or []) if isinstance(r, dict)] }}"
+          on_error:
+            catch: true
+
+        - task_name: retire-session-memory
+          skip_if: "{{ not found or (((config or {}).get('memory') or {}).get('long_term') or {}).get('enabled') is not True }}"
+          workflow:
+            ref: agent-harness-memory/memory
+            mode: inline
+            input: {mode: retire_by_session, agent_id: "{{ aid }}", config: "{{ config }}", session_id: "{{ sid }}", live_session_ids: "{{ live_session_ids }}"}
+          output:
+            set:
+              - retired_memory: "{{ ((_ or {}).get('data') or {}).get('retired') or [] }}"
+          on_error:
+            catch: true
+
+        - task_name: shape-delete
+          set:
+            - ok: "{{ found }}"
+            - error: "{{ None if found else {'code': 'not_found', 'message': 'no session ' + sid, 'retryable': False} }}"
+            - data: >-
+                {{ {'deleted_keys': sorted(set(extra_keys + [turns_key, context_key, toolcalls_key])) + grant_keys + [meta_key],
+                    'retired_memory': retired_memory}
+                   if found else None }}

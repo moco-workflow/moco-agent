@@ -1,0 +1,53 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.AGENTS — agent-admin's agents area (plan-16 step 5)
+# ================================================================================
+#   op                   in             data out
+#   list_agents          —              {agents}            agent-registry list
+#   get_definition       agent_id       {definition, profiles, versions}   load
+#   validate_definition  definition     {valid, errors}     agent-registry validate
+# Reads only; every call goes through agent-registry (one owner, §4.3).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.agents
+
+context:
+  valid_ops: ["list_agents", "get_definition", "validate_definition"]
+  reg: {}
+
+input:
+  op:
+  agent_id:
+  definition: {}
+
+output:
+  ok: "{{ bool(reg.get('ok')) }}"
+  data: "{{ reg.get('data') if op != 'get_definition' or not reg.get('ok') else {'definition': reg['data']['definition'], 'profiles': reg['data']['profiles'], 'versions': reg['data']['versions']} }}"
+  error: "{{ reg.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.agents: invalid op '{{ op }}'"
+    - task_name: call-registry
+      workflow:
+        ref: agent-harness-foundation/agent-registry
+        mode: inline
+        input:
+          mode: "{{ {'list_agents': 'list', 'get_definition': 'load', 'validate_definition': 'validate'}[op] }}"
+          agent_id: "{{ agent_id }}"
+          definition: "{{ definition }}"
+      output:
+        set:
+          - reg: "{{ _ or {} }}"
+      # load raises for an undeployed or broken agent; for an admin that is an answer.
+      on_error:
+        catch: true
+        do:
+          set:
+            - reg: "{{ {'ok': False, 'data': None, 'error': {'code': 'load_failed', 'message': str(_.get('error_message'))[:500], 'retryable': False}} }}"

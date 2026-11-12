@@ -1,0 +1,108 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.JOBS — agent-admin's background-jobs area (plan-13 step 7, plan-16 phase 3)
+# ================================================================================
+#   op           in                                   data out
+#   list_jobs    session_id?, status?                 {jobs: [row]}   (the caller's)
+#   get_job      job_id                               {job}
+#   cancel_job   job_id                               job-manager cancel's {cancelled, via, job}
+#   answer_job   job_id, decision, feedback?          the resumed turn (admin.pending resolve_pending)
+#
+# Rows through job-manager (P4: never the live entity). cancel_job signals the entity,
+# which reports `cancelled` and so tells the session itself; when the entity is gone
+# cancel writes the row, and this area then nudges the session (a plain
+# subagent_event) so a live one relays it and drops the job's pending action.
+# answer_job is the job's plan review answered from a UI button: it finds the job's
+# session and goes through resolve_pending, the same path as a typed "yes".
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.jobs
+
+context:
+  valid_ops: ["list_jobs", "get_job", "cancel_job", "answer_job"]
+  res: {}
+  job_row: {}
+
+input:
+  op:
+  agent_id:
+  job_id:
+  session_id:
+  status:
+  decision:
+  feedback:
+
+output:
+  ok: "{{ bool(res.get('ok')) }}"
+  data: "{{ res.get('data') }}"
+  error: "{{ res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.jobs: invalid op '{{ op }}'"
+
+    - task_name: read-jobs
+      skip_if: "{{ op not in ['list_jobs', 'get_job'] }}"
+      workflow:
+        ref: agent-harness-jobs/job-manager
+        mode: inline
+        input: {mode: "{{ 'list' if op == 'list_jobs' else 'get' }}", agent_id: "{{ agent_id }}", job_id: "{{ job_id }}", session_id: "{{ session_id }}", status: "{{ status }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: cancel-job
+      skip_if: "{{ op != 'cancel_job' }}"
+      workflow:
+        ref: agent-harness-jobs/job-manager
+        mode: inline
+        input: {mode: cancel, agent_id: "{{ agent_id }}", job_id: "{{ job_id }}", reason: "cancelled by the user"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: nudge-session-after-row-cancel
+      skip_if: "{{ op != 'cancel_job' or ((res.get('data') or {}).get('via')) != 'row' }}"
+      workflow:
+        ref: agent-harness-jobs/job-signal
+        mode: inline
+        input:
+          kind: to_session
+          agent_id: "{{ agent_id }}"
+          owner_user_id: "{{ __user_info__.get('user_id') }}"
+          session_id: "{{ (((res.get('data') or {}).get('job')) or {}).get('session_id') }}"
+          event_type: subagent_event
+          data: {job_id: "{{ job_id }}", kind: complete, status: cancelled}
+          wake: false
+      on_error:
+        catch: true
+
+    - task_name: read-job-to-answer
+      skip_if: "{{ op != 'answer_job' }}"
+      workflow:
+        ref: agent-harness-jobs/job-manager
+        mode: inline
+        input: {mode: get, agent_id: "{{ agent_id }}", job_id: "{{ job_id }}"}
+      output:
+        set:
+          - job_row: "{{ (((_ or {}).get('data') or {}).get('job')) or {} }}"
+          - res: >-
+              {{ {} if ((((_ or {}).get('data') or {}).get('job')) or {}).get('status') == 'awaiting_input' else
+                 {'ok': False, 'data': None, 'error': {'code': 'invalid_state',
+                  'message': 'job ' + str(job_id) + ' is not waiting for an answer', 'retryable': False}} }}
+
+    - task_name: answer-through-pending
+      skip_if: "{{ op != 'answer_job' or bool(res) }}"
+      workflow:
+        ref: admin.pending
+        mode: inline
+        input: {op: resolve_pending, agent_id: "{{ agent_id }}", session_id: "{{ job_row.get('session_id') }}", decision: "{{ decision }}", feedback: "{{ feedback }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"

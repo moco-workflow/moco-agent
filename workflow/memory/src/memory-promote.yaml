@@ -1,0 +1,418 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-PROMOTE — user notes many users share → agent-wide proposals (design §6.16)
+# ================================================================================
+#
+#   mode      in                                  data out
+#   ───────── ─────────────────────────────────── ───────────────────────────────────
+#   run       config, resolved_refs, max_users?,  {users, items, groups, confirmed,
+#             max_proposals?                       proposed: [slug], expired: [slug],
+#                                                  skipped: [{slug, reason}]}
+#   list      status?                             {proposals: [row]}
+#   approve   slug, config                        {proposal, item}
+#   reject    slug, reason?                       {proposal}
+#   every mode  agent_id, config (resolved: access, models, decisions)
+#
+# ADMIN ONLY, every mode: proposals quote other users' memory (access identify).
+#
+# RUN (one agent; memory-promote-all runs it for every agent with long-term memory):
+#   1. read      the PROMOTION POOL (memory-store list_pool; memory-store mirrors it,
+#                opt-in per agent: memory.long_term.promotion) = the users' active
+#                facts and lessons, without reading any user's namespace. Newest
+#                first, ≤ max_users (30) users, ≤ per_kind (20) per user and kind.
+#                Profiles and episodes are personal and never pooled
+#   3. bucket    every item's terms (tags + title words ≥ 4 chars, minus stopwords),
+#                grouped by kind:term through ONE sort -- linear, because this runs in
+#                workflow code. A bucket spanning ≥ min_users (3) distinct users is a
+#                candidate group (one item per user, the first by term overlap order);
+#                a group whose members are a subset of a bigger one is dropped; items
+#                already in a proposal (any status: a rejected one is not re-proposed)
+#                are left out; ≤ 2·max_proposals groups go on
+#   4. confirm   qset.memory.match, decide_many, one request per group: the state is the
+#                group's first note, the questions same_<i> about the others (F44).
+#                Members with same ≥ decisions.memory.same_min_p stay; still ≥ min_users
+#                users → confirmed, ≤ max_proposals (3)
+#   5. merge     prompt.memory.merge (decision role) per confirmed group → {title, text,
+#                tags}, general and impersonal
+#   6. write     `proposal:<slug>` (slug of the merged title) in `agent.<id>`, topic
+#                memory-proposal -- unless that proposal or an agent-scope item with the
+#                slug exists (skipped: exists)
+#   7. expire    `proposed` rows past expires_at (created + 30 days) → expired
+# Nothing reaches every user's context without a human: approve does that.
+#
+# APPROVE: proposed (not expired) → memory-store save, AGENT scope, pinned, evidence
+# one {session_id: "promoted:<user>", source: promoted} per member user (support =
+# users + 2), then the row → approved {item_key, decided_by, decided_at}. memory-store's
+# own access check (agent scope → admin) applies too, and bumps mem-version, so live
+# sessions pick the item up at their next idle tick.
+# REJECT: proposed → rejected {reason, decided_by, decided_at}.
+#
+# ONE OWNER (§4.3, §8): only this wfspec reads or writes `proposal:*` rows.
+# ROW {schema_version: 1, key, slug, kind, status: proposed|approved|rejected|expired,
+#      title, text, tags, members: [{user_id, key, title}], user_count, created_at,
+#      expires_at, decided_by?, decided_at?, reason?, item_key?}
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-promote
+
+context:
+  valid_modes: ["run", "list", "approve", "reject"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  slug_pattern: "^[a-z0-9-]{1,48}$"
+  promote_kinds: [fact, lesson]
+  per_kind: 20
+  min_users: 3
+  max_candidates: 9
+  default_same_min_p: 0.6
+  expire_days: 30
+  schema_version: 1
+  stopwords: [that, this, with, when, from, have, will, your, they, them, then, than, into, only, also, used,
+              uses, using, does, should, would, could, about, there, their, which, what, where, after, before]
+  role:
+  ok: false
+  data:
+  error:
+  user_ids: []
+  per_user: []
+  pool_rows: []
+  agent_items: []
+  proposal_keys: []
+  proposals: []
+  groups: []
+  match_results: []
+  confirmed: []
+  merges: []
+  to_write: []
+  skipped: []
+  written: []
+  expired: []
+  row: {}
+  save_result: {}
+
+input:
+  mode: run
+  agent_id:
+  config: {}
+  resolved_refs: {}
+  max_users: 30
+  max_proposals: 3
+  # list
+  status:
+  # approve / reject
+  slug:
+  reason: ""
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "memory-promote: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - ns: "agent.{{ aid }}"
+        - access_lists: "{{ (config or {}).get('access') or {} }}"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'slug must match ' + slug_pattern if mode in ['approve', 'reject'] and not re.match(slug_pattern, str(slug or '')) else None }}
+        - proceed: "{{ _bad is None }}"
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+
+    - task_name: identify-caller
+      skip_if: "{{ not proceed }}"
+      workflow:
+        ref: agent-harness-foundation/access
+        mode: inline
+        input: {mode: identify, agent_id: "{{ aid }}", definition_access: "{{ access_lists }}"}
+      output:
+        set:
+          - role: "{{ ((_ or {}).get('data') or {}).get('role') }}"
+
+    - task_name: check-admin
+      skip_if: "{{ not proceed }}"
+      set:
+        - proceed: "{{ role == 'admin' }}"
+        - error: "{{ None if role == 'admin' else {'code': 'forbidden', 'message': 'memory proposals are for admins', 'retryable': False} }}"
+
+    # Every mode reads the proposal rows (run: to skip what was proposed before).
+    - task_name: list-proposal-keys
+      skip_if: "{{ not proceed }}"
+      activity:
+        type: builtin.state.list_states
+        input: {in_global_ns: true, namespace: "{{ ns }}", key_pattern: "proposal:*", topic_pattern: memory-proposal}
+      output:
+        set:
+          - proposal_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+    - task_name: read-proposals
+      skip_if: "{{ not proceed or not proposal_keys }}"
+      loop:
+        in: "{{ proposal_keys }}"
+        foreach: proposal_key
+        execute_mode: parallel
+        do:
+          task_name: read-proposal
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "{{ ns }}", key: "{{ proposal_key }}"}
+      output:
+        set:
+          - proposals: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('key')] }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # LIST
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: shape-list
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      set:
+        - ok: true
+        - data: >-
+            {{ {'proposals': sorted([p for p in proposals if status is None or p.get('status') == status],
+                                    key=lambda p: (str(p.get('created_at') or ''), str(p.get('key'))), reverse=True)} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # RUN — 1. users, 2. read
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: list-pool
+      skip_if: "{{ not proceed or mode != 'run' }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input: {mode: list_pool, agent_id: "{{ aid }}", limit: "{{ int(max_users) * int(per_kind) * len(promote_kinds) }}"}
+      output:
+        set:
+          - pool_rows: "{{ [r for r in ((((_ or {}).get('data') or {}).get('items')) or []) if isinstance(r, dict) and r.get('user_id') and r.get('key')] }}"
+      on_error:
+        catch: true
+
+    # Newest first: the first max_users distinct users, per_kind rows per user and kind.
+    - task_name: group-pool
+      skip_if: "{{ not proceed or mode != 'run' }}"
+      set:
+        - user_ids: "{{ list(dict.fromkeys(str(r['user_id']) for r in pool_rows))[:int(max_users)] }}"
+        - per_user: >-
+            {{ [[r for k in promote_kinds
+                 for r in [x for x in pool_rows if str(x['user_id']) == u and x.get('kind') == k][:int(per_kind)]]
+                for u in user_ids] }}
+
+    - task_name: read-agent-scope
+      skip_if: "{{ not proceed or mode not in ['run', 'approve'] }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input: {mode: agent_scope_snapshot, agent_id: "{{ aid }}"}
+      output:
+        set:
+          - agent_items: "{{ (((_ or {}).get('data') or {}).get('items')) or [] }}"
+
+    # ── 3. bucket ────────────────────────────────────────────────────────────
+    - task_name: bucket-items
+      skip_if: "{{ not proceed or mode != 'run' or len(user_ids) < min_users }}"
+      set:
+        - _taken: "{{ [str(m.get('user_id')) + '|' + str(m.get('key')) for p in proposals for m in (p.get('members') or [])] }}"
+        - _items: >-
+            {{ [{'user_id': u, 'key': r.get('key'), 'kind': r.get('kind'), 'title': str(r.get('title') or ''),
+                 'text': str(r.get('text') or ''), 'tags': list(r.get('tags') or []),
+                 'terms': sorted(set([str(t).lower() for t in (r.get('tags') or [])]
+                                     + [w for w in re.findall(r'[a-z0-9]{4,}', str(r.get('title') or '').lower()) if w not in stopwords]))}
+                for u, rows in zip(user_ids, per_user) for r in rows
+                if isinstance(r, dict) and r.get('status') == 'active' and r.get('kind') in promote_kinds
+                   and (str(u) + '|' + str(r.get('key'))) not in _taken] }}
+        # ONE sort of (kind:term, user, index) pairs; buckets are runs of equal terms.
+        - _pairs: "{{ sorted((x['kind'] + ':' + t, str(x['user_id']), i) for i, x in enumerate(_items) for t in x['terms']) }}"
+        - _starts: "{{ [k for k in range(len(_pairs)) if k == 0 or _pairs[k][0] != _pairs[k - 1][0]] }}"
+        - _buckets: "{{ [_pairs[s:e] for s, e in zip(_starts, _starts[1:] + [len(_pairs)])] }}"
+        # One item per user: the first in the bucket (pairs sort by user, then index).
+        - _cands: >-
+            {{ sorted([[p[2] for k, p in enumerate(b) if k == 0 or b[k - 1][1] != p[1]] for b in _buckets
+                       if len(set(p[1] for p in b)) >= min_users],
+                      key=lambda g: (-len(g), g)) }}
+        - _kept: "{{ [g for i, g in enumerate(_cands) if not any(set(g) <= set(h) for h in _cands[:i])] }}"
+        - groups: "{{ [[_items[i] for i in g][:max_candidates + 1] for g in _kept][:2 * int(max_proposals)] }}"
+
+    # ── 4. confirm ───────────────────────────────────────────────────────────
+    - task_name: confirm-groups
+      skip_if: "{{ not proceed or mode != 'run' or not groups }}"
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide_many
+          agent_id: "{{ aid }}"
+          qset: memory.match
+          items: >-
+            {{ [{'note': {'title': g[0]['title'], 'text': g[0]['text']},
+                 'candidates': [{'key': m['key'], 'title': m['title'], 'text': m['text']} for m in g[1:]]}
+                for g in groups] }}
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: none
+      output:
+        set:
+          - match_results: "{{ (((_ or {}).get('data') or {}).get('results')) or [] }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - match_results: []
+
+    - task_name: read-confirmations
+      skip_if: "{{ not proceed or mode != 'run' or not groups }}"
+      set:
+        - _thr: "{{ float((((config or {}).get('decisions') or {}).get('memory') or {}).get('same_min_p') or default_same_min_p) }}"
+        - _n: >-
+            {{ [((match_results[i].get('data') or {}).get('nouls') or {}) if i < len(match_results) and (match_results[i] or {}).get('ok') else {}
+                for i in range(len(groups))] }}
+        - _kept: >-
+            {{ [[g[0]] + [m for j, m in enumerate(g[1:]) if (n.get('same_' + str(j)) or 0) >= _thr] for g, n in zip(groups, _n)] }}
+        - confirmed#: "{{ [g for g in _kept if len(set(str(m['user_id']) for m in g)) >= min_users][:int(max_proposals)] }}"
+
+    # ── 5. merge ─────────────────────────────────────────────────────────────
+    - task_name: merge-groups
+      skip_if: "{{ not proceed or mode != 'run' or not confirmed }}"
+      loop:
+        in: "{{ confirmed }}"
+        foreach: merge_group
+        execute_mode: sequential
+        do:
+          task_name: merge-group
+          workflow:
+            ref: agent-harness-foundation/llm-invoke
+            mode: inline
+            input:
+              mode: render_and_chat
+              agent_id: "{{ aid }}"
+              role: decision
+              models: "{{ (config or {}).get('models') or {} }}"
+              prompt: memory.merge
+              resolved_refs: "{{ resolved_refs }}"
+              variables:
+                kind: "{{ merge_group[0]['kind'] }}"
+                notes: "{{ [{'title': m['title'], 'text': m['text'], 'tags': m['tags']} for m in merge_group] }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - merges: "{{ [((r or {}).get('data') or {}).get('parsed') if isinstance(r, dict) and r.get('ok') else None for r in (_ or [])] }}"
+
+    # ── 6. write ─────────────────────────────────────────────────────────────
+    - task_name: plan-proposals
+      skip_if: "{{ not proceed or mode != 'run' }}"
+      set:
+        - _now: "{{ now() }}"
+        - _have: "{{ set(str(p.get('slug')) for p in proposals) | set(str(i.get('slug')) for i in agent_items) }}"
+        - _shaped: >-
+            {{ [(g, m, re.sub(r'-+', '-', re.sub(r'[^a-z0-9-]+', '-', str(m.get('title') or '').lower())).strip('-')[:48].strip('-'))
+                for g, m in zip(confirmed, merges) if isinstance(m, dict) and str(m.get('title') or '').strip()] }}
+        - skipped: >-
+            {{ [{'slug': None, 'reason': 'merge_failed'} for g, m in zip(confirmed, merges) if not (isinstance(m, dict) and str(m.get('title') or '').strip())]
+               + [{'slug': s, 'reason': 'exists'} for g, m, s in _shaped if not s or s in _have] }}
+        - to_write: >-
+            {{ [{'schema_version': schema_version, 'key': 'proposal:' + s, 'slug': s, 'kind': g[0]['kind'], 'status': 'proposed',
+                 'title': str(m['title']).strip()[:120], 'text': str(m.get('text') or '').strip()[:600],
+                 'tags': list(dict.fromkeys(t for t in (re.sub(r'[^a-z0-9-]+', '-', str(x).lower()).strip('-') for x in (m.get('tags') or [])) if t))[:8],
+                 'members': [{'user_id': x['user_id'], 'key': x['key'], 'title': x['title']} for x in g],
+                 'user_count': len(set(str(x['user_id']) for x in g)),
+                 'created_at': _now.isoformat(), 'expires_at': (_now + dt.timedelta(days=expire_days)).isoformat()}
+                for g, m, s in _shaped if s and s not in _have] }}
+        - _due: >-
+            {{ [p for p in proposals if p.get('status') == 'proposed' and p.get('expires_at')
+                and dt.datetime.fromisoformat(str(p['expires_at'])).replace(tzinfo=None) <= _now.replace(tzinfo=None)] }}
+        - expired: "{{ [str(p.get('slug')) for p in _due] }}"
+        - to_write: "{{ to_write + [dict(p, status='expired', decided_at=_now.isoformat()) for p in _due] }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # APPROVE / REJECT
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-decision
+      skip_if: "{{ not proceed or mode not in ['approve', 'reject'] }}"
+      set:
+        - row: "{{ next((p for p in proposals if p.get('slug') == slug), {}) }}"
+        - _expired: >-
+            {{ bool(row.get('expires_at')) and dt.datetime.fromisoformat(str(row['expires_at'])).replace(tzinfo=None) <= now().replace(tzinfo=None) }}
+        - error: >-
+            {{ {'code': 'not_found', 'message': 'no proposal ' + str(slug), 'retryable': False} if not row else
+               {'code': 'invalid_state', 'message': 'proposal ' + str(slug) + ' is ' + str(row.get('status')), 'retryable': False}
+                 if row.get('status') != 'proposed' else
+               {'code': 'invalid_state', 'message': 'proposal ' + str(slug) + ' has expired', 'retryable': False} if _expired else None }}
+        - proceed: "{{ error is None }}"
+
+    - task_name: save-agent-item
+      skip_if: "{{ not proceed or mode != 'approve' }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: save
+          agent_id: "{{ aid }}"
+          scope: agent
+          item:
+            kind: "{{ row['kind'] }}"
+            slug: "{{ row['slug'] }}"
+            title: "{{ row['title'] }}"
+            text: "{{ row['text'] }}"
+            tags: "{{ row.get('tags') or [] }}"
+            pinned: true
+            evidence: "{{ [{'session_id': 'promoted:' + u, 'source': 'promoted'} for u in sorted(set(str(m.get('user_id')) for m in (row.get('members') or [])))] }}"
+          definition_access: "{{ access_lists }}"
+      output:
+        set:
+          - save_result: "{{ _ or {} }}"
+          - proceed: "{{ (_ or {}).get('ok') == True }}"
+          - error: "{{ None if (_ or {}).get('ok') else (_ or {}).get('error') }}"
+
+    - task_name: plan-decided-row
+      skip_if: "{{ not proceed or mode not in ['approve', 'reject'] }}"
+      set:
+        - row: >-
+            {{ dict(row, status='approved' if mode == 'approve' else 'rejected', schema_version=schema_version,
+                    decided_by=str(__user_info__.get('user_id')), decided_at=now().isoformat(),
+                    **({'item_key': ((save_result.get('data') or {}).get('item') or {}).get('key')} if mode == 'approve'
+                       else {'reason': str(reason or '')[:300]})) }}
+        - to_write: "{{ [row] }}"
+
+    # Every write of this file goes through here: new, expired and decided rows.
+    - task_name: write-proposals
+      skip_if: "{{ not proceed or not to_write }}"
+      loop:
+        in: "{{ to_write }}"
+        foreach: proposal_row
+        execute_mode: parallel
+        do:
+          task_name: write-proposal
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: true
+              namespace: "{{ ns }}"
+              key: "{{ proposal_row['key'] }}"
+              value: "{{ proposal_row }}"
+              topic: memory-proposal
+      output:
+        set:
+          - written: "{{ [r['slug'] for r in to_write] }}"
+
+    - task_name: shape-run
+      skip_if: "{{ not proceed or mode != 'run' }}"
+      set:
+        - ok: true
+        - data: >-
+            {{ {'users': len(user_ids), 'items': sum(len(r) for r in per_user), 'groups': len(groups), 'confirmed': len(confirmed),
+                'proposed': [r['slug'] for r in to_write if r.get('status') == 'proposed'], 'expired': expired, 'skipped': skipped} }}
+
+    - task_name: shape-decision
+      skip_if: "{{ not proceed or mode not in ['approve', 'reject'] }}"
+      set:
+        - ok: true
+        - data: "{{ {'proposal': row, 'item': (save_result.get('data') or {}).get('item')} if mode == 'approve' else {'proposal': row} }}"

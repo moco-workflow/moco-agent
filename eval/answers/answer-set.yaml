@@ -1,0 +1,25 @@
+# ================================================================================
+# The answer evaluation set (plan-18 step 3, design §18, F31)
+# ================================================================================
+# Run with scripts/answer-eval.sh. Three kinds of case:
+#   answer   a question moco-docs answers: scored on citations and keyword coverage
+#   decline  a moco-sounding question the docs do NOT answer: correct if the agent
+#            declines or says the docs do not say -- not if it invents an answer
+#   chat     small talk: correct if it carries no citations
+# `keywords` are words a correct answer contains (lowercase match). They are a coarse
+# proxy, good for comparing two agents on the same set, not an absolute grade.
+# Grow this set from real questions; keep each case's reason in `why`.
+# ================================================================================
+cases:
+  - {id: retries, kind: answer, q: "How do I make an activity retry with exponential backoff?", keywords: [retry_policy, backoff]}
+  - {id: child-workflow, kind: answer, q: "How do I call a child workflow from my workflow spec?", keywords: [workflow, child]}
+  - {id: checkpoint, kind: answer, q: "What does a state machine checkpoint do in moco?", keywords: [checkpoint, continue]}
+  - {id: secrets, kind: answer, q: "How are secrets resolved when an activity needs an API key?", keywords: [secret]}
+  - {id: wait-for, kind: answer, q: "What does match_expression do on wait_for?", keywords: [match_expression, event]}
+  - {id: publish, kind: answer, q: "How do I publish a workflow package with the moco CLI?", keywords: [publish, moco]}
+  - {id: expressions, kind: answer, q: "How do I write an expression that reads a variable in a moco workflow?", keywords: ["{{", expression]}
+  - {id: runtimes, kind: answer, q: "What is the difference between the Temporal and in-memory runtimes?", keywords: [temporal, in-memory]}
+  - {id: kafka-v9, kind: decline, q: "What is the maximum message size of moco's built-in Kafka Streams v9 connector in megabytes?", why: "no such connector version in the docs"}
+  - {id: quantum, kind: decline, q: "Which moco release introduced the quantum scheduler?", why: "invented feature"}
+  - {id: hello, kind: chat, q: "Hello, who are you?"}
+  - {id: thanks, kind: chat, q: "Thanks, that's all for now!"}

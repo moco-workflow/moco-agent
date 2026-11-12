@@ -1,0 +1,168 @@
+test_type: integration-test
+
+# session-housekeep (plan-17 steps 4-6, design §6.16, §8.1; ported from agent-janitor
+# when F50 closed): the caller's own sessions only. Reaps dead, idle sessions; a live
+# entity, a recent session and the caller's own session are left alone; an awaiting
+# action is expired only when due (never forced); retention deletes old retired
+# sessions; memory caps run for long-term memory. A failure is reported, not raised.
+# Every child is mocked by task name (a mock answers every loop iteration alike).
+
+wfspec:
+  name: session-housekeep
+
+test_data:
+  cfg: &cfg {limits: {retire_after_idle_sec: 3600, retire_throwaway_after_idle_sec: 600}, access: {admin_user_ids: [admin]}}
+  stale: &stale {ok: true, data: {sessions: [{schema_version: 1, session_id: s1, status: active, throwaway: false, updated_at: "2000-01-01T00:00:00"}]}}
+
+test_cases:
+  - id: a-dead-idle-session-is-retired-and-its-due-action-expired
+    input: {agent_id: ops, config: *cfg, exclude_session_id: s9}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - {step_name: probe-entity, _: {alive: false}}
+      - {step_name: retire-row, _: {ok: true, data: {meta: {status: retired}}}}
+      - {step_name: expire-due-pending, _: {ok: true, data: {expired: true}}}
+      - {step_name: delete-expired-session, _: "{{ 1 / 0 }}"}
+      - {step_name: enforce-memory, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['examined'] == 1 and data['reaped'] == ['s1'] and data['expired_pending'] == ['s1'] and data['skipped_live'] == 0 }}"
+
+  # The probe and the retire address the caller's own rows: no owner override.
+  - id: the-probe-targets-the-callers-own-entity
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - step_name: probe-entity
+        _: "{{ {'alive': False} if candidate['session_id'] == 's1' and uid == str(__user_info__.get('user_id')) else 1 / 0 }}"
+      - {step_name: retire-row, _: {ok: true, data: {}}}
+      - {step_name: expire-due-pending, _: {ok: true, data: {expired: false}}}
+    expect:
+      assert:
+        - "{{ data['reaped'] == ['s1'] }}"
+
+  - id: a-live-entity-is-left-alone
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - {step_name: probe-entity, _: {alive: true}}
+      - {step_name: retire-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['reaped'] == [] and data['skipped_live'] == 1 }}"
+
+  - id: the-callers-own-session-is-never-a-candidate
+    input: {agent_id: ops, config: *cfg, exclude_session_id: s1}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - {step_name: probe-entity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['candidates'] == 0 and data['reaped'] == [] }}"
+
+  - id: a-recent-session-is-not-even-probed
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - {step_name: list-sessions, _: "{{ {'ok': True, 'data': {'sessions': [dict(session_id='s1', status='active', updated_at=now().isoformat())]}} }}"}
+      - {step_name: probe-entity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['candidates'] == 0 and data['reaped'] == [] }}"
+
+  - id: an-idle-throwaway-session-uses-the-short-threshold
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - {step_name: list-sessions, _: "{{ {'ok': True, 'data': {'sessions': [dict(session_id='t1', status='active', throwaway=True, updated_at=(now() - dt.timedelta(seconds=1200)).replace(tzinfo=None).isoformat())]}} }}"}
+      - {step_name: probe-entity, _: {alive: false}}
+      - {step_name: retire-row, _: {ok: true, data: {}}}
+      - {step_name: expire-due-pending, _: {ok: true, data: {expired: false}}}
+    expect:
+      assert:
+        - "{{ data['reaped'] == ['t1'] }}"
+
+  - id: the-override-reaps-sooner
+    input: {agent_id: ops, config: *cfg, idle_after_sec: 0}
+    mocks:
+      - {step_name: list-sessions, _: "{{ {'ok': True, 'data': {'sessions': [dict(session_id='s1', status='active', updated_at=now().isoformat())]}} }}"}
+      - {step_name: probe-entity, _: {alive: false}}
+      - {step_name: retire-row, _: {ok: true, data: {}}}
+      - {step_name: expire-due-pending, _: {ok: true, data: {expired: false}}}
+    expect:
+      assert:
+        - "{{ data['reaped'] == ['s1'] and data['expired_pending'] == [] }}"
+
+  - id: a-failed-retire-is-reported
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - {step_name: probe-entity, _: {alive: false}}
+      - {step_name: retire-row, _: {ok: false, error: {code: invalid_state, message: "x"}}}
+      - {step_name: expire-due-pending, _: {ok: true, data: {expired: false}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'partial' and data['errors'][0]['session_id'] == 's1' and data['reaped'] == [] }}"
+
+  - id: a-probe-that-errors-counts-as-alive
+    input: {agent_id: ops, config: *cfg}
+    mocks:
+      - step_name: list-sessions
+        _: *stale
+      - {step_name: probe-entity, _: "{{ 1 / 0 }}"}
+      - {step_name: retire-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['reaped'] == [] and data['skipped_live'] == 1 }}"
+
+  # ── retention (§8.1) ─────────────────────────────────────────────────────
+  - id: a-retired-session-past-retention-is-deleted
+    input: {agent_id: ops, config: {retention: {session_days: 30}, limits: {}, access: {}}}
+    mocks:
+      - {step_name: list-sessions, _: {ok: true, data: {sessions: [{session_id: s1, status: retired, updated_at: "2000-01-01T00:00:00"}]}}}
+      - {step_name: probe-entity, _: "{{ 1 / 0 }}"}
+      - {step_name: delete-expired-session, _: "{{ {'ok': True, 'data': {}} if old_sid == 's1' else 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['deleted'] == ['s1'] and data['reaped'] == [] }}"
+
+  - id: a-recently-retired-session-is-kept
+    input: {agent_id: ops, config: {retention: {session_days: 30}, limits: {}, access: {}}}
+    mocks:
+      - {step_name: list-sessions, _: "{{ {'ok': True, 'data': {'sessions': [dict(session_id='s1', status='retired', updated_at=now().isoformat())]}} }}"}
+      - {step_name: delete-expired-session, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['deleted'] == [] }}"
+
+  # ── memory caps and decay (§6.4.4) ──────────────────────────────────────
+  - id: memory-is-capped-and-decayed-with-long-term-memory
+    input: {agent_id: ops, config: {memory: {long_term: {enabled: true}}, limits: {}, access: {}}}
+    mocks:
+      - {step_name: list-sessions, _: {ok: true, data: {sessions: []}}}
+      - {step_name: enforce-memory, _: {ok: true, data: {evicted: [], decayed: ["mem:fact:old"]}}}
+    expect:
+      assert:
+        - "{{ data['memory_decayed'] == ['mem:fact:old'] and data['memory_evicted'] == [] }}"
+
+  - id: without-long-term-memory-memory-is-left-alone
+    input: {agent_id: ops, config: {limits: {}, access: {}}}
+    mocks:
+      - {step_name: list-sessions, _: {ok: true, data: {sessions: []}}}
+      - {step_name: enforce-memory, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['memory_decayed'] == [] }}"
+
+  - id: a-bad-agent-id-does-nothing
+    input: {agent_id: "Bad Id", config: {}}
+    mocks:
+      - {step_name: list-sessions, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"

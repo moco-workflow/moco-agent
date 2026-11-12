@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-harness-foundation",
+    "wfspec_package_version": "0.15.0",
+    "wfspec_description": "Agent harness - Foundation layer: access, agent-config and its defaults, agent-registry, package-catalog, prompt-render, llm-invoke, decide, hook-runner. Part of the agent-harness-* package set; see moco-agent/docs/plan-00-overview.md.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.test.yaml"
+    ]
+}

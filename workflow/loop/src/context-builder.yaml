@@ -1,0 +1,278 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# CONTEXT-BUILDER — what the model sees this turn, within a budget (design §6.6)
+# ================================================================================
+#
+#   mode          in                                         data out
+#   ───────────── ────────────────────────────────────────── ─────────────────────
+#   conversation  conversation                               {router_view}
+#   assemble      question, conversation, memory_recall?,    {context_bundle}
+#                 pending_action?, jobs?, tools_offered?,
+#                 config, resolved_refs
+#
+# Everything arrives as INPUT (F8): the session passes the conversation row,
+# memory recall, the pending action and jobs, so no provider reads another module's
+# rows. Pure apart from rendering the system prompt.
+#
+# CONVERSATION: router_view = the last 4 exchanges, 300 chars each (§6.6.1).
+#
+# ASSEMBLE: the nine built-in providers, each a part of one `set` (S8, no child
+# workflows), in the order of config.context.providers (= priority):
+#   system           persona prompt (definition persona_prompt, rendered) composed into
+#                    prompt.system.base with persona_text                     required
+#   pending          the open pending action's summary                      required if any
+#   jobs             active async jobs                                      whole
+#   profile_memory   memory_recall.profile items                            item
+#   question         {original, rewritten}                                  required
+#   recent           conversation.recent, newest first, ≤ recent_item_chars item
+#   recalled_memory  memory_recall.recalled items                           item
+#   episodes         memory_recall.episodes items                           item
+#   summary          conversation.summary                                   whole
+# A provider with no data yields no block (F9), so a definition may list providers
+# whose data does not exist yet (memory before phase 2, jobs before phase 3).
+#
+# BUDGET (§6.6.3): estimate chars / 4. Required blocks always go in; then, in priority
+# order, a `whole` block goes in if it fits, an `item` block takes the longest prefix
+# of its items that fits (so `recent` keeps the newest exchanges). If the required
+# blocks alone exceed the budget, everything droppable is dropped and `overflow` is
+# set. `budget.dropped` counts dropped items (1 for a whole block).
+#
+# THE BLOCK CONTRACT is prompt.loop's (plan-01): {id, title, content, items?};
+# `question` as items [{original, rewritten}], memory items {key, title, text}.
+#
+# CUSTOM PROVIDERS (phase 2, §6.6.2): a `context.<name>` entry in providers runs that
+# wfspec (sync, 3 s; failure/timeout → skipped, logged as providers_failed#) with
+# {session_id, question, memory_recall, conversation, pending_action, jobs, config}
+# and takes its {block: {title, content | items, required?, droppable_unit?}}. The
+# block's id is the provider's name, so its place in providers is its priority;
+# prompt.loop fences it as untrusted. Tool notices need no provider: the loop tells
+# the model which tools need setup (tool-policy needs_credential).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: context-builder
+
+context:
+  valid_modes: ["conversation", "assemble"]
+  router_exchanges: 4
+  router_chars: 300
+  titles:
+    pending: "Pending action"
+    jobs: "Background jobs"
+    profile_memory: "About the user"
+    recent: "Recent conversation"
+    recalled_memory: "Remembered facts and lessons"
+    episodes: "Earlier conversations"
+    summary: "Conversation summary"
+  ok: false
+  data:
+  error:
+  persona: ""
+  custom_blocks: []
+  providers_failed: []
+
+input:
+  mode: assemble
+  agent_id:
+  conversation: {}
+  question: {}
+  memory_recall: {}
+  pending_action:
+  jobs: []
+  tools_offered: false
+  session_id:
+  config: {}
+  resolved_refs: {}
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "context-builder: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: mode-conversation
+      skip_if: "{{ mode != 'conversation' }}"
+      set:
+        - _recent: "{{ [m for m in ((conversation or {}).get('recent') or []) if isinstance(m, dict) and m.get('content')] }}"
+        - ok: true
+        - data:
+            router_view: >-
+              {{ [{'role': m.get('role'), 'content': str(m['content'])[:router_chars]}
+                  for m in _recent[-2 * router_exchanges:]] }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ASSEMBLE
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-assemble
+      skip_if: "{{ mode != 'assemble' }}"
+      tasks:
+        - task_name: read-context-config
+          set:
+            - ccfg: "{{ (config or {}).get('context') or {} }}"
+            - providers: "{{ list(ccfg.get('providers') or []) }}"
+            - max_tokens: "{{ ccfg.get('max_context_tokens') }}"
+            - recent_chars: "{{ ccfg.get('recent_item_chars') }}"
+
+        - task_name: reject-unresolved-config
+          raise:
+            if: "{{ not providers or max_tokens is None or recent_chars is None }}"
+            type: error
+            error_type: AbortError
+            message: "context-builder: config.context needs providers, max_context_tokens and recent_item_chars (pass the resolved config)"
+
+        # The persona prompt is a deployed prompt (definition persona_prompt): trusted.
+        - task_name: render-persona
+          skip_if: "{{ 'system' not in providers or not (config or {}).get('persona_prompt') }}"
+          workflow:
+            ref: agent-harness-foundation/prompt-render
+            mode: inline
+            input: {mode: render, agent_id: "{{ agent_id }}", name: "{{ config['persona_prompt'] }}", resolved_refs: "{{ resolved_refs }}"}
+          output:
+            set:
+              - persona: "{{ '\\n\\n'.join(str(m.get('content') or '') for m in (((_ or {}).get('data') or {}).get('messages') or []) if m.get('role') == 'system') }}"
+
+        - task_name: render-system
+          skip_if: "{{ 'system' not in providers }}"
+          workflow:
+            ref: agent-harness-foundation/prompt-render
+            mode: inline
+            input:
+              mode: render
+              agent_id: "{{ agent_id }}"
+              name: system.base
+              resolved_refs: "{{ resolved_refs }}"
+              variables:
+                persona: "{{ persona }}"
+                persona_text: "{{ (config or {}).get('persona_text') or '' }}"
+                tools_offered: "{{ bool(tools_offered) }}"
+                agent_name: "{{ (config or {}).get('display_name') or '' }}"
+          output:
+            set:
+              - system_text: "{{ ((((_ or {}).get('data') or {}).get('messages') or [{}])[0]).get('content') or '' }}"
+
+        # Custom providers (§6.6.2): `context.<name>` entries of config.context.providers,
+        # each a sync child with a 3 s run timeout, in parallel; a failure or timeout
+        # skips that block and is logged. Inputs only -- no provider reads rows.
+        - task_name: run-custom-providers
+          skip_if: "{{ not [p for p in providers if str(p).startswith('context.')] }}"
+          loop:
+            in: "{{ [p for p in providers if str(p).startswith('context.')] }}"
+            foreach: provider_name
+            execute_mode: parallel
+            do:
+              task_name: run-custom-provider
+              workflow:
+                ref: "{{ provider_name }}"
+                mode: sync
+                input:
+                  session_id: "{{ session_id }}"
+                  question: "{{ question or {} }}"
+                  memory_recall: "{{ memory_recall or {} }}"
+                  conversation: "{{ conversation or {} }}"
+                  pending_action: "{{ pending_action }}"
+                  jobs: "{{ jobs or [] }}"
+                  config: "{{ config }}"
+                options:
+                  retry_policy: {timeout_sec: 3, max_attempts: 1}
+              on_error:
+                catch: true
+          output:
+            set:
+              - custom_blocks: >-
+                  {{ [dict({'title': str(p), 'required': False},
+                           **{k: v for k, v in ((r or {}).get('block') or {}).items() if k in ['title', 'content', 'items', 'required']},
+                           id=str(p), unit=str(((r or {}).get('block') or {}).get('droppable_unit') or 'whole'))
+                      for p, r in zip([p for p in providers if str(p).startswith('context.')], _ or [])
+                      if isinstance(r, dict) and isinstance(r.get('block'), dict)
+                         and (r['block'].get('content') or r['block'].get('items'))] }}
+              - providers_failed#: >-
+                  {{ [p for p, r in zip([p for p in providers if str(p).startswith('context.')], _ or [])
+                      if not (isinstance(r, dict) and isinstance(r.get('block'), dict))] }}
+
+        # The nine built-ins: one candidate block each, or none without data.
+        - task_name: build-candidates
+          set:
+            - _conv: "{{ conversation or {} }}"
+            - _mem: "{{ memory_recall or {} }}"
+            - _pa: "{{ pending_action if isinstance(pending_action, dict) and pending_action else None }}"
+            - _q: "{{ question or {} }}"
+            - _recent_items: >-
+                {{ [{'role': m.get('role'), 'content': str(m['content'])[:recent_chars]}
+                    for m in reversed([m for m in (_conv.get('recent') or []) if isinstance(m, dict) and m.get('content')])] }}
+            - _mem_items: "{{ {k: [dict(i, text=str(i.get('text') or '')) for i in (_mem.get(src) or []) if isinstance(i, dict) and i.get('text')] for k, src in [('profile_memory', 'profile'), ('recalled_memory', 'recalled'), ('episodes', 'episodes')]} }}"
+            - candidates: >-
+                {{ [b for b in [
+                     ({'id': 'system', 'title': 'System', 'content': system_text, 'required': True, 'unit': 'whole'}
+                      if 'system' in providers else None),
+                     ({'id': 'pending', 'title': titles['pending'], 'content': str(_pa.get('summary') or ''), 'required': True, 'unit': 'whole'}
+                      if _pa else None),
+                     ({'id': 'jobs', 'title': titles['jobs'], 'items': [{'text': str(j.get('summary') or j.get('status') or j)} for j in jobs], 'required': False, 'unit': 'whole'}
+                      if jobs else None),
+                     ({'id': 'profile_memory', 'title': titles['profile_memory'], 'items': _mem_items['profile_memory'], 'required': False, 'unit': 'item'}
+                      if _mem_items['profile_memory'] else None),
+                     {'id': 'question', 'title': 'Question',
+                      'items': [{'original': str(_q.get('original') or ''), 'rewritten': str(_q.get('rewritten') or '')}],
+                      'required': True, 'unit': 'whole'},
+                     ({'id': 'recent', 'title': titles['recent'], 'items': _recent_items, 'required': False, 'unit': 'item'}
+                      if _recent_items else None),
+                     ({'id': 'recalled_memory', 'title': titles['recalled_memory'], 'items': _mem_items['recalled_memory'], 'required': False, 'unit': 'item'}
+                      if _mem_items['recalled_memory'] else None),
+                     ({'id': 'episodes', 'title': titles['episodes'], 'items': _mem_items['episodes'], 'required': False, 'unit': 'item'}
+                      if _mem_items['episodes'] else None),
+                     ({'id': 'summary', 'title': titles['summary'], 'content': str(_conv.get('summary') or ''), 'required': False, 'unit': 'whole'}
+                      if _conv.get('summary') else None)]
+                   if b is not None and (b['id'] in providers or b['id'] == 'question')]
+                 + [dict(b, required=b.get('required') is True,
+                         unit=b['unit'] if b['unit'] in ['whole', 'item'] else 'whole') for b in custom_blocks] }}
+
+        # chars / 4, required first, then priority order (§6.6.3).
+        - task_name: allocate-budget
+          set:
+            - _cost: >-
+                {{ {b['id']: [len(str(i.get('text') or i.get('content') or i.get('original') or '')
+                                  + str(i.get('rewritten') or '')) // 4 + 1 for i in (b.get('items') or [])]
+                             + ([len(str(b.get('content') or '')) // 4 + 1] if b.get('content') else [])
+                    for b in candidates} }}
+            - _prio: "{{ {p: i for i, p in enumerate(providers)} }}"
+            - _ordered: "{{ sorted(candidates, key=lambda b: _prio.get(b['id'], len(providers))) }}"
+            - _required_cost: "{{ sum(sum(_cost[b['id']]) for b in candidates if b['required']) }}"
+            - overflow#: "{{ _required_cost > max_tokens }}"
+            # How many items (or 1 for whole) each droppable block keeps: a left-to-right
+            # pass over the droppable blocks in priority order, carrying what is left.
+            - _keep: >-
+                {{ (lambda f: f(f, [b for b in _ordered if not b['required']], max_tokens - _required_cost, {}))(
+                     lambda self, bs, left, acc: acc if not bs else (lambda b, costs:
+                       (lambda k: self(self, bs[1:], left - sum(costs[:k]), dict(acc, **{b['id']: k})))(
+                         (len(costs) if sum(costs) <= left else 0) if b['unit'] == 'whole'
+                         else len([c for c in [sum(costs[:i + 1]) for i in range(len(costs))] if c <= left])))(
+                       bs[0], _cost[bs[0]['id']])) }}
+            - _admitted: >-
+                {{ [b for b in _ordered if b['required'] or _keep.get(b['id'], 0) > 0] }}
+            - blocks: >-
+                {{ [dict({k: v for k, v in b.items() if k in ['id', 'title', 'content']},
+                         **({'items': b['items'] if b['required'] or b['unit'] == 'whole' else b['items'][:_keep[b['id']]]}
+                            if b.get('items') is not None else {}))
+                    for b in _admitted] }}
+            - dropped#: >-
+                {{ {b['id']: (1 if b['unit'] == 'whole' else len(b['items']) - _keep.get(b['id'], 0))
+                    for b in _ordered if not b['required'] and (b['unit'] == 'whole' and _keep.get(b['id'], 0) == 0
+                                                                or b['unit'] == 'item' and _keep.get(b['id'], 0) < len(b['items']))} }}
+            - _used: "{{ _required_cost + sum(sum(_cost[b['id']][:_keep[b['id']]]) for b in _ordered if not b['required'] and _keep.get(b['id'], 0) > 0) }}"
+            - ok: true
+            - data:
+                context_bundle:
+                  blocks: "{{ blocks }}"
+                  question: {original: "{{ str((question or {}).get('original') or '') }}", rewritten: "{{ str((question or {}).get('rewritten') or '') }}"}
+                  pending_action: "{{ pending_action if isinstance(pending_action, dict) and pending_action else None }}"
+                  used_memory: "{{ [i.get('key') for b in blocks if b['id'] in ['profile_memory', 'recalled_memory', 'episodes'] for i in (b.get('items') or []) if i.get('key')] }}"
+                  budget: {max_context_tokens: "{{ max_tokens }}", used_estimate: "{{ _used }}", dropped: "{{ dropped }}", overflow: "{{ overflow }}"}

@@ -1,0 +1,165 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# M6 — nothing is lost across the idle checkpoint (plan-00a step 8, design §19)
+# ================================================================================
+#
+# Starts a fresh measure-m6-entity, sends a burst of `pings` pings back to back
+# (the entity takes ~2s per ping and checkpoints after each, so the burst is
+# buffered across several continue-as-news), then waits for every pong by id.
+#
+# PASS when every ping is answered exactly once, the counts are 1..N in order and the
+# pending_summary sentinel survives; in `spaced` mode at least one pong must also come
+# from a continue-as-new execution (otherwise the run proved nothing). Run both modes.
+#
+# Must run on Temporal (a dev stage): in-memory there is no continue-as-new.
+# If it FAILS, plan-00a §8 applies: the queue depth drops to 0 (every message
+# during a turn gets `busy`), and pending state must be re-read from persist_state
+# after each checkpoint.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-m6-driver
+
+context:
+  sentinel: PENDING-SUMMARY-SENTINEL
+  pongs: []
+  m6_result: {}
+
+input:
+  pings: 5
+  wait_sec: 60
+  # burst:  all pings at once -- tests that buffered events are not lost. Expect
+  #         checkpoints_seen == 0: the runtime DEFERS continue-as-new while any
+  #         received event is unprocessed (temporalio_workflow_runtime_context).
+  # spaced: wait for each pong before the next ping -- the buffer is empty at every
+  #         checkpoint, so this tests that state survives an actual continue-as-new.
+  mode: burst
+
+output: '{{ m6_result }}'
+
+main:
+  tasks:
+    - task_name: plan
+      set:
+        - me: "{{ __sys_info__.get('workflow_id') }}"
+        - entity_id#: "{{ 'measure-m6-' + str(__user_info__.get('user_id')) + '-' + str(uuid4()).replace('-', '')[:10] }}"
+        - ids: "{{ ['p%02d' % i for i in range(int(pings))] }}"
+
+    # Start-or-signal for every ping: the first starts the entity, the rest are
+    # plain signals to it.
+    - task_name: burst
+      skip_if: "{{ mode != 'burst' }}"
+      loop:
+        in: "{{ ids }}"
+        foreach: item
+        do:
+          task_name: ping
+          emit_event:
+            target_workflow_id: "{{ entity_id }}"
+            topic: measure-m6
+            event_type: ping
+            data:
+              id: "{{ item }}"
+              reply_to: "{{ me }}"
+            entity_workflow:
+              ref: measure-m6-entity
+              mode: detached
+              input:
+                sentinel: "{{ sentinel }}"
+
+    - task_name: spaced
+      skip_if: "{{ mode != 'spaced' }}"
+      loop:
+        in: "{{ ids }}"
+        foreach: item
+        do:
+          tasks:
+            - task_name: ping-one
+              emit_event:
+                target_workflow_id: "{{ entity_id }}"
+                topic: measure-m6
+                event_type: ping
+                data:
+                  id: "{{ item }}"
+                  reply_to: "{{ me }}"
+                entity_workflow:
+                  ref: measure-m6-entity
+                  mode: detached
+                  input:
+                    sentinel: "{{ sentinel }}"
+            - task_name: await-one
+              wait_for:
+                event:
+                  topic: measure-m6
+                  event_type: pong
+                  match_expression: "{{ (event.get('data') or {}).get('id') == item }}"
+                timeout_sec: "{{ wait_sec }}"
+              output:
+                set:
+                  - pong: "{{ ((_ or {}).get('data')) if isinstance(_, dict) else None }}"
+                data:
+                  pong: '{{ pong }}'
+      output:
+        as: pongs
+
+    # Unmatched pongs are retained per topic, so waiting in id order works even
+    # if they arrive out of order.
+    - task_name: collect
+      skip_if: "{{ mode != 'burst' }}"
+      loop:
+        in: "{{ ids }}"
+        foreach: item
+        do:
+          task_name: await-pong
+          wait_for:
+            event:
+              topic: measure-m6
+              event_type: pong
+              match_expression: "{{ (event.get('data') or {}).get('id') == item }}"
+            timeout_sec: "{{ wait_sec }}"
+          output:
+            set:
+              - pong: "{{ ((_ or {}).get('data')) if isinstance(_, dict) else None }}"
+            data:
+              pong: '{{ pong }}'
+      output:
+        as: pongs
+
+    - task_name: stop-entity
+      emit_event:
+        target_workflow_id: "{{ entity_id }}"
+        topic: measure-m6
+        event_type: stop
+        data: {}
+      on_error: {catch: true}
+
+    - task_name: verdict
+      set:
+        # burst: one dict per item; spaced: a list per item (`tasks` body), the
+        # pong being the last task's.
+        - _p: >-
+            {{ [(x[-1] if isinstance(x, list) and x else x).get('pong')
+                for x in (pongs or [])
+                if isinstance(x, dict) or (isinstance(x, list) and x and isinstance(x[-1], dict))] }}
+        - _answered: "{{ [p for p in _p if isinstance(p, dict)] }}"
+        - m6_result:
+            measurement: M6
+            entity_id: "{{ entity_id }}"
+            sent: "{{ len(ids) }}"
+            answered: "{{ len(_answered) }}"
+            counts: "{{ [p.get('count') for p in _answered] }}"
+            summary_intact: "{{ all(p.get('pending_summary') == sentinel for p in _answered) }}"
+            checkpoints_seen: "{{ len([p for p in _answered if p.get('is_continue_as_new')]) }}"
+            final_seen: "{{ _answered[-1].get('seen') if _answered else None }}"
+            package_versions: "{{ [p.get('package_version') for p in _answered] }}"
+            # F43: every execution, continued-as-new or not, knows its package version.
+            versions_intact: "{{ bool(_answered) and all(p.get('package_version') for p in _answered) }}"
+            mode: "{{ mode }}"
+            # burst passes with no checkpoint (deferred by the runtime); spaced must
+            # actually have continued-as-new, or it proved nothing.
+            passed: >-
+              {{ len(_answered) == len(ids)
+                 and [p.get('count') for p in _answered] == list(range(1, len(ids) + 1))
+                 and all(p.get('pending_summary') == sentinel for p in _answered)
+                 and all(p.get('package_version') for p in _answered)
+                 and (mode == 'burst' or any(p.get('is_continue_as_new') for p in _answered)) }}

@@ -1,0 +1,8 @@
+{
+    "wfspec_package_name": "agent-moco-assistant",
+    "wfspec_package_version": "1.6.1",
+    "wfspec_description": "Moco Assistant: the reference agent on the agent harness (design Part II), rebuilding moco-examples-internal/moco-agent. Phase 1: chat + rag over moco-docs. Loaded as agent-moco-assistant/agent.moco-assistant; deployed into the same namespace as agent-harness.",
+    "share_to_all": true,
+    "sources": ["src/**/*.yaml"],
+    "tests": ["tests/**/*.test.yaml"]
+}

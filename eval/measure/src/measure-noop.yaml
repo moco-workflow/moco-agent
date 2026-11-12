@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# The trivial child for M2: one `set`, no activities. Whatever a call to it
+# costs is pure child-workflow overhead.
+header:
+  schema_version: 2.0.0
+  workflow_name: measure-noop
+input:
+  x: 0
+output:
+  y: "{{ y }}"
+main:
+  task_name: noop
+  set:
+    - y: "{{ x + 1 }}"

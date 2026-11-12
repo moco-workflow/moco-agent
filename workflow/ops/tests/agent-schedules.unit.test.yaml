@@ -1,0 +1,46 @@
+test_type: unit-test
+
+# agent-schedules: the specs it installs (plan-17 step 1). An off-by-default job is
+# CREATED paused; the update of an existing schedule never carries `paused`, so a
+# redeploy keeps what an admin paused or resumed.
+
+wfspec:
+  name: agent-schedules
+
+test_groups:
+  - step_name: build-requests
+    test_cases:
+      - id: one-request-per-job-sorted-with-ids-and-wfspecs
+        input: {mode: install, error: null, namespace_id: team}
+        expect:
+          assert:
+            - "{{ [r['job'] for r in requests] == ['janitor', 'keep_warm', 'knowledge_refresh', 'memory_promote', 'tool_provider_sync', 'tool_stats'] }}"
+            - "{{ requests[0]['schedule_id'] == 'team/agent-harness.janitor' }}"
+            - "{{ requests[0]['create']['name'] == 'agent-harness.janitor' }}"
+            - "{{ requests[0]['create']['namespace'] == 'team' }}"
+            - "{{ requests[0]['create']['wfspec_name'] == 'agent-harness-ops/agent-janitor' }}"
+            - "{{ requests[5]['update']['wfspec_name'] == 'agent-harness-tools/tool-stats-rollup' and requests[2]['update']['wfspec_name'] == 'agent-harness-knowledge/knowledge-refresh' }}"
+            - "{{ all(r['create']['if_exists'] == 'keep' for r in requests) }}"
+
+      - id: an-off-by-default-job-is-created-paused-and-an-update-never-sends-paused
+        input: {mode: install, error: null, namespace_id: team}
+        expect:
+          assert:
+            - "{{ requests[1]['create']['spec'] == {'every_sec': 300, 'paused': True, 'note': 'agent-harness job keep_warm'} }}"
+            - "{{ requests[0]['create']['spec']['paused'] == False }}"
+            - "{{ all('paused' not in r['update']['spec'] for r in requests) }}"
+            - "{{ requests[1]['create']['input_data'] == {'agent_id': 'skeleton'} }}"
+            - "{{ requests[1]['update']['input_data'] == {'agent_id': 'skeleton'} }}"
+
+      - id: the-job-table-is-the-source-of-the-specs
+        input:
+          mode: install
+          error: null
+          namespace_id: ops
+          jobs:
+            janitor: {wfspec: agent-harness-ops/agent-janitor, spec: {cron: ["7 * * * *"]}, enabled: true}
+        expect:
+          assert:
+            - "{{ len(requests) == 1 }}"
+            - "{{ requests[0]['create']['spec'] == {'cron': ['7 * * * *'], 'paused': False, 'note': 'agent-harness job janitor'} }}"
+            - "{{ requests[0]['update'] == {'namespace': 'ops', 'name': 'agent-harness.janitor', 'wfspec_name': 'agent-harness-ops/agent-janitor', 'spec': {'cron': ['7 * * * *']}, 'input_data': {}} }}"

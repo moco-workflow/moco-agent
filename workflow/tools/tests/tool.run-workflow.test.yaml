@@ -1,0 +1,66 @@
+test_type: integration-test
+
+# tool.run-workflow (design §6.9.4, workflow providers): a workflow tool runs the deployed
+# wfspec named by binding.workflow.ref with the model's args as its input; the target comes
+# from the binding, never from args, and harness packages are refused. Mocked by task name.
+
+wfspec:
+  name: tool.run-workflow
+
+test_cases:
+  - id: runs-the-bound-workflow-with-the-args-as-input
+    input:
+      args: {message: hi}
+      binding: {name: tool.run-workflow, workflow: {ref: "demo-tools/demo-echo"}, timeout_sec: 60}
+    mocks:
+      - step_name: run-target
+        _: "{{ {'echo': args['message'], 'target': target, 'timeout': run_timeout} }}"
+    expect:
+      assert:
+        - "{{ result == {'echo': 'hi', 'target': 'demo-tools/demo-echo', 'timeout': 60} }}"
+
+  - id: the-timeout-defaults-to-five-minutes
+    input:
+      binding: {workflow: {ref: "demo-tools/demo-echo"}}
+    mocks:
+      - {step_name: run-target, _: "{{ run_timeout }}"}
+    expect:
+      assert:
+        - "{{ result == 300 }}"
+
+  - id: a-ref-in-args-is-ignored
+    input:
+      args: {ref: "agent-harness/agent-admin"}
+      binding: {workflow: {ref: "demo-tools/demo-echo"}}
+    mocks:
+      - {step_name: run-target, _: "{{ target }}"}
+    expect:
+      assert:
+        - "{{ result == 'demo-tools/demo-echo' }}"
+
+  - id: a-missing-ref-is-a-bug
+    input:
+      binding: {workflow: {}}
+    mocks:
+      - {step_name: run-target, _: "{{ 1 / 0 }}"}
+    expect:
+      error:
+        error_type: AbortError
+
+  - id: a-bare-name-is-refused
+    input:
+      binding: {workflow: {ref: "demo-echo"}}
+    mocks:
+      - {step_name: run-target, _: "{{ 1 / 0 }}"}
+    expect:
+      error:
+        error_type: AbortError
+
+  - id: a-harness-package-is-refused
+    input:
+      binding: {workflow: {ref: "agent-harness/agent-admin"}}
+    mocks:
+      - {step_name: run-target, _: "{{ 1 / 0 }}"}
+    expect:
+      error:
+        error_type: AbortError

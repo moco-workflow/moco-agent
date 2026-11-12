@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL.MCP-CALL — call an MCP tool with a credential (design §6.9.4, F49)
+# ================================================================================
+#
+#   in                                            out
+#   ───────────────────────────────────────────── ─────────────────────────────────
+#   args, binding: {name, mcp: {endpoint,          {stopped, result} -- mcp.call_tool's
+#   tool_name, provider, secret_key,               own output, so it shapes exactly like
+#   credential_mode: service|user}}, user_id,      an `mcp` binding
+#   config, question
+#
+# The wfspec binding of every tool imported from a CREDENTIALED provider (tool-provider).
+# An `mcp` binding takes no secret, and the harness never fetches secrets at dispatch
+# (F49), so such a tool runs here: builtin.secret.get re-encrypts the secret with a
+# short-lived key and mcp.call_tool decrypts it inside the activity, sending it as
+# `Authorization: Bearer`. The plaintext never enters a workflow variable.
+#   service  a global secret: secret_key `global/<NAME>` (in_global_ns: true)
+#   user     the calling user's own secret <NAME> -- tool-policy already hid the tool
+#            (needs_credential) when the user has not stored it
+# tool-executor passes `binding` (the manifest's binding.wfspec) beside the usual
+# args / config / user_id; the endpoint and tool name come from it, never from args.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool.mcp-call
+
+context:
+  secret_pattern: "^(global/)?[A-Za-z0-9_.-]{1,128}$"
+  token:
+
+input:
+  args: {}
+  binding: {}
+  config: {}
+  user_id:
+  question:
+
+output:
+  stopped: "{{ call_result.get('stopped') }}"
+  result: "{{ call_result.get('result') }}"
+
+main:
+  tasks:
+    - task_name: read-binding
+      set:
+        - mcp_binding: "{{ (binding or {}).get('mcp') or {} }}"
+        - skey: "{{ str(mcp_binding.get('secret_key') or '') }}"
+        - is_global: "{{ skey.startswith('global/') }}"
+        - call_result: {}
+
+    - task_name: reject-bad-binding
+      raise:
+        if: >-
+          {{ not mcp_binding.get('endpoint') or not mcp_binding.get('tool_name')
+             or (bool(skey) and not re.match(secret_pattern, skey))
+             or (mcp_binding.get('credential_mode') == 'service' and not is_global) }}
+        type: error
+        error_type: AbortError
+        message: "tool.mcp-call: binding.mcp needs endpoint, tool_name and, for a service credential, a global/<NAME> secret_key"
+
+    - task_name: get-credential
+      skip_if: "{{ not skey }}"
+      activity:
+        type: builtin.secret.get
+        input:
+          secret_name: "{{ skey[len('global/'):] if is_global else skey }}"
+          in_global_ns: "{{ is_global }}"
+          expiration_seconds: 120
+      output:
+        set:
+          - token: "{{ _ }}"
+
+    - task_name: call-tool
+      activity:
+        type: mcp.call_tool
+        input:
+          endpoint: "{{ mcp_binding['endpoint'] }}"
+          tool_name: "{{ mcp_binding['tool_name'] }}"
+          arguments: "{{ args or {} }}"
+          encrypted_auth_token: "{{ token }}"
+        options:
+          retry_policy: {max_attempts: 1, timeout_sec: 300}
+      output:
+        set:
+          - call_result: "{{ _ if isinstance(_, dict) else {'result': _} }}"

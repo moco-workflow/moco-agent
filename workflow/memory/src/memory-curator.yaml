@@ -1,0 +1,381 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-CURATOR — conversation → long-term memory, detached (design §6.4.6)
+# ================================================================================
+#
+#   in                                              out
+#   ─────────────────────────────────────────────── ──────────────────────────────────
+#   agent_id, session_id, exchanges, grounding,     {ok, data: {stopped_at, kept, deduped,
+#   trigger, config, resolved_refs                   saved, conflicted, dropped_tombstoned,
+#                                                    extract_called}, error}
+#
+# Started DETACHED by `memory record` (the session passes the exchanges and records
+# last_curated_turn itself). It writes only memory rows, through memory-store, user
+# scope only (never agent scope from a conversation, §6.4.8); guests are refused by
+# memory-store's access check, and `record` does not even start for them.
+#
+# PIPELINE -- a REFINEMENT of §6.4.6's order (gate → extract → match → verdict →
+# write), made to meet the phase-2 exit "a repeated lesson dedups with NO chat-model
+# call": the match runs on the exchanges BEFORE extraction.
+#   1. gate        qset.memory.gate, decide_many: ONE request per exchange (F44);
+#                  keep worth_remembering ≥ decisions.memory.gate_min_p AND
+#                  (grounded_p ≥ decisions.guard.grounded_min_p OR user_stated ≥ 0.5).
+#                  None kept → stop. The classifier down → nothing kept (fail closed:
+#                  never learn on doubt). No chat-model call.
+#   2. pre-match   per kept exchange, ≤ 10 lexical candidates from the user scope
+#                  (word overlap with title + tags); qset.memory.match, decide_many,
+#                  one request per exchange (state = the exchange; same_<i> /
+#                  conflict_<i> nouls about candidate i). same ≥ same_min_p → the
+#                  exchange is a DUPLICATE: add_evidence on that item, and the exchange
+#                  is consumed (it never reaches a chat model).
+#   3. extract     only the exchanges left: prompt.memory.extract (decision role, JSON
+#                  schema) → ≤ 5 candidates, user scope.
+#   4. verdict     drop a candidate whose normalised title hashes to a forget tombstone;
+#                  a candidate whose key already exists → duplicate (add_evidence); one
+#                  sharing a word or tag with an item an exchange CONTRADICTED
+#                  (conflict ≥ conflict_min_p) → saved `conflicted` with conflicts_with;
+#                  else new.
+#   5. write       memory-store save / add_evidence. Keys are deterministic
+#                  (mem:<kind>:<slug of title>), evidence is one per session+turn, so a
+#                  re-run is idempotent.
+# Thresholds: config.decisions.memory {gate_min_p, same_min_p, conflict_min_p}, else
+# 0.5 / 0.6 / 0.6. Kinds: config.memory.long_term.kinds (strings, or {kind, hint} for
+# agent-defined kinds), minus `episode` (phase 3, on retire).
+#
+# EXCHANGES: [{turn?, user, assistant, grounded_p?}], or the conversation's
+# [{role, content}] list (paired user → assistant). grounding.grounded_p is the
+# fallback for an exchange without its own.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-curator
+
+context:
+  default_thresholds: {gate_min_p: 0.5, same_min_p: 0.6, conflict_min_p: 0.6}
+  default_kinds: [profile, fact, lesson]
+  user_stated_min_p: 0.5
+  max_candidates: 10
+  max_items: 5
+  hash_mod: 2305843009213693951
+  gate_results: []
+  user_items: []
+  tombstones: []
+  match_results: []
+  match_plan: []
+  deduped: []
+  remaining: []
+  conflict_keys: []
+  extracted: {}
+  to_save: []
+  to_extend: []
+  dropped_tombstoned: []
+  saved: []
+  conflicted: []
+  kept: []
+  match_items: []
+  curated_evidence: []
+  ex_list: []
+  stopped_at:
+  lt_vector: {}
+  ok: true
+  error:
+
+input:
+  agent_id:
+  session_id:
+  exchanges: []
+  grounding: {}
+  trigger: periodic
+  config: {}
+  resolved_refs: {}
+
+output:
+  ok: "{{ ok }}"
+  data:
+    stopped_at: "{{ stopped_at }}"
+    kept: "{{ len(kept) }}"
+    deduped: "{{ deduped }}"
+    saved: "{{ saved }}"
+    conflicted: "{{ conflicted }}"
+    dropped_tombstoned: "{{ dropped_tombstoned }}"
+    extract_called: "{{ bool(remaining) }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: normalise-input
+      set:
+        - _raw: "{{ [x for x in (exchanges or []) if isinstance(x, dict)] }}"
+        # A [{role, content}] list is paired: each user message with the reply after it.
+        - _pairs: >-
+            {{ [{'turn': None, 'user': str(_raw[i].get('content') or ''), 'assistant': str(_raw[i + 1].get('content') or '')}
+                for i in range(len(_raw) - 1)
+                if _raw[i].get('role') == 'user' and _raw[i + 1].get('role') == 'assistant']
+               if _raw and 'role' in _raw[0] else
+               [{'turn': x.get('turn'), 'user': str(x.get('user') or ''), 'assistant': str(x.get('assistant') or ''),
+                 'grounded_p': x.get('grounded_p')} for x in _raw] }}
+        - ex_list: >-
+            {{ [dict(x, idx=i, grounded_p=(x.get('grounded_p') if x.get('grounded_p') is not None else (grounding or {}).get('grounded_p')))
+                for i, x in enumerate(_pairs) if (x['user'] + x['assistant']).strip()] }}
+        - _lt: "{{ ((config or {}).get('memory') or {}).get('long_term') or {} }}"
+        - lt_vector: "{{ _lt.get('vector') or {} }}"
+        - kinds: >-
+            {{ [k for k in [(k.get('kind') if isinstance(k, dict) else k) for k in (_lt.get('kinds') or default_kinds)]
+                if isinstance(k, str) and k != 'episode'] or ['fact'] }}
+        - hints: "{{ {k['kind']: k.get('hint') for k in (_lt.get('kinds') or []) if isinstance(k, dict) and k.get('kind') and k.get('hint')} }}"
+        - thr: "{{ dict(default_thresholds, **{k: v for k, v in ((((config or {}).get('decisions') or {}).get('memory')) or {}).items() if v is not None}) }}"
+        - grounded_min: "{{ ((((config or {}).get('decisions') or {}).get('guard')) or {}).get('grounded_min_p') or 0.5 }}"
+        - enabled: "{{ _lt.get('enabled') is not False }}"
+        - access_lists: "{{ (config or {}).get('access') or {} }}"
+        - stopped_at: "{{ 'disabled' if not enabled else ('no_exchanges' if not ex_list else None) }}"
+
+    # ── 1. gate: one request per exchange (F44) ───────────────────────────────
+    - task_name: gate-exchanges
+      skip_if: "{{ stopped_at is not None }}"
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide_many
+          agent_id: "{{ agent_id }}"
+          qset: memory.gate
+          items: "{{ [{'exchange': {'user': x['user'], 'assistant': x['assistant']}, 'kinds': kinds, 'hints': hints} for x in ex_list] }}"
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: none
+      output:
+        set:
+          - gate_results: "{{ (((_ or {}).get('data') or {}).get('results')) or [] }}"
+
+    - task_name: read-gate
+      skip_if: "{{ stopped_at is not None }}"
+      set:
+        - _g: >-
+            {{ [((gate_results[i].get('data') or {}) if i < len(gate_results) and (gate_results[i] or {}).get('ok') else None)
+                for i in range(len(ex_list))] }}
+        - kept#: >-
+            {{ [dict(x, kind=((g.get('choices') or {}).get('kind') if (g.get('choices') or {}).get('kind') in kinds else kinds[0]))
+                for x, g in zip(ex_list, _g)
+                if g is not None
+                   and ((g.get('nouls') or {}).get('worth_remembering') or 0) >= thr['gate_min_p']
+                   and ((x.get('grounded_p') is not None and x['grounded_p'] >= grounded_min)
+                        or ((g.get('nouls') or {}).get('user_stated') or 0) >= user_stated_min_p)] }}
+        - stopped_at: "{{ 'gate' if not kept else None }}"
+
+    # ── 2. pre-match against the user scope ──────────────────────────────────
+    - task_name: list-memory
+      skip_if: "{{ stopped_at is not None }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", scope: user, kinds: "{{ kinds }}"}
+      output:
+        set:
+          - user_items: "{{ [r for r in ((((_ or {}).get('data') or {}).get('items')) or []) if r.get('status') in ['active', 'conflicted']] }}"
+
+    - task_name: list-tombstones
+      skip_if: "{{ stopped_at is not None }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input: {mode: list_tombstones, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - tombstones: "{{ (((_ or {}).get('data') or {}).get('hashes')) or [] }}"
+
+    - task_name: plan-match
+      skip_if: "{{ stopped_at is not None }}"
+      set:
+        - _words: "{{ [set(re.findall(r'[a-z0-9]{3,}', (x['user'] + ' ' + x['assistant']).lower())) for x in kept] }}"
+        - _iw: >-
+            {{ [set(re.findall(r'[a-z0-9]{3,}', (str(m.get('title') or '') + ' ' + ' '.join(str(t) for t in (m.get('tags') or []))).lower()))
+                for m in user_items] }}
+        # (exchange, candidates): the most overlapping items first, ties by key.
+        - match_plan: >-
+            {{ [{'x': x, 'cands': [user_items[j] for j in sorted([j for j in range(len(user_items)) if len(_words[i] & _iw[j]) > 0],
+                                                                  key=lambda j: (-len(_words[i] & _iw[j]), str(user_items[j].get('key'))))][:max_candidates]}
+                for i, x in enumerate(kept)] }}
+        - match_items: "{{ [p for p in match_plan if p['cands']] }}"
+
+    - task_name: match-exchanges
+      skip_if: "{{ stopped_at is not None or not match_items }}"
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide_many
+          agent_id: "{{ agent_id }}"
+          qset: memory.match
+          items: >-
+            {{ [{'exchange': {'user': p['x']['user'], 'assistant': p['x']['assistant']},
+                 'candidates': [{'key': c.get('key'), 'title': c.get('title'), 'text': c.get('text')} for c in p['cands']]}
+                for p in match_items] }}
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: none
+      output:
+        set:
+          - match_results: "{{ (((_ or {}).get('data') or {}).get('results')) or [] }}"
+
+    - task_name: read-match
+      skip_if: "{{ stopped_at is not None }}"
+      set:
+        - _n: >-
+            {{ [((match_results[i].get('data') or {}).get('nouls') or {}) if i < len(match_results) and (match_results[i] or {}).get('ok') else {}
+                for i in range(len(match_items))] }}
+        # duplicate: the candidate with the highest same_<i> at or above the threshold.
+        - _dup: >-
+            {{ [(p, max(range(len(p['cands'])), key=lambda j: n.get('same_' + str(j)) or 0))
+                for p, n in zip(match_items, _n)
+                if any((n.get('same_' + str(j)) or 0) >= thr['same_min_p'] for j in range(len(p['cands'])))] }}
+        - deduped#: "{{ [{'key': p['cands'][j]['key'], 'idx': p['x']['idx'], 'turn': p['x'].get('turn')} for p, j in _dup] }}"
+        - remaining: "{{ [x for x in kept if x['idx'] not in [d['idx'] for d in deduped]] }}"
+        - conflict_keys: >-
+            {{ sorted(set(p['cands'][j]['key'] for p, n in zip(match_items, _n) if p['x']['idx'] not in [d['idx'] for d in deduped]
+                          for j in range(len(p['cands'])) if (n.get('conflict_' + str(j)) or 0) >= thr['conflict_min_p'])) }}
+        - stopped_at: "{{ 'deduped' if not remaining else None }}"
+
+    - task_name: write-dedupes
+      skip_if: "{{ not deduped }}"
+      loop:
+        in: "{{ deduped }}"
+        foreach: dup
+        do:
+          task_name: add-evidence
+          workflow:
+            ref: memory-store
+            mode: inline
+            input:
+              mode: add_evidence
+              agent_id: "{{ agent_id }}"
+              scope: user
+              key: "{{ dup['key'] }}"
+              evidence: [{session_id: "{{ session_id }}", turn: "{{ dup['turn'] }}", source: curated}]
+              definition_access: "{{ access_lists }}"
+              promotion_pool: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('promotion')) is True }}"
+          on_error:
+            catch: true
+
+    # ── 3. extract: only what did not repeat a remembered item ───────────────
+    - task_name: extract-candidates
+      skip_if: "{{ stopped_at is not None }}"
+      workflow:
+        ref: agent-harness-foundation/llm-invoke
+        mode: inline
+        input:
+          mode: render_and_chat
+          agent_id: "{{ agent_id }}"
+          role: decision
+          models: "{{ (config or {}).get('models') or {} }}"
+          prompt: memory.extract
+          resolved_refs: "{{ resolved_refs }}"
+          variables:
+            exchanges: "{{ [{'user': x['user'], 'assistant': x['assistant']} for x in remaining] }}"
+            kinds: "{{ kinds }}"
+            hints: "{{ hints }}"
+            max_items: "{{ max_items }}"
+      output:
+        set:
+          - extracted: "{{ _ or {} }}"
+
+    # ── 4. verdict ───────────────────────────────────────────────────────────
+    - task_name: plan-save
+      skip_if: "{{ stopped_at is not None }}"
+      set:
+        - _items: >-
+            {{ [i for i in ((((extracted.get('data') or {}).get('parsed') or {}).get('items')) or [])
+                if isinstance(i, dict) and str(i.get('title') or '').strip()][:max_items] if extracted.get('ok') else [] }}
+        - _cands: >-
+            {{ [dict(i, kind=(i.get('kind') if i.get('kind') in kinds else kinds[0]),
+                     slug=re.sub(r'-+', '-', re.sub(r'[^a-z0-9-]+', '-', str(i['title']).lower())).strip('-')[:48].strip('-'),
+                     norm=' '.join(re.findall(r'[a-z0-9]+', str(i['title']).lower())))
+                for i in _items] }}
+        - _hashed: >-
+            {{ [(c, '%016x%016x' % (sum(ord(ch) * pow(31, k, hash_mod) for k, ch in enumerate(c['norm'])) % hash_mod,
+                                    sum(ord(ch) * pow(37, k, hash_mod) for k, ch in enumerate(c['norm'])) % hash_mod))
+                for c in _cands if c['slug']] }}
+        - dropped_tombstoned: "{{ [c['title'] for c, h in _hashed if h in tombstones] }}"
+        - _live: "{{ [c for c, h in _hashed if h not in tombstones] }}"
+        - _existing: "{{ {m.get('key'): m for m in user_items} }}"
+        - _turn: "{{ max([x.get('turn') for x in remaining if isinstance(x.get('turn'), int)] or [None]) if any(isinstance(x.get('turn'), int) for x in remaining) else None }}"
+        - _evidence: "{{ [{'session_id': session_id, 'turn': _turn, 'source': 'curated'}] }}"
+        - to_extend: "{{ ['mem:' + c['kind'] + ':' + c['slug'] for c in _live if ('mem:' + c['kind'] + ':' + c['slug']) in _existing] }}"
+        - to_save: >-
+            {{ [{'kind': c['kind'], 'slug': c['slug'], 'title': c['title'], 'text': str(c.get('text') or ''),
+                 'tags': list(c.get('tags') or []), 'pinned': False, 'evidence': _evidence,
+                 'status': 'conflicted' if [k for k in conflict_keys
+                                             if set(re.findall(r'[a-z0-9]{3,}', (c['title'] + ' ' + ' '.join(str(t) for t in (c.get('tags') or []))).lower()))
+                                                & set(re.findall(r'[a-z0-9]{3,}', (str(_existing[k].get('title') or '') + ' ' + ' '.join(str(t) for t in (_existing[k].get('tags') or []))).lower()))]
+                           else 'active',
+                 'conflicts_with': [k for k in conflict_keys
+                                    if set(re.findall(r'[a-z0-9]{3,}', (c['title'] + ' ' + ' '.join(str(t) for t in (c.get('tags') or []))).lower()))
+                                       & set(re.findall(r'[a-z0-9]{3,}', (str(_existing[k].get('title') or '') + ' ' + ' '.join(str(t) for t in (_existing[k].get('tags') or []))).lower()))]}
+                for c in _live if ('mem:' + c['kind'] + ':' + c['slug']) not in _existing] }}
+        - curated_evidence: "{{ _evidence }}"
+
+    # ── 5. write ─────────────────────────────────────────────────────────────
+    - task_name: write-candidates
+      skip_if: "{{ stopped_at is not None or not to_save }}"
+      loop:
+        in: "{{ to_save }}"
+        foreach: candidate_item
+        do:
+          task_name: save-candidate
+          workflow:
+            ref: memory-store
+            mode: inline
+            input:
+              mode: save
+              agent_id: "{{ agent_id }}"
+              scope: user
+              item: "{{ candidate_item }}"
+              definition_access: "{{ access_lists }}"
+              promotion_pool: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('promotion')) is True }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - saved: "{{ [(r.get('data') or {}).get('item', {}).get('key') for r in (_ or []) if isinstance(r, dict) and r.get('ok')] }}"
+          - conflicted: "{{ [(r.get('data') or {}).get('item', {}).get('key') for r in (_ or []) if isinstance(r, dict) and r.get('ok') and ((r.get('data') or {}).get('item') or {}).get('status') == 'conflicted'] }}"
+
+    - task_name: write-extensions
+      skip_if: "{{ stopped_at is not None or not to_extend }}"
+      loop:
+        in: "{{ to_extend }}"
+        foreach: extend_key
+        do:
+          task_name: add-evidence-extracted
+          workflow:
+            ref: memory-store
+            mode: inline
+            input:
+              mode: add_evidence
+              agent_id: "{{ agent_id }}"
+              scope: user
+              key: "{{ extend_key }}"
+              evidence: "{{ curated_evidence }}"
+              definition_access: "{{ access_lists }}"
+              promotion_pool: "{{ ((((config or {}).get('memory') or {}).get('long_term') or {}).get('promotion')) is True }}"
+          on_error:
+            catch: true
+
+    # The derived vector index (phase 3): the new items. Evidence-only updates keep
+    # their text, so their vectors stand.
+    - task_name: index-saved
+      skip_if: "{{ stopped_at is not None or not saved or lt_vector.get('enabled') is not True }}"
+      workflow:
+        ref: memory-vector
+        mode: inline
+        input:
+          mode: upsert
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          items: "{{ [dict(c, key='mem:' + c['kind'] + ':' + c['slug']) for c in to_save if ('mem:' + c['kind'] + ':' + c['slug']) in saved] }}"
+      on_error:
+        catch: true
+
+    - task_name: finish
+      set:
+        - deduped: "{{ [d['key'] for d in deduped] + to_extend }}"
+        - stopped_at: "{{ stopped_at or 'written' }}"

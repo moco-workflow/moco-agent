@@ -1,0 +1,168 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-EPISODE — digest a retiring session into an episode item, detached (§6.4.6)
+# ================================================================================
+#
+#   in                                              out
+#   ─────────────────────────────────────────────── ──────────────────────────────────
+#   agent_id, session_id, key, title, summary,      {ok, data: {key, digested, created,
+#   exchanges, upto_turn, config, resolved_refs      item}, error}
+#
+# Started DETACHED by `memory record_episode`, which has already checked the caller,
+# the config and the turn count, and picked the key. It writes one row, through
+# memory-store, user scope only (never agent scope from a conversation, §6.4.8).
+#
+#   1. digest  prompt.episode.digest (decision role, JSON schema) over the session's
+#              title, rolling summary and recent exchanges →
+#              {title, summary, topics, outcomes, open_items}
+#   2. shape   kind episode; title = the digest's (else the session title); text =
+#              summary + outcomes + open items (memory-store clamps it to 1500);
+#              tags = topics; unpinned; evidence {session_id, turn: upto_turn,
+#              source: learned}, so support is 1 like any fresh learned item
+#   3. save    memory-store save on the given key
+# The digest failing is not the end: with a rolling summary the episode is saved from
+# the session title and that summary (`digested: false`); with neither there is
+# nothing worth keeping and nothing is written.
+#
+# ONE EPISODE PER SESSION: the key comes from the session id, so a session that is
+# reactivated and retires again re-saves the same item with a digest of the whole
+# conversation (the summary is rolling), and evidence stays one entry per turn. An
+# episode the user forgot is retired, and memory-store refuses a save over a retired
+# key: it is not resurrected.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-episode
+
+context:
+  key_pattern: "^mem:episode:[a-z0-9-]{1,48}$"
+  max_tags: 6
+  max_lines: 5
+  digest_result: {}
+  save_result: {}
+  item: {}
+  digested: false
+  ok: false
+  error:
+
+input:
+  agent_id:
+  session_id:
+  key:
+  title: ""
+  summary: ""
+  exchanges: []
+  upto_turn:
+  config: {}
+  resolved_refs: {}
+
+output:
+  ok: "{{ ok }}"
+  data:
+    key: "{{ key }}"
+    digested: "{{ digested }}"
+    created: "{{ bool(((save_result.get('data') or {}).get('created'))) }}"
+    item: "{{ item }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-bad-key
+      raise:
+        if: "{{ not re.match(key_pattern, str(key or '')) }}"
+        type: error
+        error_type: AbortError
+        message: "memory-episode: key must match {{ key_pattern }}, got '{{ key }}'"
+
+    # ── 1. digest ────────────────────────────────────────────────────────────
+    - task_name: digest-session
+      workflow:
+        ref: agent-harness-foundation/llm-invoke
+        mode: inline
+        input:
+          mode: render_and_chat
+          agent_id: "{{ agent_id }}"
+          role: decision
+          models: "{{ (config or {}).get('models') or {} }}"
+          prompt: episode.digest
+          resolved_refs: "{{ resolved_refs }}"
+          variables:
+            title: "{{ title }}"
+            summary: "{{ summary }}"
+            exchanges: "{{ exchanges }}"
+      output:
+        set:
+          - digest_result: "{{ _ or {} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - digest_result: {}
+
+    # ── 2. shape ─────────────────────────────────────────────────────────────
+    - task_name: shape-episode
+      set:
+        - _parsed: "{{ ((digest_result.get('data') or {}).get('parsed') or {}) if digest_result.get('ok') else {} }}"
+        - _d: "{{ _parsed if isinstance(_parsed, dict) and str(_parsed.get('title') or '').strip() else {} }}"
+        - digested#: "{{ bool(_d) }}"
+        - _outcomes: "{{ [' '.join(str(x).split()).rstrip('.;') for x in (_d.get('outcomes') if isinstance(_d.get('outcomes'), list) else []) if str(x).strip(' .;')][:max_lines] }}"
+        - _open: "{{ [' '.join(str(x).split()).rstrip('.;') for x in (_d.get('open_items') if isinstance(_d.get('open_items'), list) else []) if str(x).strip(' .;')][:max_lines] }}"
+        - _summary: "{{ ' '.join(str(_d.get('summary') if digested else (summary or '')).split()) }}"
+        - _title: >-
+            {{ ' '.join(str(_d.get('title') if digested else '').split())
+               or ' '.join(str(title or '').split())
+               or ('Conversation on ' + now().strftime('%Y-%m-%d')) }}
+        - _text: >-
+            {{ _summary
+               + (('\nOutcomes: ' + '; '.join(_outcomes)) if _outcomes else '')
+               + (('\nOpen items: ' + '; '.join(_open)) if _open else '') }}
+        - _tags: >-
+            {{ list(dict.fromkeys(t for t in (re.sub(r'[^a-z0-9-]+', '-', str(x).lower()).strip('-')
+                                              for x in (_d.get('topics') if isinstance(_d.get('topics'), list) else [])) if t))[:max_tags] }}
+        - item: >-
+            {{ {'kind': 'episode', 'slug': str(key).split(':')[2], 'title': _title, 'text': _text.strip(),
+                'tags': _tags, 'pinned': False,
+                'evidence': [{'session_id': session_id, 'turn': upto_turn, 'source': 'learned'}]}
+               if _text.strip() else {} }}
+        - error: >-
+            {{ None if item else
+               {'code': 'nothing_to_record', 'message': 'the digest failed and the session has no summary', 'retryable': True} }}
+
+    # ── 3. save ──────────────────────────────────────────────────────────────
+    - task_name: save-episode
+      skip_if: "{{ not item }}"
+      workflow:
+        ref: memory-store
+        mode: inline
+        input:
+          mode: save
+          agent_id: "{{ agent_id }}"
+          scope: user
+          key: "{{ key }}"
+          item: "{{ item }}"
+          definition_access: "{{ (config or {}).get('access') or {} }}"
+      output:
+        set:
+          - save_result: "{{ _ or {} }}"
+      on_error:
+        catch: true
+        do:
+          set:
+            - save_result: "{{ {'ok': False, 'error': {'code': 'save_failed', 'message': str(_.get('error_message'))[:300], 'retryable': True}} }}"
+
+    # The derived vector index (phase 3), when on.
+    - task_name: index-episode
+      skip_if: "{{ not item or not save_result.get('ok') or (((((config or {}).get('memory') or {}).get('long_term') or {}).get('vector')) or {}).get('enabled') is not True }}"
+      workflow:
+        ref: memory-vector
+        mode: inline
+        input: {mode: upsert, agent_id: "{{ agent_id }}", config: "{{ config }}", items: "{{ [dict(item, key=key)] }}"}
+      on_error:
+        catch: true
+
+    - task_name: finish
+      skip_if: "{{ not item }}"
+      set:
+        - ok: "{{ save_result.get('ok') == True }}"
+        - error: "{{ None if save_result.get('ok') else save_result.get('error') }}"

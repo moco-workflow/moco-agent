@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-RENDER — render a manifest template with only args, result, config, user_id
+# ================================================================================
+#
+#   in                                       out
+#   ──────────────────────────────────────── ──────────────────────────
+#   template, args, result, config, user_id  {rendered}
+#
+# The manifest templates (binding.activity.input_template, result.shape,
+# result.sources, policy.approval_template) are DATA written by an admin: the
+# sandbox has no eval, and a template must not see session or memory state
+# (§6.9.3). So tool-executor runs this file INLINE: a child starts with a fresh
+# context, which holds only the four inputs (plus `true`/`false`/`null`, below, and
+# this file's own `template` and scratch names -- nothing of the caller's).
+#
+# HOW. A template of any shape (string, mapping, list, scalar) is serialised with
+# json.dumps; every JSON string token is turned into Python code --
+#   "{{ e }}"              → (e)                       the typed value
+#   "a {{ e }} b"          → ('a ' + str(e) + ' b')    interpolation
+#   "plain"                → 'plain'
+# A string that starts with `{{`, ends with `}}` and holds one `{{` is one whole
+# expression whatever braces it contains (`{{ {'a': {'b': 1}} }}`), as in the engine;
+# only interpolated strings are split, non-greedily, at `}}`.
+# -- and the whole is wrapped in ONE expression, which the second `#python` pass
+# evaluates in this context. JSON is Python apart from true/false/null, which are
+# bound here as names. A JSON object can never start with `{{` (keys are strings),
+# so the wrapper is the only `{{` in the code and the evaluator keeps its type.
+#
+# A template that fails to evaluate raises: tool-executor catches it on the
+# calling task and returns error: invalid_template to the model.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-render
+
+context:
+  "true": true
+  "false": false
+  "null": null
+
+input:
+  template:
+  args: {}
+  result:
+  config: {}
+  user_id:
+
+output:
+  rendered: "{{ rendered }}"
+
+main:
+  task_name: render-template
+  set:
+    # chr(123)/chr(125) are the braces: a literal pair in an expression would end it.
+    - _o: "{{ chr(123) * 2 }}"
+    - _c: "{{ chr(125) * 2 }}"
+    - _split: "{{ re.escape(_o) + '(.*?)' + re.escape(_c) }}"
+    - _code: >-
+        {{ _o + ' ' + re.sub(r'"(?:[^"\\]|\\.)*"',
+             lambda m: (lambda s, parts:
+                          repr(s) if len(parts) == 1 else
+                          '(' + parts[1] + ')' if len(parts) == 3 and parts[0] == '' and parts[2] == '' else
+                          '(' + ' + '.join(repr(p) if i % 2 == 0 else 'str(' + p + ')'
+                                           for i, p in enumerate(parts) if i % 2 == 1 or p != '') + ')'
+                       )(json.loads(m.group(0)),
+                         (lambda t: ['', t.strip()[2:-2], ''] if t.strip().startswith(_o) and t.strip().endswith(_c) and t.count(_o) == 1
+                                    else re.split(_split, t, flags=re.S))(json.loads(m.group(0)))),
+             json.dumps(template)) + ' ' + _c }}
+    - rendered#python#python: "{{ _code }}"

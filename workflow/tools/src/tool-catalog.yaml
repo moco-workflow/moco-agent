@@ -1,0 +1,217 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-CATALOG — the harness built-in tools and the harness-builtin toolset (§6.9.10)
+# ================================================================================
+#
+#   in   —
+#   out  {tools: [manifest, ...], toolsets: [toolset row, ...]}
+#
+# DATA. The harness exposes some of its own modules as tools, so a `react` profile
+# can do agentic retrieval and memory without a custom wfspec. Manifests here have
+# the same shape as tool-registry rows, with origin: builtin, status: enabled and a
+# `builtin` binding {module, mode} that tool-executor dispatches itself:
+#
+#   tool              module          side effects   permission
+#   ───────────────── ─────────────── ────────────── ──────────
+#   knowledge_search  knowledge       none           auto
+#   memory_recall     memory          none           auto
+#   memory_remember   memory          write          approve     (user / session scope only)
+#   read_artifact     tool-executor   none           auto        (pinned when the turn has an artifact)
+#   ask_user          loop            none           auto        (the loop suspends; the reply is the result)
+#   current_time      builtin.now     none           auto
+#
+# Only `tool-registry` reads this file (members, list), so built-ins resolve like
+# any toolset an agent opts into: `toolsets: [harness-builtin]`. They are never
+# rows, and tool-registry `save` refuses a `builtin` binding.
+#
+# `memory_*` need the memory manager (plan-07); until an agent enables long-term
+# memory, tool-executor answers them with error: unavailable.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-catalog
+
+context:
+  read_policy: &read_policy
+    side_effects: none
+    permission: auto
+    idempotent: true
+    allow_session_grant: false
+    approval_template: null
+    limits: {per_turn: 4, per_session: 50}
+    enabled_for: {users: ["*"], denied_users: []}
+
+  # #literal: approval_template holds a {{ }} template for tool-executor to render.
+  tools#literal:
+    - name: knowledge_search
+      title: Search knowledge
+      description: >-
+        Search the indexed knowledge sources this agent may use. Returns numbered passages
+        with titles and links. Use it for documentation and how-to questions.
+      parameters:
+        type: object
+        properties:
+          query: {type: string, description: "What to search for, as a standalone question or keywords."}
+        required: [query]
+      binding: {builtin: {module: knowledge, mode: retrieve}}
+      policy: *read_policy
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: [{args: {query: "how do retries work"}, note: "documentation lookup"}]
+      result: {schema: null, shape: null, max_chars: 8000, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 30, mode: sync, retry: {max_attempts: 1}}
+      tags: [builtin, knowledge, search, documentation]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+    - name: memory_recall
+      title: Recall memory
+      description: >-
+        Look up what you remember about this user or this conversation: preferences,
+        facts they told you, lessons from earlier sessions.
+      parameters:
+        type: object
+        properties:
+          query: {type: string, description: "What to recall."}
+        required: [query]
+      binding: {builtin: {module: memory, mode: recall}}
+      policy: *read_policy
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: []
+      result: {schema: null, shape: null, max_chars: 4000, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 1}}
+      tags: [builtin, memory, recall, remember, preference]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+    - name: memory_remember
+      title: Remember
+      description: >-
+        Save a fact or preference about this user for later conversations. Only when the
+        user asks you to remember something.
+      parameters:
+        type: object
+        properties:
+          text: {type: string, description: "The fact or preference, as one sentence."}
+          kind: {type: string, enum: [fact, profile], description: "profile for a preference, fact otherwise."}
+          scope: {type: string, enum: [user, session]}
+        required: [text]
+      binding: {builtin: {module: memory, mode: remember}}
+      policy:
+        side_effects: write
+        permission: approve
+        idempotent: false
+        allow_session_grant: true
+        approval_template: "Remember: {{ args.get('text') }}?"
+        limits: {per_turn: 2, per_session: 20}
+        enabled_for: {users: ["*"], denied_users: [guest]}
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: []
+      result: {schema: null, shape: null, max_chars: 2000, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 1}}
+      tags: [builtin, memory, remember, save]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+    - name: read_artifact
+      title: Read artifact
+      description: >-
+        Read more of a large tool result that was truncated. Pass the artifact_ref from
+        the truncated result and the offset to continue from.
+      parameters:
+        type: object
+        properties:
+          artifact_ref: {type: string}
+          offset: {type: integer}
+          limit: {type: integer}
+        required: [artifact_ref]
+      binding: {builtin: {module: tool-executor, mode: read_artifact}}
+      policy: *read_policy
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: []
+      result: {schema: null, shape: null, max_chars: 8000, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 10, mode: sync, retry: {max_attempts: 2}}
+      tags: [builtin, artifact, truncated, more]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+    - name: ask_user
+      title: Ask the user
+      description: >-
+        Ask the user a clarifying question when you cannot continue without their answer.
+        Their reply comes back as the result.
+      parameters:
+        type: object
+        properties:
+          question: {type: string}
+        required: [question]
+      binding: {builtin: {module: loop, mode: ask_user}}
+      policy: *read_policy
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: []
+      result: {schema: null, shape: null, max_chars: 4000, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 10, mode: sync, retry: {max_attempts: 1}}
+      tags: [builtin, ask, clarify, question]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+    - name: current_time
+      title: Current time
+      description: "The current date and time (UTC, ISO 8601)."
+      parameters: {type: object, properties: {}}
+      binding: {builtin: {module: builtin.now, mode: now}}
+      policy: *read_policy
+      schema_version: 1
+      version: 1
+      scope: shared
+      origin: builtin
+      status: enabled
+      examples: []
+      result: {schema: null, shape: null, max_chars: 200, sources: null}
+      credential: {mode: none, secret_key: null, connect_hint: null}
+      execution: {timeout_sec: 10, mode: sync, retry: {max_attempts: 2}}
+      tags: [builtin, time, date, now, today]
+      toolsets: [harness-builtin]
+      deprecated_by: null
+
+  toolsets:
+    - schema_version: 1
+      name: harness-builtin
+      scope: shared
+      description: "The harness's own modules as tools: knowledge search, memory, artifacts, ask the user, the time."
+      tools: [knowledge_search, memory_recall, memory_remember, read_artifact, ask_user, current_time]
+      always_offer: []
+
+output:
+  tools: "{{ tools }}"
+  toolsets: "{{ toolsets }}"
+
+main:
+  task_name: emit-catalog
+  set:
+    - _loaded: true

@@ -1,0 +1,411 @@
+test_type: integration-test
+
+# tool-executor (plan-10 steps 7-10, design §6.9.9). tool-render runs for real, so
+# the manifests' templates are really rendered; dispatch, guard, knowledge and the
+# artifact store are mocked by task name. A "{{ 1 / 0 }}" mock is the sentinel that
+# a step did NOT run. `{{ int('timeout') }}` is a task error whose message contains
+# "timeout": a transient error for the retry rule.
+
+wfspec:
+  name: tool-executor
+
+test_data:
+  pods: &pods
+    name: k8s_pods
+    version: 3
+    title: List pods
+    description: List the pods in a namespace.
+    status: enabled
+    effective_permission: auto
+    parameters: {type: object, properties: {namespace: {type: string}, limit: {type: integer}, phase: {type: string, enum: [Running, Pending]}}, required: [namespace]}
+    binding: {activity: {type: k8s.list, input_template: {kind: Pod, namespace: "{{ args['namespace'] }}", connection: {token_secret_key: global/K8S_TOKEN}}}}
+    result: {shape: "{{ [i['name'] for i in result['items']] }}", max_chars: 8000, sources: null}
+    policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 2, per_session: 10}}
+    execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 2}}
+  scale: &scale
+    name: k8s_scale
+    version: 1
+    title: Scale deployment
+    description: Scale a deployment.
+    status: enabled
+    effective_permission: approve
+    parameters: {type: object, properties: {name: {type: string}, replicas: {type: integer}}, required: [name, replicas]}
+    binding: {activity: {type: k8s.patch, input_template: {name: "{{ args['name'] }}", replicas: "{{ args['replicas'] }}"}}}
+    result: {max_chars: 8000}
+    policy: {side_effects: write, permission: approve, idempotent: false, allow_session_grant: true,
+             approval_template: "Scale {{ args['name'] }} to {{ args['replicas'] }} replicas?", limits: {per_turn: 2, per_session: 10}}
+    execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 3}}
+  report: &report
+    name: pod_report
+    version: 1
+    title: Pod report
+    description: A long report on the pods of a namespace.
+    status: enabled
+    effective_permission: auto
+    parameters: {type: object, properties: {namespace: {type: string}}, required: [namespace]}
+    binding: {activity: {type: k8s.list, input_template: {kind: Pod, namespace: "{{ args['namespace'] }}"}}}
+    result: {max_chars: 8000}
+    policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 2, per_session: 10}}
+    execution: {timeout_sec: 1800, mode: async, retry: {max_attempts: 1}}
+  scale_async: &scale_async
+    name: k8s_scale
+    version: 1
+    title: Scale deployment
+    description: Scale a deployment.
+    status: enabled
+    effective_permission: approve
+    parameters: {type: object, properties: {name: {type: string}, replicas: {type: integer}}, required: [name, replicas]}
+    binding: {activity: {type: k8s.patch, input_template: {name: "{{ args['name'] }}", replicas: "{{ args['replicas'] }}"}}}
+    result: {max_chars: 8000}
+    policy: {side_effects: write, permission: approve, idempotent: false, allow_session_grant: true,
+             approval_template: "Scale {{ args['name'] }} to {{ args['replicas'] }} replicas?", limits: {per_turn: 2, per_session: 10}}
+    execution: {timeout_sec: 600, mode: async, retry: {max_attempts: 1}}
+  items: &items {result: {items: [{name: web-1}, {name: web-2}]}}
+  fence: &fence {ok: true, data: {items: [{text: '["web-1", "web-2"]', n: 1, action: fence, injection_p: 0.05}], degraded: false}}
+  base: &base {mode: call, agent_id: ops, session_id: s1, turn: 4, question: "list pods in staging", budget_sec: 60}
+
+test_cases:
+
+  # ── a successful call ───────────────────────────────────────────────────
+  - id: an-activity-call-renders-dispatches-shapes-screens-and-audits
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 4, question: "list pods", budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: "{\"namespace\": \"staging\"}"}}
+    mocks:
+      - {step_name: dispatch-activity, _: *items}
+      - {step_name: screen-result, _: *fence}
+    expect:
+      assert:
+        - "{{ ok == True and data['status'] == 'ok' and data['content'] == '[\"web-1\", \"web-2\"]' and data['truncated'] == False }}"
+        - "{{ data['audit']['tool'] == 'k8s_pods' and data['audit']['version'] == 3 and data['audit']['status'] == 'ok' and data['audit']['turn'] == 4 }}"
+        - "{{ bool(re.fullmatch(r'[0-9a-f]{32}', data['audit']['args_hash'])) and data['audit']['attempts'] == 1 and data['pending'] is None }}"
+        - "{{ data['screen'] == {'action': 'fence', 'injection_p': 0.05, 'degraded': False} }}"
+
+  - id: dry-run-renders-the-binding-without-dispatching
+    input: {mode: dry_run, agent_id: ops, manifest: *pods, arguments: {namespace: staging}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data:
+            validated: true
+            problems: []
+            rendered_binding: {activity: {type: k8s.list, input: {kind: Pod, namespace: staging, connection: {token_secret_key: global/K8S_TOKEN}}}}
+            would_require: auto
+
+  # merge_args (activity providers): the arguments are the input, the fixed values win.
+  - id: merge-args-makes-the-arguments-the-input-under-the-fixed-values
+    input:
+      mode: dry_run
+      agent_id: ops
+      arguments: {query: "select 1", connection_string_secret_key: "attacker"}
+      manifest:
+        name: moco_sql_query
+        version: 1
+        description: Run a SQL query.
+        status: enabled
+        effective_permission: auto
+        parameters: {type: object, properties: {query: {type: string}}, required: [query]}
+        binding: {activity: {type: sql.query, input_template: {connection_string_secret_key: "global/DB"}, merge_args: true}}
+        result: {max_chars: 8000}
+        policy: {side_effects: read, permission: auto, idempotent: true, limits: {per_turn: 2, per_session: 10}}
+        execution: {timeout_sec: 20, mode: sync, retry: {max_attempts: 1}}
+    expect:
+      assert:
+        - "{{ data['rendered_binding'] == {'activity': {'type': 'sql.query', 'input': {'query': 'select 1', 'connection_string_secret_key': 'global/DB'}}} }}"
+
+  - id: dry-run-reports-bad-arguments
+    input: {mode: dry_run, agent_id: ops, manifest: *scale, arguments: {name: web}}
+    expect:
+      assert:
+        - "{{ data['validated'] == False and data['problems'] == ['missing required argument replicas'] and data['would_require'] == 'approve' }}"
+
+  # ── validation: returned to the model ───────────────────────────────────
+  - id: a-missing-argument-is-a-tool-result-not-a-raise
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 4, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'error' and data['content'] == 'error: invalid_arguments: missing required argument namespace' }}"
+        - "{{ data['audit']['error']['code'] == 'invalid_arguments' and data['audit']['status'] == 'error' }}"
+
+  - id: types-and-enums-are-checked
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: staging, limit: "5", phase: Dead}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['content'] == 'error: invalid_arguments: limit must be integer; phase must be one of \"Running\", \"Pending\"' }}"
+
+  - id: arguments-that-are-not-json-are-a-tool-result
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: "{namespace: staging"}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['content'] == 'error: invalid_arguments: arguments are not a JSON object' }}"
+
+  # ── authorisation ───────────────────────────────────────────────────────
+  - id: an-approve-tool-without-a-token-needs-approval
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 4, budget_sec: 60, manifest: *scale, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'needs_approval' and data['pending']['kind'] == 'tool_call' and data['pending']['summary'] == 'Scale web to 3 replicas?' }}"
+        - "{{ data['pending']['offer_session_grant'] == True and data['pending']['detail']['call'] == {'id': 'c9', 'name': 'k8s_scale', 'arguments': {'name': 'web', 'replicas': 3}} }}"
+        - "{{ data['pending']['detail']['args_hash'] == data['audit']['args_hash'] and data['pending']['detail']['call_version'] == 1 }}"
+
+  # 0c5afd84… is the args_hash of {"name": "web", "replicas": 3} (canonical JSON).
+  # A transient error is NOT retried: k8s_scale is not idempotent.
+  - id: a-matching-approval-token-dispatches-once-non-idempotent
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 5, budget_sec: 60, manifest: *scale, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}, approved_pending_id: pending-1, approval_token: "pending-1:0c5afd84cbabef501f9c8182ed0e1e06"}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ int('timeout') }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'error' and data['audit']['attempts'] == 1 and data['audit']['args_hash'] == '0c5afd84cbabef501f9c8182ed0e1e06' }}"
+        - "{{ data['audit']['approved_by'] is not None and data['pending'] is None }}"
+
+  - id: an-approved-call-records-who-approved
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 5, budget_sec: 60, manifest: *scale, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}, approved_pending_id: pending-1, approval_token: "pending-1:0c5afd84cbabef501f9c8182ed0e1e06"}
+    mocks:
+      - {step_name: dispatch-activity, _: {result: {replicas: 3}}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: '{"replicas": 3}', n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['audit']['approved_by'] is not None }}"
+
+  - id: approval-for-changed-arguments-is-refused
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *scale, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 30}}, approved_pending_id: pending-1, approval_token: "pending-1:0c5afd84cbabef501f9c8182ed0e1e06"}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'needs_approval' }}"
+
+  - id: a-denied-tool-is-denied
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: {name: nuke, status: enabled, effective_permission: deny, parameters: {type: object, properties: {}}, binding: {activity: {type: http.request}}, policy: {side_effects: external}}, call: {id: c1, name: nuke, arguments: {}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'denied' and data['content'] == 'denied: tool nuke is not allowed here' and data['audit']['error']['code'] == 'denied' }}"
+
+  - id: the-per-turn-limit-is-enforced
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}, counts: {turn: {k8s_pods: 2}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'error' and data['audit']['error']['code'] == 'limit_exceeded' and 'per turn' in data['content'] }}"
+
+  - id: the-per-session-limit-is-enforced
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}, counts: {turn: {}, session: {k8s_pods: 10}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['audit']['error']['code'] == 'limit_exceeded' and 'per session' in data['content'] }}"
+
+  - id: guard-may-escalate-an-auto-call-to-approval
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: kube-system}}, config: {guard: {checks: [check_tool_call]}}}
+    mocks:
+      - {step_name: guard-tool-call, _: {ok: true, data: {escalate: true, overreach_p: 0.8, degraded: false}}}
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'needs_approval' and data['pending']['detail']['escalated'] == True and data['pending']['offer_session_grant'] == False }}"
+
+  - id: a-disabled-tool-is-unavailable
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: {name: off, status: disabled, effective_permission: auto, parameters: {type: object, properties: {}}, binding: {activity: {type: http.request}}, policy: {side_effects: read}}, call: {id: c1, name: off, arguments: {}}}
+    expect:
+      assert:
+        - "{{ data['audit']['error']['code'] == 'unavailable' }}"
+
+  - id: a-call-for-another-tool-than-the-manifest-is-refused
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_scale, arguments: {namespace: a}}}
+    expect:
+      assert:
+        - "{{ data['audit']['error']['code'] == 'invalid_input' }}"
+
+  # ── retries ─────────────────────────────────────────────────────────────
+  - id: an-idempotent-tool-retries-a-transient-error
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ int('timeout') }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'error' and data['audit']['attempts'] == 2 and data['audit']['error']['code'] == 'timeout' }}"
+
+  - id: a-refused-connection-is-transient
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ int('Cannot connect to host 127.0.0.1:6443') }}"}
+    expect:
+      assert:
+        - "{{ data['audit']['attempts'] == 2 and data['audit']['error']['code'] == 'tool_failed' }}"
+
+  - id: a-non-transient-error-is-not-retried
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['audit']['attempts'] == 1 and data['audit']['error']['code'] == 'tool_failed' }}"
+
+  # ── artifacts ───────────────────────────────────────────────────────────
+  - id: a-long-result-becomes-an-artifact
+    input:
+      mode: call
+      agent_id: ops
+      session_id: s1
+      turn: 2
+      budget_sec: 60
+      call: {id: c1, name: k8s_pods, arguments: {namespace: a}}
+      manifest: {name: k8s_pods, version: 3, status: enabled, effective_permission: auto, parameters: {type: object, properties: {namespace: {type: string}}}, binding: {activity: {type: k8s.list, input_template: {}}}, result: {max_chars: 10}, policy: {side_effects: read, idempotent: true}, execution: {timeout_sec: 20}}
+    mocks:
+      - {step_name: dispatch-activity, _: {result: "abcdefghijklmnopqrstuvwxyz"}}
+      - {step_name: write-artifact, _: null}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: SCREENED, n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['truncated'] == True and bool(re.fullmatch(r'art_[0-9a-f]{12}', data['artifact_ref'])) and data['audit']['truncated'] == True }}"
+        - "{{ data['content'] == 'SCREENED' }}"
+
+  - id: read-artifact-pages-through-the-stored-content
+    input: {mode: read_artifact, agent_id: ops, session_id: s1, artifact_ref: art_0123456789ab, offset: 10, limit: 10}
+    mocks:
+      - {step_name: read-artifact-row, _: {schema_version: 1, id: art_0123456789ab, content: "abcdefghijklmnopqrstuvwxyz"}}
+    expect:
+      output:
+        - ok: true
+        - data: {content: klmnopqrst, next_offset: 20, total: 26}
+
+  - id: read-artifact-of-an-unknown-ref-is-not-found
+    input: {mode: read_artifact, agent_id: ops, session_id: s1, artifact_ref: art_0123456789ab}
+    mocks:
+      - {step_name: read-artifact-row, _: null}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  # ── built-ins and warnings ──────────────────────────────────────────────
+  - id: current-time-is-not-screened
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: {name: current_time, status: enabled, effective_permission: auto, parameters: {type: object, properties: {}}, binding: {builtin: {module: builtin.now, mode: now}}, result: {max_chars: 200}, policy: {side_effects: none}}, call: {id: c1, name: current_time, arguments: "{}"}}
+    mocks:
+      - {step_name: screen-result, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['content'][:2] == '20' and data['screen'] is None }}"
+
+  - id: knowledge-search-numbers-the-passages-and-returns-sources
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, config: {knowledge: {sources: [moco-docs]}}, manifest: {name: knowledge_search, status: enabled, effective_permission: auto, parameters: {type: object, properties: {query: {type: string}}, required: [query]}, binding: {builtin: {module: knowledge, mode: retrieve}}, result: {max_chars: 8000}, policy: {side_effects: none}}, call: {id: c1, name: knowledge_search, arguments: {query: retries}}}
+    mocks:
+      - {step_name: builtin-knowledge, _: {ok: true, data: {passages: [{n: 1, text: "Retries are...", title: Retries, url: "https://d/r", source: moco-docs}]}}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: "[1] Retries\nRetries are...", n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['content'] == '[1] Retries\\nRetries are...' }}"
+        - "{{ data['sources'] == [{'title': 'Retries', 'url': 'https://d/r', 'source': 'moco-docs'}] }}"
+
+  - id: ask-user-needs-input
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: {name: ask_user, status: enabled, effective_permission: auto, parameters: {type: object, properties: {question: {type: string}}, required: [question]}, binding: {builtin: {module: loop, mode: ask_user}}, policy: {side_effects: none}}, call: {id: c1, name: ask_user, arguments: {question: "Which namespace?"}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'needs_input' and data['pending']['kind'] == 'user_input' and data['pending']['summary'] == 'Which namespace?' }}"
+
+  - id: memory-tools-are-unavailable-without-long-term-memory
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, manifest: {name: memory_recall, status: enabled, effective_permission: auto, parameters: {type: object, properties: {query: {type: string}}}, binding: {builtin: {module: memory, mode: recall}}, policy: {side_effects: none}}, call: {id: c1, name: memory_recall, arguments: {query: x}}}
+    expect:
+      assert:
+        - "{{ data['audit']['error']['code'] == 'unavailable' }}"
+
+  - id: a-deprecated-tool-runs-with-a-warning
+    input:
+      mode: call
+      agent_id: ops
+      session_id: s1
+      budget_sec: 60
+      call: {id: c1, name: k8s_pods, arguments: {namespace: a}}
+      manifest: {name: k8s_pods, version: 3, status: deprecated, deprecated_by: k8s_pods_v2, effective_permission: auto, parameters: {type: object, properties: {}}, binding: {activity: {type: k8s.list, input_template: {}}}, result: {max_chars: 8000}, policy: {side_effects: read}}
+    mocks:
+      - {step_name: dispatch-activity, _: {result: ok}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: ok, n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['warning'] == 'tool k8s_pods is deprecated, use k8s_pods_v2' and data['audit']['warning'] == data['warning'] }}"
+
+  - id: no-budget-left-is-a-timeout-without-dispatch
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 2, manifest: *pods, call: {id: c1, name: k8s_pods, arguments: {namespace: a}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['audit']['error']['code'] == 'timeout' }}"
+
+  # ── memory built-ins (plan-07 integration) ──────────────────────────────
+  - id: memory-recall-lists-what-is-remembered
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, config: {memory: {long_term: {enabled: true}}}, manifest: {name: memory_recall, status: enabled, effective_permission: auto, parameters: {type: object, properties: {query: {type: string}}}, binding: {builtin: {module: memory, mode: recall}}, result: {max_chars: 4000}, policy: {side_effects: none}}, call: {id: c1, name: memory_recall, arguments: {query: deploy}}}
+    mocks:
+      - {step_name: builtin-memory-recall, _: {ok: true, data: {profile: [{kind: profile, title: Deploys, text: "uses helm"}], items: [], episodes: []}}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: "[profile] Deploys: uses helm", n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['content'] == '[profile] Deploys: uses helm' }}"
+
+  - id: memory-remember-saves-and-says-so
+    input: {mode: call, agent_id: ops, session_id: s1, budget_sec: 60, config: {memory: {long_term: {enabled: true}}}, manifest: {name: memory_remember, status: enabled, effective_permission: auto, parameters: {type: object, properties: {text: {type: string}}, required: [text]}, binding: {builtin: {module: memory, mode: remember}}, result: {max_chars: 2000}, policy: {side_effects: write}}, call: {id: c1, name: memory_remember, arguments: {text: "I deploy with helm"}}}
+    mocks:
+      - {step_name: builtin-memory-remember, _: {ok: true, data: {key: "mem:fact:i-deploy-with-helm", verdict: new}}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: "Remembered (new).", n: 1, action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['content'] == 'Remembered (new).' }}"
+
+  # ── async tools (phase 3, §6.9.9) ───────────────────────────────────────
+  - id: an-async-tool-starts-a-job-instead-of-dispatching
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 4, question: "report on staging", budget_sec: 60, manifest: *report, call: {id: c1, name: pod_report, arguments: {namespace: staging}}, allow_async: true}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+      - {step_name: screen-result, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['status'] == 'async_started' and data['content'].startswith('started: Pod report is running in the background') }}"
+        - "{{ data['job_request']['wfspec'] == 'agent-harness-tools/tool-job' and data['job_request']['input']['call'] == {'id': 'c1', 'name': 'pod_report', 'arguments': {'namespace': 'staging'}} }}"
+        - "{{ data['job_request']['input']['manifest']['name'] == 'pod_report' and data['job_request']['input']['turn'] == 4 and data['job_request']['input']['approval_token'] is None }}"
+        - "{{ data['audit']['status'] == 'async_started' and data['pending'] is None }}"
+
+  - id: an-async-tool-where-jobs-are-not-allowed-is-unavailable
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 4, question: "report", budget_sec: 60, manifest: *report, call: {id: c1, name: pod_report, arguments: {namespace: staging}}}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'error' and data['content'].startswith('error: unavailable: pod_report runs as a background job') and data['job_request'] is None }}"
+
+  - id: an-async-tool-needing-approval-asks-in-the-turn-first
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 5, budget_sec: 60, manifest: *scale_async, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}, allow_async: true}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'needs_approval' and data['job_request'] is None and data['pending']['summary'] == 'Scale web to 3 replicas?' }}"
+
+  - id: an-approved-async-tool-carries-its-token-into-the-job
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 5, budget_sec: 60, manifest: *scale_async, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}, approved_pending_id: pending-1, approval_token: "pending-1:0c5afd84cbabef501f9c8182ed0e1e06", allow_async: true}
+    mocks:
+      - {step_name: dispatch-activity, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['status'] == 'async_started' and data['job_request']['input']['approval_token'] == 'pending-1:0c5afd84cbabef501f9c8182ed0e1e06' and data['job_request']['input']['approved_pending_id'] == 'pending-1' }}"
+
+  - id: inside-the-job-run-now-dispatches-the-async-tool
+    input: {mode: call, agent_id: ops, session_id: s1, turn: 5, budget_sec: 900, manifest: *scale_async, call: {id: c9, name: k8s_scale, arguments: {name: web, replicas: 3}}, approved_pending_id: pending-1, approval_token: "pending-1:0c5afd84cbabef501f9c8182ed0e1e06", run_now: true}
+    mocks:
+      - {step_name: dispatch-activity, _: {result: {replicas: 3}}}
+      - {step_name: screen-result, _: {ok: true, data: {items: [{text: "scaled", action: fence}], degraded: false}}}
+    expect:
+      assert:
+        - "{{ data['status'] == 'ok' and data['content'] == 'scaled' and data['job_request'] is None }}"
+

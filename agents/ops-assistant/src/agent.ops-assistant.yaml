@@ -1,0 +1,47 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT.OPS-ASSISTANT — the minimal second agent (design §16, plan-18 step 4)
+# ================================================================================
+# PHASE 2: `chat` + `react` over the k8s-readonly toolset, and still NO logic
+# wfspecs (design §16): the tools are manifests (tools.ops-assistant, installed by
+# the harness's seed-tools), the routing, approval and guard machinery is the
+# harness's. `/tools` reaches react directly. The cluster connection is deployment
+# data in tools.config['*'] -- secret NAMES only. `react` stays unavailable until a
+# tool is enabled, i.e. until global/K8S_TOKEN exists (tool-registry validate).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent.ops-assistant
+
+context:
+  definition:
+    agent_id: ops-assistant
+    display_name: Ops Assistant
+    harness: ">=0.3 <3.0"
+    persona_prompt: persona.ops
+    models:
+      inference:
+        provider: default
+        model:
+        base_url:
+        apikey_secret_key: MY_LLM_TOKEN
+    router: {default_profile: chat, classifier: true, slash: {/tools: react, /chat: chat}}
+    profiles: [chat, react]
+    toolsets: [k8s-readonly]
+    tools:
+      config:
+        "*":
+          api_server: "https://127.0.0.1:6443"
+          token_secret_key: global/K8S_TOKEN
+          namespace: default
+    guard: {checks: [screen_content, check_tool_call]}
+    hitl: {approval_timeout_sec: 86400}
+
+output:
+  definition: "{{ definition }}"
+  version: "{{ __sys_info__.get('wfspec_version') }}"
+
+main:
+  task_name: emit-definition
+  set:
+    - _loaded: true

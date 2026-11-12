@@ -1,0 +1,42 @@
+test_type: integration-test
+
+# knowledge-index-run's embed guard: model_name and base_url may be null (the
+# activity's environment defaults); embed_dim may not. A bogus source kind fails AFTER the
+# guard, so its error proves the guard passed.
+
+wfspec:
+  name: knowledge-index-run
+
+test_cases:
+  - id: a-null-base-url-passes-the-embed-guard
+    input:
+      domain: d
+      table_name: kb_d
+      sources: [{kind: bogus}]
+      embed_model_info: {model_name: nomic-embed-text, embed_dim: 768, base_url: null, apikey_secret_key: K}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "Unsupported source kind 'bogus'. Use one of: web, site, github, files, gdrive."
+
+  - id: a-null-model-name-passes-the-embed-guard
+    input:
+      domain: d
+      table_name: kb_d
+      sources: [{kind: bogus}]
+      embed_model_info: {model_name: null, embed_dim: 768, base_url: null, apikey_secret_key: K}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "Unsupported source kind 'bogus'. Use one of: web, site, github, files, gdrive."
+
+  - id: a-missing-embed-dim-fails-the-embed-guard
+    input:
+      domain: d
+      table_name: kb_d
+      sources: [{kind: bogus}]
+      embed_model_info: {model_name: null, base_url: null, apikey_secret_key: K}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "embed_model_info must carry embed_dim; got: {'apikey_secret_key': 'K', 'base_url': None, 'model_name': None}"

@@ -1,0 +1,390 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# DECIDE — the only caller of typesafe.system_one (design §6.2.3)
+# ================================================================================
+#
+#   mode         in                                       data out
+#   ──────────── ──────────────────────────────────────── ───────────────────────
+#   decide       qset, variables, resolved_refs, models,  {choices, nouls, scores,
+#                fallback, default?, timeout_sec?,         confidence, probabilities, keymap,
+#                attempts?                                 decided_by, model, usage,
+#                                                          elapsed_ms, replaced}
+#   decide_many  qset, items: [variables], ...            {results: [{ok, data, error}]}
+#
+# Runs a QUESTION SET (qset.<name>, rendered by prompt-render) and owns the
+# fallback, so a caller never knows which backend answered. Keys and choice labels
+# come back mapped through the qset's `keymap` (source_0 → moco-docs,
+# profile_1 → rag).
+#
+# CONFIDENCE (§6.2.3): choice → the chosen label's probability; noul →
+# abs(p - 0.5) * 2; score → the modal level's probability. The LLM fallback has no
+# probabilities, so there only nouls get a confidence; choices and scores are null.
+#
+# FALLBACK (§6.2.3 table), when the classifier is disabled, not configured (no
+# base_url and no worker_default, F70), or unavailable (timeout, 5xx, connection error):
+#   llm      prompt.decide.fallback → llm-invoke chat (decision role, its schema)
+#   default  the caller's `default` answers, decided_by: default
+#   none     ok: false, code: unavailable
+# A 4xx or a request the activity refuses to send (validation error) means the qset
+# is malformed: a BUG, which raises whatever `fallback` says. An answer outside the
+# offered labels takes that question's default and is listed in `replaced`.
+#
+# BUDGET: one classify task whose activity timeout and attempts are the call's
+# timeout_sec / attempts, else models.classifier's, else 10 s x 1 (the synchronous
+# default, §7.3). Raise them for a slow self-hosted classifier (moco-systemone on CPU)
+# or an offline caller. (Until 2026-10-16 activity timeouts were believed to have to be
+# literals, P20, and there were fixed 10 s / 30 s x 2 variants; they do not.)
+#
+# Errors seen by on_error are all WorkflowRuntimeError; the HTTP status is only in
+# the message ("...: 422 question 'q': ..."), so classification reads the message.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: decide
+
+context:
+  valid_modes: ["decide", "decide_many"]
+  valid_fallbacks: ["llm", "default", "none"]
+  ok: false
+  data:
+  error:
+
+input:
+  mode: decide
+  agent_id:
+  qset:
+  variables: {}
+  items: []
+  resolved_refs: {}
+  models: {}
+  fallback: llm
+  # Per question, by MAPPED key: {route: chat, needs_context: 0.0, ambiguity: 0}.
+  default: {}
+  timeout_sec:
+  attempts:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+functions:
+
+  # Map raw answers (positional keys and labels) through the keymap, re-validate
+  # choice labels against those offered, and compute confidence. `answers` holds
+  # System One's full answer objects; it is {} for the LLM fallback.
+  map-answers:
+    input:
+      request: {}
+      nouls: {}
+      choices: {}
+      scores: {}
+      answers: {}
+      default: {}
+    output:
+      nouls: "{{ m_nouls }}"
+      choices: "{{ m_choices }}"
+      scores: "{{ m_scores }}"
+      confidence: "{{ m_confidence }}"
+      probabilities: "{{ m_probabilities }}"
+      replaced: "{{ m_replaced }}"
+    main:
+      task_name: map-keys
+      set:
+        - _km: "{{ (request or {}).get('keymap') or {} }}"
+        - _qs: "{{ (request or {}).get('questions') or {} }}"
+        - _offered: "{{ {k: list((q.get('criteria') or {}).keys()) for k, q in _qs.items() if q.get('type') == 'choice'} }}"
+        - _bad: "{{ sorted(k for k, lbl in (choices or {}).items() if lbl not in _offered.get(k, [])) }}"
+        - m_nouls: "{{ {_km.get(k, k): float(p) for k, p in (nouls or {}).items()} }}"
+        - m_scores: "{{ {_km.get(k, k): float(v) for k, v in (scores or {}).items()} }}"
+        - m_choices: >-
+            {{ {_km.get(k, k): ((default or {}).get(_km.get(k, k)) if k in _bad else _km.get(lbl, lbl))
+                for k, lbl in (choices or {}).items()} }}
+        - m_replaced: "{{ [_km.get(k, k) for k in _bad] }}"
+        # Per choice question, every offered label's probability, labels mapped
+        # (System One only; the LLM fallback has none). The router's clarify text
+        # needs the top two.
+        - m_probabilities: >-
+            {{ {_km.get(k, k): {_km.get(lbl, lbl): float(p)
+                                for lbl, p in ((answers.get(k) or {}).get('probabilities') or {}).items()
+                                if lbl in _offered.get(k, [])}
+                for k in (choices or {}) if answers} }}
+        - m_confidence: >-
+            {{ dict(
+                 {_km.get(k, k): round(abs(float(p) - 0.5) * 2, 4) for k, p in (nouls or {}).items()},
+                 **{_km.get(k, k): (None if k in _bad or not answers else
+                                    ((answers.get(k) or {}).get('probabilities') or {}).get(lbl))
+                    for k, lbl in (choices or {}).items()},
+                 **{_km.get(k, k): (max(((answers.get(k) or {}).get('probabilities') or {}).values(), default=None)
+                                    if answers else None)
+                    for k in (scores or {})}) }}
+
+  # One decision: render, classify (or fall back), map. Called once by `decide`
+  # and once per item by `decide_many`.
+  decide-one:
+    input:
+      agent_id:
+      qset:
+      variables: {}
+      resolved_refs: {}
+      models: {}
+      fallback: llm
+      default: {}
+      timeout_sec:
+      attempts:
+    output:
+      ok: "{{ r_ok }}"
+      data: "{{ r_data }}"
+      error: "{{ r_error }}"
+    main:
+      tasks:
+        - task_name: render-qset
+          workflow:
+            ref: prompt-render
+            mode: inline
+            input:
+              mode: render
+              agent_id: "{{ agent_id }}"
+              name: "{{ qset }}"
+              variables: "{{ variables or {} }}"
+              resolved_refs: "{{ resolved_refs or {} }}"
+          output:
+            set:
+              - request: "{{ (_ or {}).get('data') or {} }}"
+
+        - task_name: reject-non-qset
+          raise:
+            if: "{{ request.get('kind') != 'system_one' }}"
+            type: error
+            error_type: AbortError
+            message: "decide: '{{ qset }}' is not a question set (kind {{ request.get('kind') }})"
+
+        - task_name: plan-call
+          set:
+            - started_at: "{{ now() }}"
+            - cls: "{{ (models or {}).get('classifier') or {} }}"
+            # Off unless an endpoint is STATED (F70): with no base_url the activity falls
+            # back to TYPESAFE_DEFAULT_BASE_URL and then to the hosted TypeSafe API, which
+            # the harness must never reach by accident. worker_default: true is the
+            # admin's statement that the worker's variable names a self-hosted classifier.
+            - configured: "{{ bool(cls.get('base_url')) or cls.get('worker_default') is True }}"
+            - enabled: "{{ cls.get('enabled', True) is not False and configured }}"
+            - call_timeout#: "{{ max(1, int(timeout_sec or cls.get('timeout_sec') or 10)) }}"
+            - call_attempts: "{{ max(1, int(attempts or cls.get('attempts') or 1)) }}"
+            - s1:
+
+        # ── System One, within the call budget ──────────────────────────────
+        - task_name: classify
+          skip_if: "{{ not enabled }}"
+          activity:
+            type: typesafe.system_one
+            input:
+              state: "{{ request.get('state') }}"
+              questions: "{{ request.get('questions') }}"
+              model: "{{ cls.get('model') }}"
+              base_url: "{{ cls.get('base_url') }}"
+              apikey_secret_key: "{{ cls.get('apikey_secret_key') }}"
+            options:
+              retry_policy: {timeout_sec: "{{ call_timeout }}", max_attempts: "{{ call_attempts }}"}
+          output:
+            set:
+              - s1: "{{ _ if isinstance(_, dict) or _ is None else _.model_dump(mode='json') }}"
+          on_error:
+            catch: true
+            do:
+              set:
+                - s1: "{{ {'result': 'error', **_} }}"
+
+        - task_name: classify-outcome
+          set:
+            - s1_failed: "{{ enabled and (not isinstance(s1, dict) or s1.get('result') == 'error') }}"
+            - s1_message: "{{ str((s1 or {}).get('error_message') or '') if s1_failed else '' }}"
+            # A 4xx other than 408/409/429, or a request refused before sending.
+            - bad_request#: >-
+                {{ s1_failed and (bool(re.search(r'(?<![0-9])4(?!08|09|29)[0-9]{2}(?![0-9])', s1_message))
+                                  or 'validation error' in s1_message.lower()) }}
+            - unavailable#: "{{ (not enabled) or s1_failed }}"
+            - unavailable_reason: "{{ ('classifier disabled' if cls.get('enabled', True) is False else 'classifier not configured') if not enabled else s1_message[:300] }}"
+
+        - task_name: reject-malformed-qset
+          raise:
+            if: "{{ bad_request }}"
+            type: error
+            error_type: AbortError
+            message: "decide: System One refused qset '{{ qset }}' (a bug in the question set): {{ s1_message[:300] }}"
+
+        - task_name: map-system-one
+          skip_if: "{{ unavailable }}"
+          workflow:
+            function: map-answers
+            input:
+              request: "{{ request }}"
+              nouls: "{{ s1.get('nouls') or {} }}"
+              choices: "{{ s1.get('choices') or {} }}"
+              scores: "{{ s1.get('scores') or {} }}"
+              answers: "{{ s1.get('answers') or {} }}"
+              default: "{{ default or {} }}"
+          output:
+            set:
+              - mapped: "{{ _ }}"
+              - decided_by: system_one
+              - used_model: "{{ s1.get('model') }}"
+              - usage: >-
+                  {{ {'classifier_calls': 1, 'llm_calls': 0,
+                      'tokens_in': (s1.get('usage') or {}).get('input_tokens') or 0,
+                      'tokens_out': (s1.get('usage') or {}).get('output_tokens') or 0} }}
+
+        # ── fallback: llm ───────────────────────────────────────────────────
+        - task_name: fallback-llm
+          skip_if: "{{ not (unavailable and fallback == 'llm') }}"
+          tasks:
+            - task_name: render-fallback-prompt
+              workflow:
+                ref: agent-harness-prompts/prompt.decide.fallback
+                mode: inline
+                input:
+                  qset: "{{ request }}"
+              output:
+                set:
+                  - fb_prompt: "{{ _ or {} }}"
+            - task_name: ask-decision-model
+              workflow:
+                ref: llm-invoke
+                mode: inline
+                input:
+                  mode: chat
+                  agent_id: "{{ agent_id }}"
+                  role: decision
+                  models: "{{ models or {} }}"
+                  messages: "{{ fb_prompt.get('messages') }}"
+                  response_format: "{{ fb_prompt.get('response_format') }}"
+                  schema: "{{ fb_prompt.get('schema') }}"
+              output:
+                set:
+                  - fb_result: "{{ _ or {} }}"
+            - task_name: map-fallback
+              skip_if: "{{ not fb_result.get('ok') }}"
+              workflow:
+                function: map-answers
+                input:
+                  request: "{{ request }}"
+                  nouls: "{{ (fb_result['data']['parsed'] or {}).get('nouls') or {} }}"
+                  choices: "{{ (fb_result['data']['parsed'] or {}).get('choices') or {} }}"
+                  scores: "{{ (fb_result['data']['parsed'] or {}).get('scores') or {} }}"
+                  answers: {}
+                  default: "{{ default or {} }}"
+              output:
+                set:
+                  - mapped: "{{ _ }}"
+                  - decided_by: llm
+                  - used_model: "{{ fb_result['data'].get('model') }}"
+                  - usage: >-
+                      {{ {'classifier_calls': 0,
+                          'llm_calls': (fb_result['data'].get('usage') or {}).get('calls') or 1,
+                          'tokens_in': (fb_result['data'].get('usage') or {}).get('tokens_in') or 0,
+                          'tokens_out': (fb_result['data'].get('usage') or {}).get('tokens_out') or 0} }}
+
+        # ── fallback: default ───────────────────────────────────────────────
+        - task_name: fallback-default
+          skip_if: "{{ not (unavailable and fallback == 'default') }}"
+          set:
+            - _d: "{{ default or {} }}"
+            - _types: "{{ {((request.get('keymap') or {}).get(k, k)): q.get('type') for k, q in (request.get('questions') or {}).items()} }}"
+            - mapped:
+                nouls: "{{ {k: v for k, v in _d.items() if _types.get(k) == 'noul'} }}"
+                choices: "{{ {k: v for k, v in _d.items() if _types.get(k) == 'choice'} }}"
+                scores: "{{ {k: v for k, v in _d.items() if _types.get(k) == 'score'} }}"
+                confidence: {}
+                probabilities: {}
+                replaced: []
+            - decided_by: default
+            - used_model:
+            - usage: {classifier_calls: 0, llm_calls: 0, tokens_in: 0, tokens_out: 0}
+
+        - task_name: shape-decision
+          set:
+            - _decided: "{{ not unavailable or fallback == 'default' or (fallback == 'llm' and fb_result.get('ok')) }}"
+            - _elapsed: "{{ int((now() - started_at).total_seconds() * 1000) }}"
+            - r_ok: "{{ _decided }}"
+            - r_data: >-
+                {{ None if not _decided else
+                   dict(mapped, keymap=request.get('keymap') or {}, decided_by=decided_by,
+                        model=used_model, usage=usage, elapsed_ms=_elapsed) }}
+            - r_error: >-
+                {{ None if _decided else
+                   {'code': 'unavailable',
+                    'message': unavailable_reason if fallback == 'none'
+                               else 'classifier unavailable (' + unavailable_reason + ') and the decision model failed: '
+                                    + str((fb_result.get('error') or {}).get('message'))[:300],
+                    'retryable': True} }}
+            - decision#: >-
+                {{ {'qset': qset, 'decided_by': decided_by if _decided else None,
+                    'choices': mapped.get('choices') if _decided else None,
+                    'nouls': mapped.get('nouls') if _decided else None,
+                    'scores': mapped.get('scores') if _decided else None,
+                    'replaced': mapped.get('replaced') if _decided else None,
+                    'elapsed_ms': _elapsed} }}
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "decide: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: reject-unknown-fallback
+      raise:
+        if: "{{ fallback not in valid_fallbacks }}"
+        type: error
+        error_type: AbortError
+        message: "decide: invalid fallback '{{ fallback }}'. Must be one of: {{ ', '.join(valid_fallbacks) }}"
+
+    - task_name: mode-decide
+      skip_if: "{{ mode != 'decide' }}"
+      workflow:
+        function: decide-one
+        input:
+          agent_id: "{{ agent_id }}"
+          qset: "{{ qset }}"
+          variables: "{{ variables }}"
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ models }}"
+          fallback: "{{ fallback }}"
+          default: "{{ default }}"
+          timeout_sec: "{{ timeout_sec }}"
+          attempts: "{{ attempts }}"
+      output:
+        set:
+          - ok: "{{ _['ok'] }}"
+          - data: "{{ _['data'] }}"
+          - error: "{{ _['error'] }}"
+
+    # One decision per item, in parallel; results keep the items' order.
+    - task_name: mode-decide-many
+      skip_if: "{{ mode != 'decide_many' }}"
+      loop:
+        in: "{{ items or [] }}"
+        foreach: item
+        execute_mode: parallel
+        do:
+          task_name: decide-item
+          workflow:
+            function: decide-one
+            input:
+              agent_id: "{{ agent_id }}"
+              qset: "{{ qset }}"
+              variables: "{{ item }}"
+              resolved_refs: "{{ resolved_refs }}"
+              models: "{{ models }}"
+              fallback: "{{ fallback }}"
+              default: "{{ default }}"
+              timeout_sec: "{{ timeout_sec }}"
+              attempts: "{{ attempts }}"
+      output:
+        set:
+          - ok: true
+          - data: "{{ {'results': list(_ or [])} }}"

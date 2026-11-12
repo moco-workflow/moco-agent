@@ -1,0 +1,162 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# KNOWLEDGE-MIGRATE-LEGACY — the old agent's domains → harness sources (plan-06 §5.2)
+# ================================================================================
+#
+#   in                                       out
+#   ──────────────────────────────────────── ──────────────────────────────────────
+#   agent_id, scope: private|shared,         {ok, data: {found: [name], migrated: [{name,
+#   dry_run? (true)                           source, indexer}], skipped: [{name, reason}],
+#                                             old_tables: [table]}, error}
+#
+# The old agent (moco-examples-internal/moco-agent, removed in da0ce1f) kept one row per
+# knowledge domain, `domain:<name>` (topic domain) in `moco-agent` -- global for shared
+# domains, the user's own `<uid>:moco-agent` for private ones -- and one pgvector table
+# `kb_<slug>` for BOTH scopes, so two users' private domains of one name shared a
+# table (the collision the harness fixed: private tables are kb_u_<h>_<slug>).
+#
+# Each old domain is registered again through `knowledge register` with its stored
+# `sources` and `embed_model_info`, so it is RE-INDEXED into the harness's table name
+# (private: the user's own kb_u_<h>_<slug>; shared: kb_<slug>, the same name as before,
+# rebuilt in place). One run per scope:
+#   private  any user, for their own domains (run it as that user)
+#   shared   an admin (knowledge register checks it)
+# Skipped: a name a harness source already has (`exists`), a name that does not fit
+# the harness's name pattern after lowercasing (`bad_name`), no stored sources
+# (`no_sources`: nothing to re-index from). The old rows and tables are NOT touched:
+# an old private table may be shared with another user's domain. `old_tables` lists
+# them for an admin to drop once every user has migrated.
+#
+# dry_run (the default) reports what would happen and writes nothing.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: knowledge-migrate-legacy
+
+context:
+  legacy_namespace: moco-agent
+  name_pattern: "^[a-z0-9][a-z0-9-]{0,47}$"
+  legacy_keys: []
+  legacy_rows: []
+  existing: []
+  plan: []
+  results: []
+  cfg: {}
+  ok: true
+  error:
+
+input:
+  agent_id:
+  scope: private
+  dry_run: true
+
+output:
+  ok: "{{ ok }}"
+  data:
+    found: "{{ [str(r.get('name')) for r in legacy_rows] }}"
+    migrated: "{{ results }}"
+    skipped: "{{ [{'name': p['name'], 'reason': p['reason']} for p in plan if p.get('reason')] }}"
+    old_tables: "{{ sorted(set(str(r.get('table_name')) for r in legacy_rows if r.get('table_name'))) }}"
+    dry_run: "{{ bool(dry_run) }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: reject-bad-scope
+      raise:
+        if: "{{ scope not in ['private', 'shared'] }}"
+        type: error
+        error_type: AbortError
+        message: "knowledge-migrate-legacy: scope must be private or shared, got '{{ scope }}'"
+
+    - task_name: list-legacy-keys
+      activity:
+        type: builtin.state.list_states
+        input: {in_global_ns: "{{ scope == 'shared' }}", namespace: "{{ legacy_namespace }}", key_pattern: "domain:*", topic_pattern: domain}
+      output:
+        set:
+          - legacy_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+
+    - task_name: read-legacy-rows
+      skip_if: "{{ not legacy_keys }}"
+      loop:
+        in: "{{ legacy_keys }}"
+        foreach: legacy_key
+        execute_mode: parallel
+        do:
+          task_name: read-legacy-row
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: "{{ scope == 'shared' }}", namespace: "{{ legacy_namespace }}", key: "{{ legacy_key }}"}
+      output:
+        set:
+          - legacy_rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('name')] }}"
+
+    - task_name: list-sources
+      skip_if: "{{ not legacy_rows }}"
+      workflow:
+        ref: source-registry
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", scope: "{{ scope }}"}
+      output:
+        set:
+          - existing: "{{ [str(s.get('name')) for s in ((((_ or {}).get('data') or {}).get('sources')) or [])] }}"
+
+    - task_name: plan-migration
+      set:
+        - plan#: >-
+            {{ [dict({'name': n, 'row': r},
+                     **({'reason': 'bad_name'} if not re.match(name_pattern, n) else
+                        {'reason': 'exists'} if n in existing else
+                        {'reason': 'no_sources'} if not (r.get('sources') or []) else {}))
+                for r, n in ((r, str(r.get('name')).strip().lower()) for r in legacy_rows)] }}
+
+    - task_name: resolve-config
+      skip_if: "{{ bool(dry_run) or not [p for p in plan if not p.get('reason')] }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - cfg: "{{ (((_ or {}).get('data') or {}).get('config')) or {} }}"
+
+    - task_name: register-each
+      skip_if: "{{ bool(dry_run) or not [p for p in plan if not p.get('reason')] }}"
+      loop:
+        in: "{{ [p for p in plan if not p.get('reason')] }}"
+        foreach: migrate_item
+        execute_mode: sequential
+        do:
+          task_name: register-source
+          workflow:
+            ref: knowledge
+            mode: inline
+            input:
+              mode: register
+              agent_id: "{{ agent_id }}"
+              config: "{{ cfg }}"
+              name: "{{ migrate_item['name'] }}"
+              scope: "{{ scope }}"
+              description: "{{ str(migrate_item['row'].get('description') or '') }}"
+              keywords: "{{ list(migrate_item['row'].get('keywords') or []) }}"
+              index_sources: "{{ list(migrate_item['row'].get('sources') or []) }}"
+              embed_model_info: "{{ migrate_item['row'].get('embed_model_info') or None }}"
+          on_error:
+            catch: true
+      output:
+        set:
+          - results: >-
+              {{ [{'name': p['name'], 'ok': isinstance(r, dict) and r.get('ok') == True,
+                   'source': (((r.get('data') or {}).get('source') or {}).get('table_name')) if isinstance(r, dict) and r.get('ok') else None,
+                   'indexer': ((r.get('data') or {}).get('indexer')) if isinstance(r, dict) and r.get('ok') else None,
+                   'error': r.get('error') if isinstance(r, dict) else {'message': str(r)[:300]}}
+                  for p, r in zip([p for p in plan if not p.get('reason')], _ or [])] }}
+          - ok: "{{ all(isinstance(r, dict) and r.get('ok') for r in (_ or [])) }}"
+          - error: "{{ None if all(isinstance(r, dict) and r.get('ok') for r in (_ or [])) else {'code': 'partial', 'message': 'some domains could not be registered', 'retryable': True} }}"
+
+    - task_name: shape-dry-run
+      skip_if: "{{ not dry_run }}"
+      set:
+        - results: "{{ [{'name': p['name'], 'would_register': True} for p in plan if not p.get('reason')] }}"

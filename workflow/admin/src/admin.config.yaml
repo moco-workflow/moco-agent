@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# ADMIN.CONFIG — agent-admin's config area (plan-16 step 5)
+# ================================================================================
+#   op            in               data out
+#   get_config    —                {config, profiles, config_version, tiers,
+#                                   user_settable, role}
+#                                   tiers: each stored tier's own sections;
+#                                   role: the caller's (access identify), so a UI
+#                                   can offer the agent tier to admins only
+#   save_config   scope, patch     {config_version}     (agent scope: admin, via access)
+#   reset_config  scope, section?  {config_version}
+#   list_models   —                {providers}
+#   get_readiness —                {ready, roles: {<role>: {status, reason, secret,
+#                                   fix, hint}}}  (model-readiness over the resolved
+#                                   config, F70; any role may read it)
+# Every call goes through agent-config, which owns the rows and checks access.
+# Old-UI scope names are accepted: global → agent, user → user.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: admin.config
+
+context:
+  valid_ops: ["get_config", "save_config", "reset_config", "list_models", "get_readiness"]
+  res: {}
+  readiness: {}
+  ident: {}
+
+input:
+  op:
+  agent_id:
+  scope: user
+  patch: {}
+  section:
+
+output:
+  ok: "{{ bool(res.get('ok')) and (op != 'get_readiness' or bool(readiness.get('ok'))) }}"
+  data: >-
+    {{ {'config': res['data']['config'], 'profiles': sorted(res['data']['profiles']), 'config_version': res['data']['config_version'],
+        'tiers': res['data'].get('tiers') or {}, 'user_settable': res['data'].get('user_settable') or [],
+        'role': (ident.get('data') or {}).get('role') or 'user'}
+       if op == 'get_config' and res.get('ok')
+       else readiness.get('data') if op == 'get_readiness' and res.get('ok')
+       else res.get('data') }}
+  error: "{{ readiness.get('error') if op == 'get_readiness' and res.get('ok') else res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: reject-unknown-op
+      raise:
+        if: "{{ op not in valid_ops }}"
+        type: error
+        error_type: AbortError
+        message: "admin.config: invalid op '{{ op }}'"
+    - task_name: call-config
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input:
+          mode: "{{ {'get_config': 'resolve', 'save_config': 'save', 'reset_config': 'reset', 'list_models': 'list_models', 'get_readiness': 'resolve'}[op] }}"
+          agent_id: "{{ agent_id }}"
+          scope: "{{ {'global': 'agent'}.get(scope, scope) if op in ['save_config', 'reset_config'] else None }}"
+          patch: "{{ patch }}"
+          section: "{{ section }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+    - task_name: identify-caller
+      skip_if: "{{ op != 'get_config' or not res.get('ok') }}"
+      workflow:
+        ref: agent-harness-foundation/access
+        mode: inline
+        input: {mode: identify, agent_id: "{{ agent_id }}", definition_access: "{{ res['data']['config'].get('access') }}"}
+      output:
+        set:
+          - ident: "{{ _ or {} }}"
+    - task_name: check-readiness
+      skip_if: "{{ op != 'get_readiness' or not res.get('ok') }}"
+      workflow:
+        ref: agent-harness-foundation/model-readiness
+        mode: inline
+        input: {config: "{{ res['data']['config'] }}", agent_id: "{{ agent_id }}"}
+      output:
+        set:
+          - readiness: "{{ _ or {} }}"

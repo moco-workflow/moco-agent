@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-skeleton",
+    "wfspec_package_version": "1.3.0",
+    "wfspec_description": "Phase-0 agent definition for the agent harness: one chat profile, no router, no tools. Agent packages are named agent-<agent_id> and hold the definition agent.<agent_id>; the harness loads it as agent-<agent_id>/agent.<agent_id>. Deployed into the same namespace as agent-harness.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.yaml"
+    ]
+}

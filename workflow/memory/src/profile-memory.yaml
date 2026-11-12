@@ -1,0 +1,153 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE-MEMORY — the `memory` profile: remember, forget, what do you know (§6.4.7)
+# ================================================================================
+#
+# A `kind: wfspec` profile (profile.memory points here) honouring the profile
+# contract (§6.8.1): in {agent_id, profile, query, rewritten_query, router,
+# context_bundle, config, resolved_refs, budget_sec, session_id, turn, ...}, out
+# {status, answer, sources, grounded, grounded_p, pending_action, job_request,
+# handoff, used_memory, usage, trace}.
+#
+#   1. command   decide(qset.memory.command): remember | forget | list | none
+#                (fallback llm; both down → none)
+#   2. act       remember  memory remember {statement}: the message minus its
+#                          "remember that" lead-in (a regex, no model call); kind
+#                          profile when it states a preference ("I prefer", "I always",
+#                          "I use"), else fact
+#                forget    memory forget {query}
+#                list      memory list (the user scope, active items)
+#                none      handoff to the router's default profile: the classifier
+#                          routed a message that is not about memory
+#   3. answer    a templated sentence saying what changed -- the user can always
+#                see and remove what the agent holds (§6.4.7). No chat-model call.
+# The user scope only (memory enforces it); guests never reach this profile
+# (requires not_guest).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: profile-memory
+
+context:
+  lead_in: "(?i)^\\s*(please\\s+)?(remember|note|keep in mind|don't forget)(\\s+that)?\\s*[:,]?\\s*"
+  preference: "(?i)\\b(i (prefer|always|usually|never|like|use|want)|my (preferred|favourite|favorite))\\b"
+  status: ok
+  answer: ""
+  handoff:
+  command: none
+  act_result: {}
+  decision_result: {}
+  usage: {llm_calls: 0, classifier_calls: 0, tool_calls: 0, tokens_in: 0, tokens_out: 0, elapsed_ms: 0}
+
+input:
+  agent_id:
+  profile: {}
+  query: ""
+  rewritten_query:
+  router: {}
+  context_bundle: {}
+  config: {}
+  resolved_refs: {}
+  resume:
+  budget_sec: 30
+  session_id:
+  turn: 0
+  tool_counts: {}
+
+output:
+  status: "{{ status }}"
+  answer: "{{ answer }}"
+  sources: []
+  grounded: false
+  grounded_p:
+  pending_action:
+  job_request:
+  handoff: "{{ handoff }}"
+  used_memory: []
+  usage: "{{ usage }}"
+  trace: "{{ {'command': command, 'result': {k: v for k, v in (act_result.get('data') or {}).items() if k != 'items'} if isinstance(act_result.get('data'), dict) else None} }}"
+
+main:
+  tasks:
+    - task_name: classify-command
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide
+          agent_id: "{{ agent_id }}"
+          qset: memory.command
+          variables: {message: "{{ str(query or '') }}"}
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: llm
+          default: {command: none}
+      output:
+        set:
+          - decision_result: "{{ _ or {} }}"
+
+    - task_name: read-command
+      set:
+        - command#: >-
+            {{ (((decision_result.get('data') or {}).get('choices') or {}).get('command')) if decision_result.get('ok') else 'none' }}
+        - command: "{{ command if command in ['remember', 'forget', 'list', 'none'] else 'none' }}"
+        - statement: "{{ re.sub(lead_in, '', str(query or '')).strip() }}"
+        - usage: "{{ dict(usage, classifier_calls=1 if (decision_result.get('data') or {}).get('decided_by') == 'system_one' else 0, llm_calls=1 if (decision_result.get('data') or {}).get('decided_by') == 'llm' else 0) }}"
+
+    - task_name: do-remember
+      skip_if: "{{ command != 'remember' or not statement }}"
+      workflow:
+        ref: memory
+        mode: inline
+        input:
+          mode: remember
+          agent_id: "{{ agent_id }}"
+          config: "{{ config }}"
+          session_id: "{{ session_id }}"
+          statement: "{{ statement }}"
+          kind: "{{ 'profile' if re.search(preference, statement) else 'fact' }}"
+      output:
+        set:
+          - act_result: "{{ _ or {} }}"
+
+    - task_name: do-forget
+      skip_if: "{{ command != 'forget' }}"
+      workflow:
+        ref: memory
+        mode: inline
+        input: {mode: forget, agent_id: "{{ agent_id }}", config: "{{ config }}", query: "{{ statement or query }}"}
+      output:
+        set:
+          - act_result: "{{ _ or {} }}"
+
+    - task_name: do-list
+      skip_if: "{{ command != 'list' }}"
+      workflow:
+        ref: memory
+        mode: inline
+        input: {mode: list, agent_id: "{{ agent_id }}", config: "{{ config }}", scope: user, status: active}
+      output:
+        set:
+          - act_result: "{{ _ or {} }}"
+
+    - task_name: write-answer
+      set:
+        - _ok: "{{ act_result.get('ok') == True }}"
+        - _d: "{{ act_result.get('data') or {} }}"
+        - _items: "{{ [i for i in (_d.get('items') or []) if isinstance(i, dict)] }}"
+        - _default: "{{ (((config or {}).get('router') or {}).get('default_profile')) or 'chat' }}"
+        - handoff: "{{ {'profile': _default, 'reason': 'not a memory request'} if command == 'none' else None }}"
+        - status: "{{ 'handoff' if command == 'none' else 'ok' }}"
+        - answer: >-
+            {{ '' if command == 'none' else
+               'Tell me what to remember, for example: "remember that I deploy with helm".' if command == 'remember' and not statement else
+               ("I couldn't change my memory just now: " + str((act_result.get('error') or {}).get('message') or 'unknown error')) if not _ok else
+               ('Got it, I will remember: ' + statement) if command == 'remember' and _d.get('verdict') == 'new' else
+               ('I already had that: ' + statement) if command == 'remember' else
+               ('Done, I have forgotten ' + str(len(_d.get('retired') or [])) + ' thing(s) about that, and I will not learn it again.')
+                 if command == 'forget' and _d.get('retired') else
+               'I had nothing remembered about that.' if command == 'forget' else
+               ('Here is what I remember about you:\n' + '\n'.join('- ' + str(i.get('title') or i.get('text')) for i in _items[:20])
+                + '\n\nSay "forget …" to remove any of it.') if _items else
+               'I do not remember anything about you yet.' }}

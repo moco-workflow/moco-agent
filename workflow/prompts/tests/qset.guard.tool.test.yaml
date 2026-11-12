@@ -1,0 +1,16 @@
+test_type: integration-test
+
+# qset.guard.tool: one state (request + proposed call, canonical arguments), one noul.
+
+wfspec:
+  name: qset.guard.tool
+
+test_cases:
+  - id: one-overreach-noul-about-the-request-and-the-call
+    input: {question: "list pods in staging", tool: {name: k8s_pods, description: List pods, side_effects: read}, arguments: {namespace: staging, a: 1}}
+    expect:
+      output:
+        - kind: system_one
+        - state: "User request: list pods in staging\n\nProposed tool call: k8s_pods (List pods; side effects: read)\nArguments: {\"a\": 1, \"namespace\": \"staging\"}"
+      assert:
+        - "{{ list(questions) == ['overreach'] and questions['overreach']['type'] == 'noul' and bool(questions['overreach']['instructions']) }}"

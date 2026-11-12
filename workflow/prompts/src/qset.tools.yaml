@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.TOOLS — would this tool help? one noul per candidate (design §6.9.8)
+# ================================================================================
+#
+#   variables          out
+#   ────────────────── ──────────────────────────────────────────────────
+#   request, tools     {kind: system_one, state, questions, keymap, trace}
+#
+# A data wfspec: it only BUILDS the request; `decide` sends it and tool-selector
+# reads the nouls back through `keymap`. One request, MANY questions about ONE
+# state (the request) -- the working pattern of F44; the tools are the questions,
+# never the state.
+#
+# `tools` are the pre-filtered candidates [{name, description, example?}], at most
+# `max_questions` (10, §7.3: the selector runs on every loop step, so it is a
+# synchronous call). Extra tools are dropped and listed in trace.dropped.
+#
+# POSITIONAL KEYS `tool_<i>` with keymap → tool name, so a tool name can never
+# collide with another key. SORTED: Temporal serialises activity input with sorted
+# keys and System One is sensitive to the order (§6.3.2).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.tools
+
+context:
+  description_chars: 300
+
+input:
+  request: ""
+  tools: []
+  max_questions: 10
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: "{{ keymap }}"
+  trace: "{{ trace }}"
+
+main:
+  task_name: build-tools-qset
+  set:
+    - state: "{{ 'Current request: ' + str(request or '').strip() }}"
+    - _tools: "{{ [t for t in (tools or []) if isinstance(t, dict) and t.get('name')] }}"
+    - _kept: "{{ _tools[:int(max_questions)] }}"
+    - _all: >-
+        {{ {('tool_' + str(i)): {'type': 'noul',
+                                 'instructions': 'Would the tool "' + str(t['name']) + '" ('
+                                                 + str(t.get('description') or 'no description')[:description_chars].strip()
+                                                 + ((' For example: ' + str(t['example'])) if t.get('example') else '')
+                                                 + ') help to answer or carry out the current request?'}
+            for i, t in enumerate(_kept)} }}
+    - questions: >-
+        {{ {k: dict(sorted(_all[k].items())) for k in sorted(_all)} }}
+    - keymap: "{{ dict(sorted({('tool_' + str(i)): t['name'] for i, t in enumerate(_kept)}.items())) }}"
+    - trace:
+        question_count: "{{ len(questions) }}"
+        dropped: "{{ [t['name'] for t in _tools[int(max_questions):]] }}"

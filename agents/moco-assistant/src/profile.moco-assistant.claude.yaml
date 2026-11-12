@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# PROFILE.MOCO-ASSISTANT.CLAUDE — the `claude` profile (plan-18 step 5, design §6.8.5)
+# ================================================================================
+# A `kind: wfspec` profile: subagent.claude runs claude_agent.query on the agent
+# worker with web search and the bridged tools. Reached by routing or /claude, never
+# by an implicit handoff from rag (F10). Gated by requires.worker: agent.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: profile.moco-assistant.claude
+
+context:
+  profile:
+    name: claude
+    kind: wfspec
+    mode: sync
+    route_description: "A question that needs current information from the web, or open-ended research beyond the moco documentation."
+    examples: ["what changed in the latest temporal python sdk release?", "compare moco with airflow"]
+    requires: {worker: agent, not_guest: true}
+    needs_rewrite: true
+    budget_sec: 100
+    estimated_sec: 80
+    wfspec: {name: subagent.claude}
+
+output:
+  profile: "{{ profile }}"
+
+main:
+  task_name: emit-profile
+  set:
+    - _loaded: true

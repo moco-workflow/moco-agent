@@ -1,0 +1,227 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# JOB-STORE — the job row and its lifecycle (design §6.12, plan-13)
+# ================================================================================
+#
+#   mode            in                                          data out
+#   ─────────────── ─────────────────────────────────────────── ─────────────────────
+#   create          job_id, session_id, profile, wfspec,         {job}
+#                   workflow_id, summary?
+#   get             job_id                                      {job}   (null when none)
+#   transition      job_id, to, progress?, result?, error?,      {job}
+#                   pending_action?
+#   mark_delivered  job_id                                      {job, already: bool}
+#   list            session_id?, status? (a list)               {jobs: [row, ...]}
+#   delete          job_id                                      {deleted: bool}
+#
+# ONE OWNER (§4.3): only this wfspec touches `job:<job_id>`, topic session-job, in
+# `<uid>:agent.<id>.sessions`. Its live writer is the job entity (through
+# job-manager report); the session writes `create` (start) and `mark_delivered`
+# (relaying); a caller writes `cancelled` directly only when the entity is gone,
+# and job-manager reconcile `failed` for a stuck job of an entity that is gone (run
+# by the session as the same user: nobody else can address these rows).
+#
+# ROW  {schema_version: 1, job_id, session_id, profile, wfspec, workflow_id, summary,
+#       status, progress, pending_action, result: {answer, sources, artifacts},
+#       error: null | {code, message}, created_at, updated_at, delivered_at}
+#
+# LIFECYCLE (row state machine; anything else is ok: false, invalid_state):
+#   create ─▶ queued ─▶ running ──needs input──▶ awaiting_input ──reply──▶ running
+#                         ├──done──▶ completed        ├──cancel / expired──▶ cancelled
+#                         ├──error──▶ failed          └──error──▶ failed
+#                         └──cancel──▶ cancelled
+#   queued may also go straight to failed (the entity could not start) or cancelled.
+# running -> running is a progress update. `pending_action` is kept only while
+# awaiting_input; `delivered_at` is set once, on a terminal row, by mark_delivered
+# (a second call is ok with already: true, so a relay retried after a crash is
+# harmless).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: job-store
+
+context:
+  valid_modes: ["create", "get", "transition", "mark_delivered", "list", "delete"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  statuses: ["queued", "running", "awaiting_input", "completed", "failed", "cancelled"]
+  terminal_statuses: ["completed", "failed", "cancelled"]
+  transitions:
+    queued: ["running", "failed", "cancelled"]
+    running: ["running", "awaiting_input", "completed", "failed", "cancelled"]
+    awaiting_input: ["running", "failed", "cancelled"]
+    completed: []
+    failed: []
+    cancelled: []
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  ok: false
+  data:
+  error:
+  current:
+  rows: []
+  new_row:
+  problem:
+
+input:
+  mode: get
+  agent_id:
+  job_id:
+  session_id:
+  profile:
+  wfspec:
+  workflow_id:
+  summary: ""
+  to:
+  progress:
+  result:
+  error_info:
+  pending_action:
+  status:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "job-store: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - jid: '{{ str(job_id or "").strip() }}'
+        - sessions_ns: "{{ 'agent.' + aid + '.sessions' }}"
+        - key: "job:{{ jid }}"
+        - status_filter: "{{ ([status] if isinstance(status, str) else list(status)) if status else [] }}"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'job_id must match ' + id_pattern if mode != 'list' and not re.match(id_pattern, jid) else
+               'create needs session_id, profile and wfspec'
+                 if mode == 'create' and not (session_id and re.match(id_pattern, str(session_id)) and profile and wfspec) else
+               'to must be one of ' + ', '.join(statuses) if mode == 'transition' and to not in statuses else
+               'status must be among ' + ', '.join(statuses) if mode == 'list' and not all(s in statuses for s in status_filter) else None }}
+        - proceed: "{{ _bad is None }}"
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+        - now_iso: "{{ now().isoformat() }}"
+
+
+    # ── list ────────────────────────────────────────────────────────────────
+    - task_name: mode-list
+      skip_if: "{{ not proceed or mode != 'list' }}"
+      tasks:
+        - task_name: list-job-keys
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key_pattern: "job:*", topic_pattern: session-job}
+          output:
+            set:
+              - job_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: read-job-rows
+          loop:
+            in: "{{ job_keys }}"
+            foreach: job_key
+            execute_mode: parallel
+            do:
+              task_name: read-job-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ job_key }}"}
+          output:
+            set:
+              - rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('schema_version', 0) in supported_schema_versions] }}"
+        - task_name: shape-list
+          set:
+            - ok: true
+            - data: >-
+                {{ {'jobs': sorted([r for r in rows
+                                    if (not session_id or r.get('session_id') == session_id)
+                                       and (not status_filter or r.get('status') in status_filter)],
+                                   key=lambda r: str(r.get('created_at')))} }}
+
+    # ── one row ─────────────────────────────────────────────────────────────
+    - task_name: mode-row
+      skip_if: "{{ not proceed or mode == 'list' }}"
+      tasks:
+        - task_name: read-current
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ key }}"}
+          output:
+            set:
+              - current: >-
+                  {{ _ if isinstance(_, dict) and _.get('schema_version', 0) in supported_schema_versions else None }}
+
+        - task_name: plan-row
+          set:
+            - _status: "{{ (current or {}).get('status') }}"
+            - already#: "{{ mode == 'mark_delivered' and bool((current or {}).get('delivered_at')) }}"
+            - problem#: >-
+                {{ None if mode == 'get' else
+                   ('already_exists', 'job ' + jid + ' already exists')
+                     if mode == 'create' and current is not None else
+                   ('not_found', 'no job ' + jid)
+                     if mode in ['transition', 'mark_delivered', 'delete'] and current is None else
+                   ('invalid_state', 'job ' + jid + ' is ' + str(_status) + '; it cannot become ' + str(to))
+                     if mode == 'transition' and to not in transitions.get(_status, []) else
+                   ('invalid_state', 'job ' + jid + ' is ' + str(_status) + '; only a finished job is delivered')
+                     if mode == 'mark_delivered' and _status not in terminal_statuses else None }}
+            - _res: "{{ result if isinstance(result, dict) else {} }}"
+            - new_row: >-
+                {{ None if problem is not None or already else
+                   {'schema_version': schema_version, 'job_id': jid, 'session_id': str(session_id),
+                    'profile': profile, 'wfspec': wfspec, 'workflow_id': workflow_id,
+                    'summary': str(summary or '')[:300], 'status': 'queued', 'progress': None,
+                    'pending_action': None, 'result': None, 'error': None,
+                    'created_at': now_iso, 'updated_at': now_iso, 'delivered_at': None}
+                     if mode == 'create' else
+                   dict(current, status=to, updated_at=now_iso,
+                        progress=progress if progress is not None else current.get('progress'),
+                        pending_action=(pending_action if isinstance(pending_action, dict) else None) if to == 'awaiting_input' else None,
+                        result=({'answer': str(_res.get('answer') or ''), 'sources': list(_res.get('sources') or []),
+                                 'artifacts': list(_res.get('artifacts') or [])}
+                                if to == 'completed' else current.get('result')),
+                        error=(error_info if isinstance(error_info, dict) else
+                               {'code': 'job_failed' if to == 'failed' else to, 'message': str(error_info or '')[:500]}
+                                 if to in ['failed', 'cancelled'] and error_info else
+                               current.get('error') if to in ['failed', 'cancelled'] else None))
+                     if mode == 'transition' else
+                   dict(current, delivered_at=now_iso, updated_at=now_iso)
+                     if mode == 'mark_delivered' else None }}
+
+        - task_name: write-row
+          skip_if: "{{ new_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ sessions_ns }}"
+              key: "{{ key }}"
+              value: "{{ new_row }}"
+              topic: session-job
+
+        - task_name: delete-row
+          skip_if: "{{ mode != 'delete' or problem is not None }}"
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: false, namespace: "{{ sessions_ns }}", key: "{{ key }}"}
+
+        - task_name: shape-row
+          set:
+            - ok: "{{ problem is None }}"
+            - error: "{{ None if problem is None else {'code': problem[0], 'message': problem[1], 'retryable': False} }}"
+            - data: >-
+                {{ None if problem is not None else
+                   {'job': current} if mode == 'get' else
+                   {'job': current, 'already': True} if already else
+                   {'job': new_row, 'already': False} if mode == 'mark_delivered' else
+                   {'deleted': True} if mode == 'delete' else
+                   {'job': new_row} }}

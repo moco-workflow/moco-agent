@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL.RUN-WORKFLOW — run a deployed workflow as a tool (design §6.9.4, workflow providers)
+# ================================================================================
+#
+#   in                                            out
+#   ───────────────────────────────────────────── ─────────────────────────────────
+#   args, binding: {name, workflow: {ref},         {result} -- the workflow's output
+#   timeout_sec?}, user_id, config, question
+#
+# The wfspec binding of every tool imported from a `workflow` provider (tool-provider):
+# a deployed wfspec that opted in with `header.metadata.tool` (collected by
+# `moco publish` into its package manifest). The target is `binding.workflow.ref`,
+# `<package>/<workflow_name>`, from the stored manifest -- never from args. The model's
+# arguments are the workflow's input.
+#
+# It runs as a `sync` child under the CALLING user, so the platform's deployment
+# targeting decides whether this user may run it at all, and the engine's call-stack
+# guard stops a tool workflow from re-entering the agent. Harness packages are refused
+# as targets: their entry points are not tools.
+#
+# Failures RAISE (no on_error): tool-executor catches them on its calling task and
+# classifies them for its retry rule, as with tool-dispatch.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool.run-workflow
+
+context:
+  ref_pattern: "^[a-z0-9][a-z0-9_.-]{0,63}/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+  run_output:
+
+input:
+  args: {}
+  binding: {}
+  config: {}
+  user_id:
+  question:
+
+output:
+  result: "{{ run_output }}"
+
+main:
+  tasks:
+    - task_name: read-binding
+      set:
+        - target: "{{ str(((binding or {}).get('workflow') or {}).get('ref') or '') }}"
+        - run_timeout: "{{ min(3600, max(1, int((binding or {}).get('timeout_sec') or 300))) }}"
+
+    - task_name: reject-bad-binding
+      raise:
+        if: "{{ not re.match(ref_pattern, target) or target.split('/')[0].startswith('agent-harness') }}"
+        type: error
+        error_type: AbortError
+        message: "tool.run-workflow: binding.workflow.ref must be <package>/<workflow_name> outside the agent-harness packages, got '{{ target }}'"
+
+    - task_name: run-target
+      workflow:
+        ref: "{{ target }}"
+        mode: sync
+        input: "{{ args or {} }}"
+        options:
+          retry_policy: {timeout_sec: "{{ run_timeout }}", max_attempts: 1}
+      output:
+        set:
+          - run_output: "{{ _ }}"

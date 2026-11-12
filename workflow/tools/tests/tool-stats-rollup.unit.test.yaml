@@ -1,0 +1,25 @@
+test_type: unit-test
+
+# tool-stats-rollup compute-stats: the figures of one tool from audit entries.
+
+wfspec:
+  name: tool-stats-rollup
+
+test_groups:
+  - step_name: compute-stats
+    test_cases:
+      - id: calls-errors-latency-approvals-and-the-last-error
+        input:
+          entries:
+            - {tool: k8s_list_pods, status: ok, elapsed_ms: 100, _aid: ops, ts: "2026-10-11T10:00:00"}
+            - {tool: k8s_list_pods, status: ok, elapsed_ms: 300, truncated: true, _aid: ops, ts: "2026-10-11T10:01:00"}
+            - {tool: k8s_list_pods, status: error, elapsed_ms: 200, error: {code: timeout, message: slow}, _aid: ops, ts: "2026-10-11T10:02:00"}
+            - {tool: k8s_get_secret, status: needs_approval, _aid: ops, ts: "2026-10-11T10:03:00"}
+            - {tool: k8s_get_secret, status: ok, elapsed_ms: 50, approved_by: u1, _aid: ops, ts: "2026-10-11T10:04:00"}
+        expect:
+          assert:
+            - "{{ stats['k8s_list_pods']['calls'] == 3 and stats['k8s_list_pods']['errors'] == 1 and stats['k8s_list_pods']['error_rate'] == 0.333 }}"
+            - "{{ stats['k8s_list_pods']['p50_ms'] == 200 and stats['k8s_list_pods']['p95_ms'] == 300 and stats['k8s_list_pods']['truncated'] == 1 }}"
+            - "{{ stats['k8s_list_pods']['last_error'] == {'message': 'slow', 'ts': '2026-10-11T10:02:00'} and stats['k8s_list_pods']['agents'] == {'ops': 3} }}"
+            - "{{ stats['k8s_get_secret']['approval_requests'] == 1 and stats['k8s_get_secret']['approved'] == 1 and stats['k8s_get_secret']['calls'] == 1 }}"
+            - "{{ stats['k8s_get_secret']['flag'] is None and stats['k8s_get_secret']['schema_version'] == 1 }}"

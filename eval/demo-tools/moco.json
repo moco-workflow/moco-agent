@@ -1,0 +1,10 @@
+{
+    "wfspec_package_name": "demo-tools",
+    "wfspec_package_version": "0.1.1",
+    "wfspec_description": "Demo workflow tools for the agent harness's workflow tool providers (header.metadata.tool). Published to a dev stage only.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": []
+}

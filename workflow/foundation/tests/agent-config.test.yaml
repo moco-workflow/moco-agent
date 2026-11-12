@@ -1,0 +1,307 @@
+test_type: integration-test
+
+# agent-config (plan-04 steps 2-7, design §6.1). The registry (`load-registry`), the
+# defaults (`load-defaults`), the two tier rows (`read-agent-tier`, `read-user-tier`),
+# the access check (`authorize-write`) and the writes are mocked by task name, so the
+# merge, allowlist and versioning rules are tested against pinned fixtures.
+
+wfspec:
+  name: agent-config
+
+test_data:
+  registry: &registry
+    ok: true
+    data:
+      definition:
+        agent_id: skeleton
+        harness: ">=0.2"
+        profiles: [chat, rag]
+        router: {default_profile: chat}
+        models: {inference: {model: deepseek-flash}}
+        limits: {retire_after_idle_sec: 3600}
+        access: {admin_user_ids: [root]}
+      profiles:
+        chat: {name: chat, kind: loop, loop: {prompt: loop, tools: null}}
+        rag: {name: rag, kind: loop, loop: {prompt: rag.answer, tools: null}}
+      resolved_refs: {loop: {wfspec: agent-harness-prompts/prompt.loop, version: "0.3.0"}}
+      versions: {harness: "0.3.0", agent: "0.2.0"}
+  defaults: &defaults
+    version: "0.3.0"
+    defaults:
+      models:
+        inference: {provider: deepseek, model: deepseek-v4-pro, max_tokens: 1200, temperature: 0.2}
+        decision: null
+      limits: {turn_budget_sec: 110, max_queued_messages: 1, retire_after_idle_sec: 86400}
+      memory: {short_term: {recent_turns: 6}}
+      access: {denied_user_ids: [], guest_user_ids: [guest], admin_user_ids: [], guest_profiles: [chat]}
+      profiles: [chat]
+    catalog:
+      providers:
+        - id: deepseek
+          kind: inference
+          models:
+            - {id: deepseek-v4-pro, tools: true, json_mode: true}
+            - {id: deepseek-flash, tools: true, json_mode: true}
+            - {id: tiny-chat, tools: false, json_mode: false}
+        - id: openai
+          kind: inference
+          base_urls: ["https://api.openai.com/v1"]
+          apikey_secret_key: OPENAI_KEY
+          models:
+            - {id: gpt-4o, max_tokens: 900, tools: true, json_mode: true}
+        - id: laya-embed
+          kind: classifier
+          base_urls: ["http://mocopi-4:8000", "http://localhost:8001"]
+          apikey_secret_key: LAYA_KEY
+          models:
+            - {id: laya}
+        - id: ollama-embed
+          kind: embedding
+          base_urls: ["http://mocopi-3:11434/v1", "http://localhost:11434/v1"]
+          apikey_secret_key: OLLAMA_KEY
+          models:
+            - {id: nomic-embed-text, embed_dim: 768}
+        - id: openai-embed
+          kind: embedding
+          base_urls: ["https://api.openai.com/v1"]
+          apikey_secret_key: OPENAI_KEY
+          models:
+            - {id: text-embedding-3-small, embed_dim: 1536}
+  agent_row: &agent_row
+    schema_version: 1
+    version: 3
+    sections: {limits: {turn_budget_sec: 90}, models: {inference: {temperature: 0.5}}}
+  user_row: &user_row
+    schema_version: 1
+    version: 7
+    sections: {persona_text: "Answer in French.", disabled_profiles: [rag]}
+
+test_cases:
+
+  # ── resolve: the five tiers ─────────────────────────────────────────────
+  - id: resolve-merges-defaults-definition-agent-and-user-tiers-field-by-field
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: *agent_row}
+      - {step_name: read-user-tier, _: *user_row}
+    expect:
+      output:
+        - ok: true
+        - error: null
+      assert:
+        # definition over defaults; the agent tier's temperature over both; siblings survive
+        - "{{ data['config']['models']['inference'] == {'provider': 'deepseek', 'model': 'deepseek-flash', 'max_tokens': 1200, 'temperature': 0.5} }}"
+        - "{{ data['config']['limits'] == {'turn_budget_sec': 90, 'max_queued_messages': 1, 'retire_after_idle_sec': 3600} }}"
+        - "{{ data['config']['persona_text'] == 'Answer in French.' }}"
+        - "{{ data['config']['memory'] == {'short_term': {'recent_turns': 6}} }}"
+        # the definition's list replaces the default's; the user disabled rag
+        - "{{ data['config']['profiles'] == ['chat'] and list(data['profiles']) == ['chat'] }}"
+        - "{{ data['resolved_refs']['loop']['wfspec'] == 'agent-harness-prompts/prompt.loop' }}"
+        - "{{ data['config_version'] == 'd0.3.0+a0.2.0+g3+u7' }}"
+
+  - id: missing-rows-are-version-zero
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      assert:
+        - "{{ data['config_version'] == 'd0.3.0+a0.2.0+g0+u0' and data['config']['profiles'] == ['chat', 'rag'] }}"
+
+  - id: session-overrides-keep-only-their-allowlist
+    input:
+      mode: resolve
+      agent_id: skeleton
+      session_overrides: {models: {inference: {temperature: 0.9, base_url: "http://evil"}}, limits: {turn_budget_sec: 9999}}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      assert:
+        - "{{ data['config']['models']['inference']['temperature'] == 0.9 }}"
+        - "{{ 'base_url' not in data['config']['models']['inference'] }}"
+        - "{{ data['config']['limits']['turn_budget_sec'] == 110 }}"
+
+  - id: the-default-profile-cannot-be-disabled
+    input: {mode: resolve, agent_id: skeleton, session_overrides: {disabled_profiles: [chat, rag]}}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      assert:
+        - "{{ data['config']['profiles'] == ['chat'] }}"
+
+  - id: a-row-from-a-newer-schema-is-refused
+    input: {mode: resolve, agent_id: skeleton}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: {schema_version: 2, version: 1, sections: {}}}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-config: a config row of agent 'skeleton' has an unsupported schema_version"
+
+  # ── validate: tier allowlist, catalog, capabilities ─────────────────────
+  - id: a-user-may-pick-a-catalog-model-and-set-persona-text
+    input: {mode: validate, agent_id: skeleton, scope: user, partial: {models: {inference: {model: deepseek-v4-pro}}, persona_text: "Be brief."}}
+    mocks: &resolve_mocks
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+    expect:
+      output:
+        - data: {valid: true, errors: []}
+
+  - id: a-user-may-set-a-custom-model-but-not-limits-or-guard
+    input:
+      mode: validate
+      agent_id: skeleton
+      scope: user
+      partial: {models: {inference: {model: gpt-unknown, base_url: "http://x"}}, limits: {turn_budget_sec: 1}, guard: {x: 1}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ data['valid'] == False }}"
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.guard.x', '$.limits.turn_budget_sec'] }}"
+
+  - id: a-session-may-change-temperature-but-not-toolsets
+    input: {mode: validate, agent_id: skeleton, scope: session, partial: {models: {inference: {temperature: 0.1}}, toolsets: [x]}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ [e['path'] for e in data['errors']] == ['$.toolsets'] }}"
+
+  - id: the-agent-tier-cannot-change-agent-id-or-harness
+    input: {mode: validate, agent_id: skeleton, scope: agent, partial: {agent_id: other, harness: ">=9", limits: {turn_budget_sec: 60}}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ sorted(e['path'] for e in data['errors']) == ['$.agent_id', '$.harness'] }}"
+
+  - id: the-decision-model-needs-json-mode
+    input: {mode: validate, agent_id: skeleton, scope: user, partial: {models: {inference: {model: tiny-chat}}}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ [e['message'] for e in data['errors']] == ['the decision model tiny-chat lacks json_mode'] }}"
+
+  - id: disabling-the-default-profile-is-refused
+    input: {mode: validate, agent_id: skeleton, scope: user, partial: {disabled_profiles: [chat]}}
+    mocks: *resolve_mocks
+    expect:
+      assert:
+        - "{{ [e['message'] for e in data['errors']] == ['the default profile cannot be disabled'] }}"
+
+  # ── save / reset ────────────────────────────────────────────────────────
+  - id: a-user-save-merges-into-its-row-and-bumps-the-version
+    input: {mode: save, agent_id: skeleton, scope: user, patch: {persona_text: "Be brief."}}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: *agent_row}
+      - {step_name: read-user-tier, _: *user_row}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: true, reason: ok}}}
+      - {step_name: write-user-tier, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {config_version: "d0.3.0+a0.2.0+g3+u8"}
+
+  - id: an-agent-tier-save-needs-an-admin
+    input: {mode: save, agent_id: skeleton, scope: agent, patch: {limits: {turn_budget_sec: 60}}}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: *agent_row}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: false, reason: not_admin}}}
+      - step_name: write-agent-tier
+        _: "{{ 1 / 0 }}"
+    expect:
+      output:
+        - ok: false
+        - data: null
+        - error: {code: forbidden, message: "not allowed to write the agent tier (not_admin)", retryable: false}
+
+  - id: an-invalid-save-writes-nothing
+    input: {mode: save, agent_id: skeleton, scope: user, patch: {limits: {turn_budget_sec: 1}}}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: null}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: true, reason: ok}}}
+      - step_name: write-user-tier
+        _: "{{ 1 / 0 }}"
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' and '$.limits.turn_budget_sec' in error['message'] }}"
+
+  - id: reset-of-one-section-bumps-the-version-and-keeps-the-rest
+    input: {mode: reset, agent_id: skeleton, scope: agent, section: limits}
+    mocks:
+      - {step_name: load-registry, _: *registry}
+      - {step_name: load-defaults, _: *defaults}
+      - {step_name: read-agent-tier, _: *agent_row}
+      - {step_name: read-user-tier, _: null}
+      - {step_name: authorize-write, _: {ok: true, data: {allow: true, reason: ok}}}
+      - {step_name: write-agent-tier, _: null}
+    expect:
+      output:
+        - ok: true
+        - data: {config_version: "d0.3.0+a0.2.0+g4+u0"}
+
+  # ── list_models, guards ─────────────────────────────────────────────────
+  - id: list-models-returns-the-catalog-providers
+    input: {mode: list_models}
+    mocks:
+      - {step_name: mode-list-models, _: *defaults}
+    expect:
+      assert:
+        - "{{ ok == True and data['providers'][0]['id'] == 'deepseek' }}"
+
+  - id: an-agent-id-that-is-not-key-safe-is-refused-without-loading
+    input: {mode: resolve, agent_id: "../etc"}
+    expect:
+      output:
+        - ok: false
+        - data: null
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: save-needs-a-writable-scope
+    input: {mode: save, agent_id: skeleton, scope: session, patch: {}}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-config: save needs scope one of user, agent, got 'session'"
+
+  - id: an-unknown-mode-is-a-bug
+    input: {mode: delete, agent_id: skeleton}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "agent-config: invalid mode 'delete'. Must be one of: resolve, validate, save, reset, list_models, version"
+
+  # The per-turn check reads only the two rows (plan-14 step 7).
+  - id: version-reads-only-the-two-row-versions
+    input: {mode: version, agent_id: skeleton}
+    mocks:
+      - {step_name: read-agent-version, _: {schema_version: 1, version: 3, sections: {}}}
+      - {step_name: read-user-version, _: null}
+      - {step_name: load-registry, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data: {agent_row: 3, user_row: 0}

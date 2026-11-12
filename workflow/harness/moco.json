@@ -1,0 +1,12 @@
+{
+    "wfspec_package_name": "agent-harness",
+    "wfspec_package_version": "0.15.0",
+    "wfspec_description": "Agent harness entry points (agent-cli, agent-admin) and the harness version. The harness is split into agent-harness-* packages deployed into the same namespace; an agent is a definition (agent.<agent_id>) in its own package. See moco-agent/docs/plan-00-overview.md.",
+    "share_to_all": true,
+    "sources": [
+        "src/**/*.yaml"
+    ],
+    "tests": [
+        "tests/**/*.test.yaml"
+    ]
+}

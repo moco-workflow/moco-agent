@@ -1,0 +1,145 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MODEL-READINESS — is each model role set up, and if not, what fixes it (F70)
+# ================================================================================
+#
+#   in                               out data
+#   ──────────────────────────────── ─────────────────────────────────────────────
+#   config (resolved), agent_id      {ready, roles: {<role>: {status, reason, secret,
+#                                     fix: {fields, secret_name, scope}, hint}}}
+#
+# STATIC (design §6.2.5): reads the resolved config and the caller's and the global
+# secret NAMES (builtin.secret.list), never calls a model. What it cannot see is the
+# worker's environment, so a role left on the worker's default is `unknown`, not
+# `ready`; a turn that then fails for a setup reason gets the session's setup answer.
+#
+#   role        status (reason)
+#   inference   missing (no_secret_name | secret_missing) | unknown (env_default) | ready
+#   decision    inherited (null: the inference model) | as inference
+#   classifier  off (classifier_disabled | classifier_unset) | ready (endpoint |
+#               worker_default) | missing (secret_missing)
+#   embedding   only when the agent searches knowledge (rag, knowledge.sources) or
+#               vector recall is on: unknown (env_default) | missing (secret_missing) |
+#               ready; otherwise off (not_used)
+# ready is false only when a role is `missing`: unknown, off and inherited do not
+# stop a turn by themselves.
+#
+# A key name without `global/` lives in the CALLER's own secrets, so every user
+# needs their own; an admin can point the agent at a shared global/<NAME> instead.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: model-readiness
+
+context:
+  ok: false
+  data:
+  error:
+  user_secrets: []
+  global_secrets: []
+
+input:
+  config: {}
+  agent_id:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: read-config
+      set:
+        - models: "{{ (config or {}).get('models') or {} }}"
+        - inference: "{{ models.get('inference') or {} }}"
+        - decision: "{{ models.get('decision') if isinstance(models.get('decision'), dict) else None }}"
+        - classifier: "{{ models.get('classifier') or {} }}"
+        - embedding: "{{ models.get('embedding') or {} }}"
+        - uses_knowledge: >-
+            {{ 'rag' in ((config or {}).get('profiles') or [])
+               or bool(((config or {}).get('knowledge') or {}).get('sources'))
+               or bool(((((config or {}).get('memory') or {}).get('long_term') or {}).get('vector') or {}).get('enabled')) }}
+        - secret_names: >-
+            {{ [str(n) for n in [inference.get('apikey_secret_key'), (decision or {}).get('apikey_secret_key'),
+                                 classifier.get('apikey_secret_key'), embedding.get('apikey_secret_key')] if n] }}
+
+    # Names only. A list that fails reads as "not found", which errs towards guiding.
+    - task_name: list-user-secrets
+      skip_if: "{{ not [n for n in secret_names if not n.startswith('global/')] }}"
+      activity:
+        type: builtin.secret.list
+        input: {in_global_ns: false}
+      output:
+        set:
+          - user_secrets: "{{ [str(k) for k in (_ or [])] }}"
+      on_error:
+        catch: true
+
+    - task_name: list-global-secrets
+      skip_if: "{{ not [n for n in secret_names if n.startswith('global/')] }}"
+      activity:
+        type: builtin.secret.list
+        input: {in_global_ns: true}
+      output:
+        set:
+          - global_secrets: "{{ [str(k) for k in (_ or [])] }}"
+      on_error:
+        catch: true
+
+    - task_name: judge-roles
+      set:
+        - cfg_of: "{{ {'inference': inference, 'decision': decision or {}, 'classifier': classifier, 'embedding': embedding} }}"
+        - secret_of: >-
+            {{ {r: {'name': (c.get('apikey_secret_key') or None),
+                    'scope': (('global' if str(c.get('apikey_secret_key')).startswith('global/') else 'user') if c.get('apikey_secret_key') else None),
+                    'exists': ((str(c.get('apikey_secret_key'))[len('global/'):] in global_secrets
+                                if str(c.get('apikey_secret_key')).startswith('global/')
+                                else str(c.get('apikey_secret_key')) in user_secrets) if c.get('apikey_secret_key') else None)}
+                for r, c in cfg_of.items()} }}
+        - chat_status: >-
+            {{ {r: (('missing', 'no_secret_name') if not cfg_of[r].get('apikey_secret_key')
+                    else ('missing', 'secret_missing') if not secret_of[r]['exists']
+                    else ('unknown', 'env_default') if not (cfg_of[r].get('model') and cfg_of[r].get('base_url'))
+                    else ('ready', 'configured'))
+                for r in ['inference', 'decision']} }}
+        - classifier_status: >-
+            {{ ('off', 'classifier_disabled') if classifier.get('enabled', True) is False
+               else ('off', 'classifier_unset') if not (classifier.get('base_url') or classifier.get('worker_default') is True)
+               else ('missing', 'secret_missing') if classifier.get('apikey_secret_key') and not secret_of['classifier']['exists']
+               else ('ready', 'endpoint' if classifier.get('base_url') else 'worker_default') }}
+        - embedding_status: >-
+            {{ ('off', 'not_used') if not uses_knowledge
+               else ('missing', 'secret_missing') if embedding.get('apikey_secret_key') and not secret_of['embedding']['exists']
+               else ('unknown', 'env_default') if not (embedding.get('model_name') and embedding.get('base_url'))
+               else ('ready', 'configured') }}
+        - statuses: >-
+            {{ {'inference': list(chat_status['inference']),
+                'decision': ['inherited', 'uses_inference'] if decision is None else list(chat_status['decision']),
+                'classifier': list(classifier_status), 'embedding': list(embedding_status)} }}
+
+    - task_name: shape
+      set:
+        - hints:
+            no_secret_name: "Choose an API key secret for this model in Settings."
+            secret_missing_user: "Store your API key as the secret {name} (Settings, or: moco secret upload {name} <key>). Each user stores their own; an admin can point the agent at a shared global/<NAME> secret instead."
+            secret_missing_global: "An admin needs to store the shared secret {name}."
+            env_default: "It uses the worker default model (MOCO_LLM_DEFAULT_BASE_URL, MOCO_LLM_DEFAULT_MODEL_NAME); if answers fail, choose a model and endpoint in Settings."
+            env_default_embedding: "It uses the worker default embedding model (MOCO_LLM_DEFAULT_EMBED_MODEL_NAME); if indexing or search fails, choose an embedding model in Settings."
+            classifier_unset: "Without a classifier, routing and checks use simpler fallbacks. Point it at a self-hosted moco-systemone (endpoint), or tick worker default if the worker TYPESAFE_DEFAULT_BASE_URL names one."
+        - model_key: {inference: model, decision: model, classifier: model, embedding: model_name}
+        - roles: >-
+            {{ {r: {'status': st[0], 'reason': st[1], 'secret': secret_of[r],
+                    'fix': {'fields': (['models.' + r + '.' + f for f in [model_key[r], 'base_url', 'apikey_secret_key']]
+                                       if st[0] in ('missing', 'unknown') or st[1] == 'classifier_unset' else []),
+                            'secret_name': secret_of[r]['name'] if st[1] == 'secret_missing' else None,
+                            'scope': secret_of[r]['scope'] if st[1] == 'secret_missing' else None},
+                    'hint': (str(hints.get(st[1] + '_' + str(secret_of[r]['scope']) if st[1] == 'secret_missing'
+                                           else st[1] + '_embedding' if (st[1] == 'env_default' and r == 'embedding')
+                                           else st[1]) or '').replace('{name}', str(secret_of[r]['name'])) or None)}
+                for r, st in statuses.items()} }}
+        - ok: true
+        - data:
+            ready: "{{ not any(v['status'] == 'missing' for v in roles.values()) }}"
+            roles: "{{ roles }}"

@@ -1,0 +1,346 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-ADMIN — the synchronous admin/UI backend: a dispatcher (design §6.15)
+# ================================================================================
+#
+#   in                                 out
+#   ────────────────────────────────── ─────────────────────────────────────────
+#   op (or operator), agent_id, ...    the area's {ok, data, error}
+#
+# A literal op table routes each op to its area wfspec (plan-16 step 4); the areas
+# call the owning modules, which check access themselves. Persist_state only: never
+# the live entity (P4), except delete_session, which signals it to retire.
+#
+#   agents     list_agents, get_definition, validate_definition
+#   config     get_config, save_config, reset_config, list_models, get_readiness
+#   sessions   list_sessions, get_session, rename_session, delete_session,
+#              submit_feedback
+#   tools      list_tools, get_tool, save_tool, validate_tool, enable_tool,
+#              disable_tool, deprecate_tool, delete_tool, list_toolsets, save_toolset,
+#              dry_run_tool, revoke_grant, seed_tools, tool_stats        (phase 2)
+#              set_tool_pref, clear_tool_pref, list_tool_prefs,
+#              list_providers, get_provider, preview_provider, register_provider,
+#              update_provider, sync_provider, accept_provider_drift, reject_provider_drift,
+#              disable_provider, enable_provider, delete_provider        (phase 3)
+#   pending    list_pending, resolve_pending                             (phase 2)
+#   memory     list_memory, edit_memory, retire_memory, resolve_memory,
+#              forget_memory                                             (phase 2)
+#              list_proposals, approve_proposal, reject_proposal,
+#              run_promotion                                             (phase 3)
+#   usage      usage_report                                              (phase 2)
+#   jobs       list_jobs, get_job, cancel_job, answer_job                (phase 3)
+#   knowledge  list_sources, get_source, register_source, reindex_source,
+#              delete_source, move_source (later), check_sitemap,
+#              refresh_source, set_source_refresh                       (phase 3)
+#
+# OLD-UI COMPATIBILITY (plan-16 step 8, one major version): the old agent's op names
+# (and its `operator` key) are mapped -- list_domains, get_domain, start_index,
+# delete_domain, move_domain -- with `domain` → name and `sources` → index_sources.
+# Its build ops map onto the jobs area (phase 3): list_builds, get_build, cancel_build →
+# list_jobs, get_job, cancel_job; approve_build / revise_build → answer_job with decision
+# approve / revise (`build_id` → job_id).
+# Unknown op → ok: false, code: unknown_op (an expected failure: it comes from a UI).
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-admin
+
+context:
+  areas:
+    list_agents: agents
+    get_definition: agents
+    validate_definition: agents
+    get_config: config
+    save_config: config
+    reset_config: config
+    list_models: config
+    get_readiness: config
+    list_sessions: sessions
+    get_session: sessions
+    rename_session: sessions
+    delete_session: sessions
+    submit_feedback: sessions
+    list_sources: knowledge
+    get_source: knowledge
+    register_source: knowledge
+    reindex_source: knowledge
+    refresh_source: knowledge
+    set_source_refresh: knowledge
+    delete_source: knowledge
+    move_source: knowledge
+    check_sitemap: knowledge
+    list_tools: tools
+    get_tool: tools
+    save_tool: tools
+    validate_tool: tools
+    enable_tool: tools
+    disable_tool: tools
+    deprecate_tool: tools
+    delete_tool: tools
+    list_toolsets: tools
+    save_toolset: tools
+    dry_run_tool: tools
+    revoke_grant: tools
+    set_tool_pref: tools
+    clear_tool_pref: tools
+    list_tool_prefs: tools
+    list_providers: tools
+    get_provider: tools
+    preview_provider: tools
+    register_provider: tools
+    update_provider: tools
+    sync_provider: tools
+    accept_provider_drift: tools
+    reject_provider_drift: tools
+    disable_provider: tools
+    enable_provider: tools
+    delete_provider: tools
+    seed_tools: tools
+    tool_stats: tools
+    list_pending: pending
+    resolve_pending: pending
+    list_memory: memory
+    edit_memory: memory
+    retire_memory: memory
+    resolve_memory: memory
+    forget_memory: memory
+    list_proposals: memory
+    approve_proposal: memory
+    reject_proposal: memory
+    run_promotion: memory
+    usage_report: usage
+    list_jobs: jobs
+    get_job: jobs
+    cancel_job: jobs
+    answer_job: jobs
+  old_ops:
+    list_domains: list_sources
+    get_domain: get_source
+    start_index: register_source
+    delete_domain: delete_source
+    move_domain: move_source
+    list_builds: list_jobs
+    get_build: get_job
+    cancel_build: cancel_job
+    approve_build: answer_job
+    revise_build: answer_job
+  old_decisions: {approve_build: approve, revise_build: revise}
+  later_ops: []
+  default_agent_id: skeleton
+  res: {}
+
+input:
+  op:
+  operator:
+  agent_id:
+  # Area arguments (each area takes the ones it needs).
+  session_id:
+  limit: 50
+  status:
+  page: 0
+  title: ""
+  scope:
+  patch: {}
+  section:
+  definition: {}
+  name:
+  domain:
+  description: ""
+  keywords: []
+  index_sources: []
+  sources: []
+  embed_model_info:
+  url:
+  # register_source / set_source_refresh: scheduled refresh interval (phase 3)
+  every_hours:
+  # feedback, tools, pending (phase 2)
+  turn: 0
+  rating:
+  comment: ""
+  manifest: {}
+  toolset:
+  by:
+  arguments: {}
+  # set_tool_pref (phase 3)
+  permission:
+  # tool providers (phase 3)
+  endpoint:
+  credential: {}
+  import_spec: {}
+  sync: {}
+  decision:
+  feedback:
+  key:
+  query:
+  kind:
+  wfspec_name:
+  source_config: {}
+  kinds:
+  text:
+  tags:
+  to:
+  # memory proposals (phase 3)
+  slug:
+  reason: ""
+  # jobs (phase 3); build_id is the old UI's name for job_id
+  job_id:
+  build_id:
+
+output:
+  ok: "{{ bool(res.get('ok')) }}"
+  data: "{{ res.get('data') }}"
+  error: "{{ res.get('error') }}"
+
+main:
+  tasks:
+    - task_name: route-op
+      set:
+        - _asked: "{{ str(op or operator or '') }}"
+        - asked_op: "{{ str(op or operator or '') }}"
+        - the_op#: "{{ old_ops.get(_asked, _asked) }}"
+        - area: "{{ areas.get(the_op) }}"
+        - aid: "{{ str(agent_id or default_agent_id) }}"
+        - res: >-
+            {{ {'ok': False, 'data': None, 'error': {'code': 'not_available', 'message': _asked + ' arrives with the builder (phase 3)', 'retryable': False}}
+                 if _asked in later_ops else
+               {'ok': False, 'data': None, 'error': {'code': 'unknown_op', 'message': 'unknown op ' + repr(_asked), 'retryable': False}}
+                 if area is None else {} }}
+
+    - task_name: call-agents
+      skip_if: "{{ area != 'agents' }}"
+      workflow:
+        ref: agent-harness-admin/admin.agents
+        mode: inline
+        input: {op: "{{ the_op }}", agent_id: "{{ aid }}", definition: "{{ definition }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-config
+      skip_if: "{{ area != 'config' }}"
+      workflow:
+        ref: agent-harness-admin/admin.config
+        mode: inline
+        input: {op: "{{ the_op }}", agent_id: "{{ aid }}", scope: "{{ scope or 'user' }}", patch: "{{ patch }}", section: "{{ section }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-sessions
+      skip_if: "{{ area != 'sessions' }}"
+      workflow:
+        ref: agent-harness-admin/admin.sessions
+        mode: inline
+        input: {op: "{{ the_op }}", agent_id: "{{ aid }}", session_id: "{{ session_id }}", limit: "{{ limit }}", status: "{{ status }}", page: "{{ page }}", title: "{{ title }}", turn: "{{ turn }}", rating: "{{ rating }}", comment: "{{ comment }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-knowledge
+      skip_if: "{{ area != 'knowledge' }}"
+      workflow:
+        ref: agent-harness-admin/admin.knowledge
+        mode: inline
+        input:
+          op: "{{ the_op }}"
+          agent_id: "{{ aid }}"
+          name: "{{ name or domain }}"
+          scope: "{{ scope or 'shared' }}"
+          description: "{{ description }}"
+          keywords: "{{ keywords }}"
+          index_sources: "{{ index_sources or sources }}"
+          embed_model_info: "{{ embed_model_info }}"
+          every_hours: "{{ every_hours }}"
+          url: "{{ url }}"
+          kind: "{{ kind }}"
+          wfspec_name: "{{ wfspec_name }}"
+          source_config: "{{ source_config }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-tools
+      skip_if: "{{ area != 'tools' }}"
+      workflow:
+        ref: agent-harness-admin/admin.tools
+        mode: inline
+        input:
+          op: "{{ the_op }}"
+          agent_id: "{{ aid }}"
+          name: "{{ name }}"
+          scope: "{{ scope }}"
+          status: "{{ status }}"
+          toolset: "{{ toolset }}"
+          manifest: "{{ manifest }}"
+          by: "{{ by }}"
+          arguments: "{{ arguments }}"
+          session_id: "{{ session_id }}"
+          permission: "{{ permission }}"
+          endpoint: "{{ endpoint }}"
+          credential: "{{ credential }}"
+          import_spec: "{{ import_spec }}"
+          sync: "{{ sync }}"
+          kind: "{{ kind }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-pending
+      skip_if: "{{ area != 'pending' }}"
+      workflow:
+        ref: agent-harness-admin/admin.pending
+        mode: inline
+        input: {op: "{{ the_op }}", agent_id: "{{ aid }}", session_id: "{{ session_id }}", decision: "{{ decision }}", feedback: "{{ feedback }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-memory-area
+      skip_if: "{{ area != 'memory' }}"
+      workflow:
+        ref: agent-harness-admin/admin.memory
+        mode: inline
+        input:
+          op: "{{ the_op }}"
+          agent_id: "{{ aid }}"
+          key: "{{ key }}"
+          query: "{{ query }}"
+          scope: "{{ scope }}"
+          kinds: "{{ kinds }}"
+          status: "{{ status }}"
+          title: "{{ title or None }}"
+          text: "{{ text }}"
+          tags: "{{ tags }}"
+          to: "{{ to }}"
+          slug: "{{ slug }}"
+          reason: "{{ reason }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-jobs
+      skip_if: "{{ area != 'jobs' }}"
+      workflow:
+        ref: agent-harness-admin/admin.jobs
+        mode: inline
+        input:
+          op: "{{ the_op }}"
+          agent_id: "{{ aid }}"
+          job_id: "{{ job_id or build_id }}"
+          session_id: "{{ session_id }}"
+          status: "{{ status }}"
+          decision: "{{ old_decisions.get(asked_op) or decision }}"
+          feedback: "{{ feedback }}"
+      output:
+        set:
+          - res: "{{ _ or {} }}"
+
+    - task_name: call-usage
+      skip_if: "{{ area != 'usage' }}"
+      workflow:
+        ref: agent-harness-admin/admin.usage
+        mode: inline
+        input: {op: "{{ the_op }}", agent_id: "{{ aid }}", limit: "{{ limit }}"}
+      output:
+        set:
+          - res: "{{ _ or {} }}"

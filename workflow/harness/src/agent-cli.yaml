@@ -1,0 +1,190 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-CLI — the synchronous chat entry point (design §6.15.1)
+# ================================================================================
+#
+#   in   {agent_id?, message | question, session_id?, message_id?}
+#   out  {answer, sources, session_id, message_id, turn, workflow_id, route,
+#         status: ok|declined|needs_approval|async_started|error|clarify|busy,
+#         pending_action, clarify, job, setup}
+#
+# Start-or-signal the session entity `agent-session-<agent_id>-<uid>-<sid>`, then
+# wait for the `agent_answer` carrying THIS call's message_id (P16). Matching on
+# message_id rather than on session_id is the fix for the old agent-cli, which
+# took whichever answer its session emitted first -- a queued caller could be
+# handed someone else's answer.
+#
+# - `session_id` absent -> a throwaway session is minted (F25): it retires after
+#   `retire_throwaway_after_idle_sec`, so guests and one-off CLI questions do not
+#   leak entities for a day.
+# - `message_id` absent -> minted. A UI should send its own, so a retry is
+#   recognisable.
+# - `sent_at` stamps the message: the session uses it to enforce queue depth
+#   (see agent-session's header).
+# - On a 120s timeout the turn goes on in the entity; the caller gets
+#   `status: error` with the workflow_id and message_id, and the answer appears in
+#   the transcript later.
+#
+# `workflow_id` is THIS run's id (for traceview), not the session's: the session is
+# one workflow for the whole conversation.
+#
+# PROGRESS (design §11.4): the message asks for progress, and the session (and its
+# loop) send `agent_answer` events with kind: progress before the answer. Each is
+# logged here as `progress#`, so it reaches the debug feed of THIS run's trace -- a UI
+# opens /api/workflow/events/<trace_id> before the call and passes the same trace_id
+# with debug_mode. (The entity's own progress# go to the trace of the turn that started
+# it.) The wait is a loop: progress events until the real answer, within 120 s.
+#
+# PHASE 1 (plan-16 steps 1-2): `action` (a UI reply to a pending action, routed by
+# the session's pending_reply fast path) and the old-UI fields `sources_urls` and
+# `question_count`. `overrides` (session_overrides) is phase 2.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-cli
+
+context:
+  # The deployment's default agent (plan-16 step 1). Phase 0: the skeleton.
+  default_agent_id: skeleton
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  session_id_pattern: "^[A-Za-z0-9_.-]{1,64}$"
+  answer_event:
+  cli_result: {}
+  # The whole wait for this message's answer (progress events do not extend it).
+  answer_timeout_sec: 120
+  max_progress_events: 40
+  wait_until:
+  got_event:
+  progress:
+
+input:
+  agent_id:
+  message:
+  # Alias of `message`, kept from the old contract.
+  question:
+  session_id:
+  message_id:
+  # A UI reply to a pending action: {decision: approve|approve_session|reject|revise|reply,
+  # feedback?}.
+  # With an action the message may be empty (the router's pending_reply fast path).
+  action:
+
+output: '{{ cli_result }}'
+
+main:
+  tasks:
+
+    - task_name: build-ids
+      set:
+        - client_workflow_id: "{{ __sys_info__.get('workflow_id') }}"
+        - aid: "{{ str(agent_id or default_agent_id).strip() }}"
+        - text: "{{ str(message if message is not None else (question or '')) }}"
+        - throwaway#: "{{ not session_id }}"
+        - sid: "{{ str(session_id).strip() if session_id else 'cli-' + str(uuid4()).replace('-', '')[:12] }}"
+        - mid: "{{ str(message_id).strip() if message_id else 'm-' + str(uuid4()).replace('-', '')[:16] }}"
+        # Both ids go into a workflow id. Checked here, before anything is
+        # started -- session-store checks them again as the owner.
+        - problem#: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'session_id must match ' + session_id_pattern if not re.match(session_id_pattern, sid) else
+               'message_id must match ' + session_id_pattern if not re.match(session_id_pattern, mid) else
+               'message is empty' if not text.strip() and not isinstance(action, dict) else None }}
+        # The user id is part of the entity id, so two users can never
+        # address the same session workflow.
+        - session_workflow_id#: 'agent-session-{{ aid }}-{{ __user_info__.get("user_id") }}-{{ sid }}'
+
+    # `entity_workflow` is start-or-signal: it boots the entity if it is not
+    # running -- which is also how a retired or upgraded session comes back.
+    - task_name: send-message
+      skip_if: '{{ problem is not None }}'
+      emit_event:
+        target_workflow_id: "{{ session_workflow_id }}"
+        topic: agent-session
+        event_type: user_message
+        data:
+          message: "{{ text }}"
+          message_id: "{{ mid }}"
+          caller_workflow_id: "{{ client_workflow_id }}"
+          action: "{{ action if isinstance(action, dict) else None }}"
+          progress: true
+          sent_at: "{{ now().isoformat() }}"
+        entity_workflow:
+          ref: agent-harness-session/agent-session
+          mode: detached
+          input:
+            agent_id: "{{ aid }}"
+            session_id: "{{ sid }}"
+            throwaway: "{{ throwaway }}"
+
+    - task_name: start-wait
+      set:
+        - wait_until: "{{ (now() + dt.timedelta(seconds=answer_timeout_sec)).isoformat() }}"
+
+    # Progress events first, then the answer: at most max_progress_events + 1 waits.
+    - task_name: await-answer
+      skip_if: '{{ problem is not None }}'
+      loop:
+        in: "{{ list(range(max_progress_events + 1)) }}"
+        foreach: wait_no
+        do:
+          tasks:
+            - task_name: await-event
+              wait_for:
+                event:
+                  topic: agent-session
+                  event_type: agent_answer
+                  match_expression: "{{ (event.get('data') or {}).get('message_id') == mid }}"
+                timeout_sec: >-
+                  {{ max(1, int((dt.datetime.fromisoformat(wait_until) - now()).total_seconds())) }}
+              output:
+                set:
+                  - got_event: "{{ _ }}"
+            - task_name: log-progress
+              skip_if: "{{ not (isinstance(got_event, dict) and (got_event.get('data') or {}).get('kind') == 'progress') }}"
+              set:
+                - progress#: "{{ got_event['data'].get('progress') }}"
+            - task_name: read-event
+              set:
+                - _d: "{{ (got_event.get('data') or {}) if isinstance(got_event, dict) else {} }}"
+                - answer_event: "{{ got_event if _d and _d.get('kind') != 'progress' else answer_event }}"
+                - got_event:
+            - task_name: stop-waiting
+              raise:
+                if: >-
+                  {{ answer_event is not None
+                     or dt.datetime.fromisoformat(wait_until) <= now() }}
+                type: break
+
+    - task_name: format-result
+      set:
+        - _a: "{{ (answer_event.get('data') or {}) if isinstance(answer_event, dict) else {} }}"
+        - _timed_out: "{{ problem is None and not _a }}"
+        - cli_result:
+            answer: >-
+              {{ _a.get('answer', '') if _a else
+                 ('Invalid request: ' + problem) if problem else
+                 'No answer within 120s. The turn is still running; it will appear in the conversation.' }}
+            sources: "{{ _a.get('sources') or [] }}"
+            session_id: "{{ sid }}"
+            message_id: "{{ mid }}"
+            turn: "{{ _a.get('turn') }}"
+            workflow_id: "{{ client_workflow_id }}"
+            status: "{{ _a.get('status') or 'error' }}"
+            route: "{{ _a.get('route') }}"
+            # Additive: per-turn timings for the phase-0 measurement M4.
+            timing: "{{ _a.get('timing') }}"
+            # {id, kind, summary, offer_session_grant} while the turn waits for the user.
+            pending_action: "{{ _a.get('pending_action') }}"
+            clarify:
+            # {job_id, status} when the turn started a background job (§6.12); its result
+            # arrives later as a turn of its own (poll agent-admin get_session, F12).
+            job: "{{ _a.get('job') }}"
+            # {role, reason, secret_name, scope} when the turn failed because a model is
+            # not set up (F70); the answer then says what to set up.
+            setup: "{{ _a.get('setup') }}"
+            # Old-UI compatibility (plan-16 step 2), for one major version.
+            sources_urls: "{{ [s.get('url') for s in (_a.get('sources') or []) if isinstance(s, dict) and s.get('url')] }}"
+            question_count: "{{ _a.get('turn') }}"
+            # Only on the timeout path: which entity to look at.
+            session_workflow_id: "{{ session_workflow_id if _timed_out else None }}"

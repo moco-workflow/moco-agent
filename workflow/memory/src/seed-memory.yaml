@@ -1,0 +1,152 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# SEED-MEMORY — curated agent-scope memory from an agent package (§6.16, plan-17)
+# ================================================================================
+#
+#   in         out
+#   ────────── ──────────────────────────────────────────────────────────────
+#   agent_id   {ok, data: {source, items: [{key, action: unchanged|saved|failed, error}]}, error}
+#
+# An agent package that ships curated knowledge-of-the-house ("our clusters are in
+# eu-west", "deploys go through argo") ships it as DATA: a wfspec `memory.<agent_id>`
+# whose output is {items: [{kind, slug?, title, text, tags}]}. Each item is saved to
+# the AGENT scope, pinned, with evidence source `seed` -- the only way besides
+# promotion that the agent scope is written (§6.4.8). Idempotent: an existing active
+# item with the same title, text and tags is left alone, so a redeploy does not bump
+# mem-version (which would make every session refresh its snapshot).
+# Authority: memory-store checks access (agent scope → admin).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: seed-memory
+
+context:
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  cfg_result: {}
+  cat_agent: {}
+  seed: {}
+  item_results: []
+  stored_item: {}
+  saved_item: {}
+  ok: false
+  data:
+  error:
+
+input:
+  agent_id:
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+    - task_name: check-agent
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - valid: "{{ bool(re.match(agent_id_pattern, aid)) }}"
+        - seed_name: "memory.{{ aid }}"
+        - error: "{{ None if valid else {'code': 'invalid_input', 'message': 'agent_id must match ' + agent_id_pattern, 'retryable': False} }}"
+
+    - task_name: resolve-config
+      skip_if: "{{ not valid }}"
+      workflow:
+        ref: agent-harness-foundation/agent-config
+        mode: inline
+        input: {mode: resolve, agent_id: "{{ aid }}"}
+      output:
+        set:
+          - cfg_result: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: catalog-agent
+      skip_if: "{{ not valid or cfg_result.get('ok') != True }}"
+      workflow:
+        ref: agent-harness-foundation/package-catalog
+        mode: sync
+        input: {package_name: "agent-{{ aid }}"}
+        options:
+          retry_policy: {timeout_sec: 60, max_attempts: 1}
+      output:
+        set:
+          - cat_agent: "{{ _ or {} }}"
+
+    - task_name: plan-seed
+      set:
+        - access_lists: "{{ (((cfg_result.get('data') or {}).get('config')) or {}).get('access') or {} }}"
+        - has_seed#: "{{ valid and cfg_result.get('ok') == True and seed_name in (cat_agent.get('wfspecs') or []) }}"
+        - error: >-
+            {{ error if not valid else
+               {'code': 'config_failed', 'message': 'cannot resolve config for ' + aid, 'retryable': False}
+                 if cfg_result.get('ok') != True else None }}
+
+    - task_name: load-seed
+      skip_if: "{{ not has_seed }}"
+      workflow:
+        ref: "agent-{{ aid }}/{{ seed_name }}"
+        mode: inline
+      output:
+        set:
+          - seed: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: seed-each-item
+      skip_if: "{{ not has_seed or not (seed.get('items') or []) }}"
+      loop:
+        in: "{{ [i for i in (seed.get('items') or []) if isinstance(i, dict) and i.get('title')] }}"
+        foreach: seed_item
+        do:
+          tasks:
+            - task_name: plan-item
+              set:
+                - item_kind: "{{ re.sub(r'[^a-z0-9-]+', '-', str(seed_item.get('kind') or 'fact').lower()).strip('-')[:48] or 'fact' }}"
+                - item_slug: "{{ re.sub(r'[^a-z0-9-]+', '-', str(seed_item.get('slug') or seed_item['title']).lower()).strip('-')[:48] or 'item' }}"
+            - task_name: read-stored-item
+              workflow:
+                ref: memory-store
+                mode: inline
+                input: {mode: get, agent_id: "{{ aid }}", scope: agent, key: "mem:{{ item_kind }}:{{ item_slug }}"}
+              output:
+                set:
+                  - stored_item: "{{ ((_ or {}).get('data') or {}).get('item') or {} }}"
+            - task_name: save-item
+              skip_if: >-
+                {{ stored_item.get('status') == 'active' and stored_item.get('title') == seed_item.get('title')
+                   and stored_item.get('text') == seed_item.get('text')
+                   and sorted(stored_item.get('tags') or []) == sorted(str(t).lower() for t in (seed_item.get('tags') or [])) }}
+              workflow:
+                ref: memory-store
+                mode: inline
+                input:
+                  mode: save
+                  agent_id: "{{ aid }}"
+                  scope: agent
+                  definition_access: "{{ access_lists }}"
+                  item:
+                    kind: "{{ item_kind }}"
+                    slug: "{{ item_slug }}"
+                    title: "{{ seed_item['title'] }}"
+                    text: "{{ seed_item.get('text') or seed_item['title'] }}"
+                    tags: "{{ seed_item.get('tags') or [] }}"
+                    pinned: true
+                    status: active
+                    evidence: [{session_id: seed, turn: 0, source: seed, ts: "{{ now().isoformat() }}"}]
+              output:
+                set:
+                  - saved_item: "{{ _ or {} }}"
+            - task_name: record-item
+              set:
+                - item_results: >-
+                    {{ item_results + [{'key': 'mem:' + item_kind + ':' + item_slug,
+                                        'action': 'unchanged' if not saved_item else ('saved' if saved_item.get('ok') else 'failed'),
+                                        'error': saved_item.get('error') if saved_item and not saved_item.get('ok') else None}] }}
+                - saved_item: {}
+                - stored_item: {}
+
+    - task_name: shape-report
+      set:
+        - ok: "{{ error is None and all(r['action'] != 'failed' for r in item_results) }}"
+        - error: >-
+            {{ error if error is not None else
+               {'code': 'seed_failed', 'message': 'some memory items were not saved (see data)', 'retryable': False} if not ok else None }}
+        - data: "{{ None if not valid else {'source': ('agent-' + aid + '/' + seed_name) if has_seed else None, 'items': item_results} }}"

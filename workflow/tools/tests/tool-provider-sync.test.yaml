@@ -1,0 +1,44 @@
+test_type: integration-test
+
+# tool-provider-sync (plan-17 step 12): due = ready/failed providers past their
+# sync.every_hours, oldest first, bounded; a shared provider syncs through the first
+# agent, an agent-scope one through its own; drifted ones wait for an admin.
+# The agent list, config resolves, provider lists and syncs are mocked by task name.
+
+wfspec:
+  name: tool-provider-sync
+
+test_cases:
+  - id: due-providers-sync-through-the-right-agent
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: ops-assistant}, {agent_id: moco-assistant}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {}}}}}
+      - step_name: list-scope-providers
+        _: >-
+          {{ {'ok': True, 'data': {'providers': (
+                [{'name': 'atlassian', 'scope': 'shared', 'status': 'ready', 'sync': {'every_hours': 24}, 'snapshot': {'synced_at': '2026-01-01T00:00:00'}},
+                 {'name': 'fresh', 'scope': 'shared', 'status': 'ready', 'snapshot': {'synced_at': now().isoformat()}},
+                 {'name': 'drifty', 'scope': 'shared', 'status': 'drifted', 'snapshot': {'synced_at': '2026-01-01T00:00:00'}}]
+                if list_scope[1] == 'shared' else
+                [{'name': 'k8s', 'scope': 'agent', 'status': 'failed', 'updated_at': '2026-02-01T00:00:00'}] if list_scope[0] == 'ops-assistant' else [])}} }}
+      - step_name: sync-provider
+        _: "{{ {'ok': True, 'data': {'provider': {'status': 'ready'}, 'drift': None, 'aid': due_provider['_aid']}} }}"
+    expect:
+      output:
+        - ok: true
+        - data:
+            due: [shared/atlassian, agent/k8s]
+            synced: [{provider: shared/atlassian, status: ready, drift: null}, {provider: agent/k8s, status: ready, drift: null}]
+            errors: []
+
+  - id: a-failed-sync-is-an-error-entry
+    input: {}
+    mocks:
+      - {step_name: list-agents, _: {ok: true, data: {agents: [{agent_id: moco-assistant}]}}}
+      - {step_name: resolve-agent-config, _: {ok: true, data: {config: {access: {}}}}}
+      - {step_name: list-scope-providers, _: "{{ {'ok': True, 'data': {'providers': [{'name': 'atlassian', 'scope': 'shared', 'status': 'ready'}] if list_scope[1] == 'shared' else []}} }}"}
+      - {step_name: sync-provider, _: {ok: false, error: {code: list_failed, message: down}}}
+    expect:
+      assert:
+        - "{{ data['synced'] == [] and data['errors'] == [{'provider': 'shared/atlassian', 'error': {'code': 'list_failed', 'message': 'down'}}] }}"

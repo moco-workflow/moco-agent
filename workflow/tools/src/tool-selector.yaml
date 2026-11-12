@@ -1,0 +1,145 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# TOOL-SELECTOR — pick at most max_selected tools for one request (design §6.9.8)
+# ================================================================================
+#
+#   in                                              data out
+#   ─────────────────────────────────────────────── ────────────────────────────────
+#   rewritten_query, tags?, offerable, always_offer,  {selected: [name], openai_tools,
+#   max_selected, recent_tool_use?, has_artifact?,     decided_by, trace: {pinned,
+#   config, resolved_refs                              prefiltered, probabilities}}
+#
+# PURE (no storage). `offerable` is tool-policy resolve's output: manifests with
+# effective_permission, deprecated tools flagged.
+#
+#   1. pinned      always_offer tools that are offerable, plus read_artifact when the
+#                  turn has an artifact. They count towards max_selected.
+#   2. pre-filter  the rest, minus deprecated tools, ranked by how many words of the
+#                  request (+ tags) appear in the tool's name, description, tags and
+#                  example notes; +2 for a tool used successfully earlier in this
+#                  session; ties in name order. Top `prefilter_keep` (10, §7.3).
+#   3. decide      qset.tools, ONLY when the pre-filter left more than the free slots.
+#                  Keep P ≥ decisions.tools.select_min_p, highest first, up to the slots.
+#   4. none above the threshold → the top `fallback_keep` (2) by pre-filter rank, so
+#                  the loop can still try. The classifier down (decide ok: false, it
+#                  runs with fallback: none) → the top slots by pre-filter rank:
+#                  selection never fails a turn.
+#   5. openai_tools from the selected manifests: name, description (+ the first
+#                  example's args), parameters.
+#
+#   decided_by: none (nothing offerable) | prefilter (fit without asking) |
+#               system_one | threshold_fallback | classifier_down
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: tool-selector
+
+context:
+  prefilter_keep: 10
+  fallback_keep: 2
+  recent_boost: 2
+  default_select_min_p: 0.5
+  decision: {}
+  ok: true
+  error:
+
+input:
+  agent_id:
+  config: {}
+  resolved_refs: {}
+  rewritten_query: ""
+  tags: []
+  offerable: []
+  always_offer: []
+  max_selected: 6
+  recent_tool_use: []
+  has_artifact: false
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: prefilter-tools
+      set:
+        - _offer: "{{ [t for t in (offerable or []) if isinstance(t, dict) and t.get('name')] }}"
+        - _names: "{{ [t['name'] for t in _offer] }}"
+        - max_n: "{{ max(0, int(max_selected or 0)) }}"
+        - pinned#: >-
+            {{ [n for n in _names
+                if n in (always_offer or []) or (has_artifact and n == 'read_artifact')][:max_n] }}
+        - _words: >-
+            {{ set(re.findall(r'[a-z0-9]+', (str(rewritten_query or '') + ' ' + ' '.join(str(g) for g in (tags or []))).lower())) }}
+        - _score: >-
+            {{ {t['name']: len(_words & set(re.findall(r'[a-z0-9]+',
+                   (str(t['name']).replace('_', ' ') + ' ' + str(t.get('description') or '') + ' '
+                    + ' '.join(str(g) for g in (t.get('tags') or [])) + ' '
+                    + ' '.join(str((e or {}).get('note') or '') for e in (t.get('examples') or []))).lower())))
+                 + (recent_boost if t['name'] in (recent_tool_use or []) else 0)
+                for t in _offer} }}
+        - prefiltered#: >-
+            {{ sorted([t['name'] for t in _offer if t['name'] not in pinned and not t.get('deprecated')],
+                      key=lambda n: (-_score[n], n))[:prefilter_keep] }}
+        - slots: "{{ max(0, max_n - len(pinned)) }}"
+        - ask: "{{ len(prefiltered) > slots and slots > 0 }}"
+        - by_name: "{{ {t['name']: t for t in _offer} }}"
+
+    - task_name: decide-tools
+      skip_if: "{{ not ask }}"
+      workflow:
+        ref: agent-harness-foundation/decide
+        mode: inline
+        input:
+          mode: decide
+          agent_id: "{{ agent_id }}"
+          qset: tools
+          resolved_refs: "{{ resolved_refs }}"
+          models: "{{ (config or {}).get('models') or {} }}"
+          fallback: none
+          variables:
+            request: "{{ str(rewritten_query or '') }}"
+            tools: >-
+              {{ [{'name': n, 'description': by_name[n].get('description'),
+                   'example': ((by_name[n].get('examples') or [{}])[0] or {}).get('note')}
+                  for n in prefiltered] }}
+      output:
+        set:
+          - decision: "{{ _ or {} }}"
+
+    - task_name: select-tools
+      set:
+        - _min_p: >-
+            {{ ((((config or {}).get('decisions') or {}).get('tools') or {}).get('select_min_p'))
+               if ((((config or {}).get('decisions') or {}).get('tools') or {}).get('select_min_p')) is not None
+               else default_select_min_p }}
+        - _decided: "{{ ask and decision.get('ok') == True }}"
+        - _probs: "{{ ((decision.get('data') or {}).get('nouls') or {}) if _decided else {} }}"
+        - _above: >-
+            {{ sorted([n for n in prefiltered if _probs.get(n) is not None and _probs[n] >= _min_p],
+                      key=lambda n: (-_probs[n], prefiltered.index(n))) }}
+        - decided_by#: >-
+            {{ 'none' if not by_name else
+               'prefilter' if not ask else
+               'classifier_down' if not _decided else
+               'system_one' if _above else 'threshold_fallback' }}
+        - _picked: >-
+            {{ prefiltered[:slots] if decided_by in ['prefilter', 'classifier_down'] else
+               _above[:slots] if decided_by == 'system_one' else
+               prefiltered[:min(fallback_keep, slots)] if decided_by == 'threshold_fallback' else [] }}
+        - selected: "{{ pinned + _picked }}"
+        - openai_tools: >-
+            {{ [{'type': 'function',
+                 'function': {'name': n,
+                              'description': str(by_name[n].get('description') or by_name[n].get('title') or n).strip()
+                                             + ((' Example arguments: ' + json.dumps(((by_name[n].get('examples') or [{}])[0] or {}).get('args'), sort_keys=True))
+                                                if ((by_name[n].get('examples') or [{}])[0] or {}).get('args') else ''),
+                              'parameters': by_name[n].get('parameters') or {'type': 'object', 'properties': {}}}}
+                for n in selected] }}
+        - data: >-
+            {{ {'selected': selected, 'openai_tools': openai_tools, 'decided_by': decided_by,
+                'trace': {'pinned': pinned, 'prefiltered': prefiltered,
+                          'probabilities': {n: _probs.get(n) for n in prefiltered if n in _probs}}} }}

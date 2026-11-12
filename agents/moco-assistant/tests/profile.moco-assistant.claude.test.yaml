@@ -1,0 +1,14 @@
+test_type: integration-test
+
+# The claude profile: kind wfspec over subagent.claude, gated on the agent worker.
+
+wfspec:
+  name: profile.moco-assistant.claude
+
+test_cases:
+  - id: a-wfspec-profile-on-the-agent-worker
+    input: {}
+    expect:
+      assert:
+        - "{{ profile['kind'] == 'wfspec' and profile['wfspec'] == {'name': 'subagent.claude'} }}"
+        - "{{ profile['requires']['worker'] == 'agent' and profile['estimated_sec'] < profile['budget_sec'] }}"

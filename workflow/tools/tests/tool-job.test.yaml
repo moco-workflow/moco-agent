@@ -1,0 +1,60 @@
+test_type: integration-test
+
+# tool-job (plan-10 step 14): the job body of an async tool runs tool-executor with
+# run_now and the approval it was given, and maps the call's result onto the profile
+# contract. tool-executor is mocked by task name; the mock checks what it was given.
+
+wfspec:
+  name: tool-job
+
+test_cases:
+  - id: an-ok-call-becomes-the-answer
+    input:
+      agent_id: ops
+      session_id: s1
+      job_id: job-1
+      budget_sec: 900
+      job_input: {call: {id: c1, name: pod_report, arguments: {namespace: staging}}, manifest: {name: pod_report, title: Pod report}, question: "report", turn: 4, approval_token: null, approved_pending_id: null}
+    mocks:
+      - step_name: run-tool
+        _: >-
+          {{ {'ok': True, 'data': {'status': 'ok', 'content': '3 pods, all running', 'sources': [{'title': 'pods'}],
+                                   'artifact_ref': None, 'audit': {'tool': 'pod_report', 'status': 'ok'}}}
+             if tool_turn == 4 and tool_call['name'] == 'pod_report' else 1 / 0 }}
+    expect:
+      assert:
+        - "{{ status == 'ok' and answer == '**Pod report** finished in the background:' + chr(10) * 2 + '3 pods, all running' and sources == [{'title': 'pods'}] }}"
+        - "{{ trace['tool_audit'] == [{'tool': 'pod_report', 'status': 'ok'}] and trace['error'] is None }}"
+
+  - id: a-stored-artifact-is-mentioned
+    input:
+      agent_id: ops
+      session_id: s1
+      job_input: {call: {id: c1, name: pod_report, arguments: {}}, manifest: {name: pod_report}, turn: 4}
+    mocks:
+      - {step_name: run-tool, _: {ok: true, data: {status: ok, content: "first part", sources: [], artifact_ref: art_0123456789ab, audit: {status: ok}}}}
+    expect:
+      assert:
+        - "{{ status == 'ok' and answer.endswith('_The full result was longer; it is stored as art_0123456789ab._') }}"
+
+  - id: a-failed-call-is-a-failed-job-with-the-calls-code
+    input:
+      agent_id: ops
+      session_id: s1
+      job_input: {call: {id: c1, name: pod_report, arguments: {}}, manifest: {name: pod_report, title: Pod report}, turn: 4}
+    mocks:
+      - {step_name: run-tool, _: {ok: true, data: {status: error, content: "error: timeout: k8s did not answer", audit: {status: error, error: {code: timeout, message: "k8s did not answer"}}}}}
+    expect:
+      assert:
+        - "{{ status == 'error' and answer == '' and trace['error'] == {'code': 'timeout', 'message': 'Pod report: k8s did not answer'} }}"
+
+  - id: a-call-that-needs-approval-again-fails
+    input:
+      agent_id: ops
+      session_id: s1
+      job_input: {call: {id: c1, name: k8s_scale, arguments: {}}, manifest: {name: k8s_scale}, turn: 4}
+    mocks:
+      - {step_name: run-tool, _: {ok: true, data: {status: needs_approval, content: "", pending: {kind: tool_call}, audit: {status: needs_approval}}}}
+    expect:
+      assert:
+        - "{{ status == 'error' and trace['error']['code'] == 'needs_approval' }}"

@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# AGENT-SKELETON — the package's main wfspec (moco publish requires one named
+# after the package). Describes the package; the definition itself is
+# agent.skeleton, which the harness loads as `agent-skeleton/agent.skeleton`.
+# ================================================================================
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-skeleton
+
+context:
+  info:
+    agent_id: skeleton
+    definition: agent-skeleton/agent.skeleton
+    chat: "moco run agent-harness/agent-cli -i '{\"agent_id\": \"skeleton\", \"message\": \"hi\"}'"
+
+output: '{{ info }}'
+
+main:
+  task_name: describe
+  set:
+    - _described: true

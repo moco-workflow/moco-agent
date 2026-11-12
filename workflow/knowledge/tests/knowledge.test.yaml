@@ -1,0 +1,329 @@
+test_type: integration-test
+
+# knowledge catalog / retrieve (plan-06 steps 3-5), management (step 6) and refresh
+# (phase 3). The registry list (`list-sources`)
+# and each source query (`query-source`) are mocked by task name. A mock answers every
+# source alike, so the interleave case tells sources apart by the `source` stamp.
+
+wfspec:
+  name: knowledge
+
+test_data:
+  config: &config
+    knowledge: {sources: [moco-docs, k8s-runbooks], allow_user_sources: false, top_k_per_source: 4, max_chunks: 4, pgvector_secret_key: ""}
+  config_user: &config_user
+    knowledge: {sources: [moco-docs], allow_user_sources: true, top_k_per_source: 4, max_chunks: 8, pgvector_secret_key: ""}
+  rows: &rows
+    ok: true
+    data:
+      sources:
+        - {name: moco-docs, scope: shared, status: ready, kind: pgvector, description: "Moco docs", keywords: [workflow], table_name: kb_moco_docs, embed_model_info: {}}
+        - {name: k8s-runbooks, scope: shared, status: ready, kind: pgvector, description: "K8s", keywords: [pod], table_name: kb_k8s_runbooks, embed_model_info: {}}
+        - {name: hr-policies, scope: shared, status: ready, kind: pgvector, description: "HR", keywords: [], table_name: kb_hr_policies, embed_model_info: {}}
+        - {name: my-notes, scope: private, status: ready, kind: pgvector, description: "mine", keywords: [], table_name: kb_u_1_my_notes, embed_model_info: {}}
+        - {name: moco-docs, scope: private, status: ready, kind: pgvector, description: "my copy", keywords: [], table_name: kb_u_1_moco_docs, embed_model_info: {}}
+  ready_row: &ready_row
+    ok: true
+    data: {source: {name: moco-docs, scope: shared, status: ready, kind: pgvector, table_name: kb_moco_docs, refresh: {sources: [{kind: site, url: "http://x"}], every_hours: 24}}}
+  passages: &passages
+    passages:
+      - {text: "first", title: t1, url: "http://a/1", score: 0.9}
+      - {text: "second", title: t2, url: "http://a/2", score: 0.8}
+      - {text: "third", title: t3, url: "http://a/3", score: 0.7}
+
+test_cases:
+
+  # ── catalog ─────────────────────────────────────────────────────────────
+  - id: the-catalog-shows-only-allowed-shared-sources-without-internals
+    input: {mode: catalog, config: *config}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ [s['name'] for s in data['sources']] == ['k8s-runbooks', 'moco-docs'] }}"
+        - "{{ sorted(data['sources'][0]) == ['description', 'keywords', 'kind', 'name', 'scope', 'status'] }}"
+
+  - id: private-sources-only-with-allow-user-sources-and-shared-wins-a-name
+    input: {mode: catalog, config: *config_user}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+    expect:
+      assert:
+        - "{{ [(s['name'], s['scope']) for s in data['sources']] == [('moco-docs', 'shared'), ('my-notes', 'private')] }}"
+
+  - id: an-agent-with-no-sources-reads-nothing
+    input: {mode: catalog, config: {knowledge: {sources: [], allow_user_sources: false}}}
+    mocks:
+      - {step_name: list-sources, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - data: {sources: []}
+
+  # ── retrieve ────────────────────────────────────────────────────────────
+  - id: retrieve-interleaves-sources-round-robin-numbers-and-clamps
+    input: {mode: retrieve, config: *config, sources: [moco-docs, k8s-runbooks, zzz], query: "how do retries work?", budget_sec: 30}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+      - {step_name: query-source, _: *passages}
+    expect:
+      assert:
+        - "{{ [(p['n'], p['source'], p['text']) for p in data['passages']] == [(1, 'moco-docs', 'first'), (2, 'k8s-runbooks', 'first'), (3, 'moco-docs', 'second'), (4, 'k8s-runbooks', 'second')] }}"
+        - "{{ data['searched'] == ['moco-docs', 'k8s-runbooks'] and data['dropped'] == ['zzz'] }}"
+        - "{{ data['failed'] == [] and data['empty'] == False }}"
+        - "{{ data['passages'][0]['url'] == 'http://a/1' and data['passages'][0]['score'] == 0.9 }}"
+
+  # A mock cannot raise; a list where the output expects a dict makes the task fail,
+  # which drives the real on_error path.
+  - id: a-failing-source-is-reported-and-does-not-fail-retrieve
+    input: {mode: retrieve, config: *config, sources: [moco-docs], query: "q", budget_sec: 30}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+      - {step_name: query-source, _: [1]}
+    expect:
+      assert:
+        - "{{ ok == True and data['passages'] == [] and data['failed'] == ['moco-docs'] and data['empty'] == True }}"
+
+  - id: a-source-outside-the-catalog-is-dropped-not-queried
+    input: {mode: retrieve, config: *config, sources: [hr-policies], query: "q"}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+      - {step_name: query-source, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['dropped'] == ['hr-policies'] and data['searched'] == [] and data['empty'] == True }}"
+
+  - id: an-empty-query-retrieves-nothing
+    input: {mode: retrieve, config: *config, sources: [moco-docs], query: "  "}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+      - {step_name: query-source, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ data['empty'] == True and data['passages'] == [] }}"
+
+  - id: an-unresolved-config-raises
+    input: {mode: retrieve, config: {knowledge: {sources: [moco-docs]}}, sources: [moco-docs], query: "q"}
+    mocks:
+      - {step_name: list-sources, _: *rows}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  # ── register / reindex / delete (plan-06 step 6) ────────────────────────
+  - id: register-records-indexing-and-starts-the-indexer-detached
+    input: {mode: register, config: {knowledge: {pgvector_secret_key: ""}, models: {embedding: {model_name: nomic-embed-text, embed_dim: 768}}, access: {}}, name: moco-docs, scope: shared, index_sources: [{kind: site, url: "http://x/docs"}]}
+    mocks:
+      - {step_name: register-row, _: {ok: true, data: {source: {name: moco-docs, status: indexing}}, error: null}}
+      - {step_name: start-indexer-for-register, _: "wf-indexer-1"}
+    expect:
+      output:
+        - ok: true
+        - data: {source: {name: moco-docs, status: indexing}, indexer: wf-indexer-1}
+
+  - id: register-without-an-embedding-model-is-invalid-input
+    input: {mode: register, config: {knowledge: {}, models: {}}, name: moco-docs}
+    mocks:
+      - {step_name: register-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: a-refused-register-starts-no-indexer
+    input: {mode: register, config: {knowledge: {}, models: {embedding: {model_name: m, embed_dim: 8}}}, name: moco-docs}
+    mocks:
+      - {step_name: register-row, _: {ok: false, data: null, error: {code: forbidden, message: "no", retryable: false}}}
+      - {step_name: start-indexer-for-register, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - error: {code: forbidden, message: "no", retryable: false}
+
+  - id: reindex-uses-the-sources-stored-on-the-row
+    input: {mode: reindex, config: {knowledge: {pgvector_secret_key: K}}, name: moco-docs}
+    mocks:
+      - {step_name: reindex-transition, _: {ok: true, data: {source: {name: moco-docs, status: indexing, refresh: {sources: [{kind: site, url: "http://x"}]}}}}}
+      - {step_name: start-indexer-for-reindex, _: "wf-indexer-2"}
+    expect:
+      assert:
+        - "{{ ok == True and data['indexer'] == 'wf-indexer-2' }}"
+
+  - id: delete-marks-deleting-drops-the-table-and-removes-the-row
+    input: {mode: delete, config: {knowledge: {pgvector_secret_key: K}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-delete, _: {ok: true, data: {source: {name: moco-docs, status: ready, table_name: kb_moco_docs}}, error: null}}
+      - {step_name: mark-deleting, _: {ok: true, data: {source: {status: deleting}}, error: null}}
+      - {step_name: drop-table, _: {table_name: kb_moco_docs, dropped: true}}
+      - {step_name: mark-removed, _: {ok: true, data: {source: null}, error: null}}
+    expect:
+      output:
+        - ok: true
+        - data: {removed: moco-docs}
+
+  - id: a-failed-drop-leaves-the-row-deleting
+    input: {mode: delete, config: {knowledge: {pgvector_secret_key: K}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-delete, _: {ok: true, data: {source: {name: moco-docs, status: deleting, table_name: kb_moco_docs}}, error: null}}
+      - {step_name: mark-deleting, _: "{{ 1 / 0 }}"}
+      - {step_name: drop-table, _: "{{ 1 / 0 }}"}
+      - {step_name: mark-removed, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'drop_failed' }}"
+
+  - id: a-table-name-outside-the-pattern-is-never-dropped
+    input: {mode: delete, config: {knowledge: {pgvector_secret_key: K}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-delete, _: {ok: true, data: {source: {name: moco-docs, status: deleting, table_name: "users; --"}}, error: null}}
+      - {step_name: drop-table, _: "{{ 1 / 0 }}"}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "knowledge: refusing to drop table 'users; --' (not a source table name)"
+
+  - id: deleting-an-unknown-source-is-not-found
+    input: {mode: delete, config: {knowledge: {}}, name: nope}
+    mocks:
+      - {step_name: read-for-delete, _: {ok: false, data: null, error: {code: not_found, message: "no shared source nope", retryable: false}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  # ── kind: wfspec sources (phase 2, plan-06 step 7) ───────────────────────
+  - id: a-wfspec-source-is-probed-and-goes-straight-to-ready
+    input: {mode: register, agent_id: moco, config: {access: {}, knowledge: {}}, name: jira-kb, scope: shared, kind: wfspec, wfspec_name: source.jira-kb, source_config: {project: MOCO}, description: "Jira tickets"}
+    mocks:
+      - {step_name: register-wfspec-row, _: {ok: true, data: {source: {name: jira-kb, status: indexing}}}}
+      - {step_name: probe-retriever, _: {passages: [{text: "MOCO-1", title: "MOCO-1"}]}}
+      - {step_name: settle-wfspec-source, _: "{{ {'ok': True, 'data': {'source': {'name': 'jira-kb', 'status': 'ready'}}} }}"}
+      - {step_name: register-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['status'] == 'ready' and data['probe_error'] is None }}"
+
+  - id: a-failing-probe-leaves-the-source-failed
+    input: {mode: register, agent_id: moco, config: {access: {}, knowledge: {}}, name: jira-kb, scope: shared, kind: wfspec, wfspec_name: source.jira-kb}
+    mocks:
+      - {step_name: register-wfspec-row, _: {ok: true, data: {source: {name: jira-kb}}}}
+      - {step_name: probe-retriever, _: {passages: [], error: {code: auth, message: "token expired"}}}
+      - {step_name: settle-wfspec-source, _: {ok: true, data: {source: {name: jira-kb, status: failed}}}}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['status'] == 'failed' and data['probe_error'] == 'token expired' }}"
+
+  # ── refresh / set_refresh (phase 3): the source keeps serving ───────────
+  - id: refresh-marks-the-shadow-table-and-starts-the-indexer
+    input: {mode: refresh, config: {knowledge: {pgvector_secret_key: K}, access: {}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-refresh, _: *ready_row}
+      - step_name: patch-for-refresh
+        _: "{{ {'ok': True, 'data': {'source': dict(ref_row, refreshing=ref_patch['refreshing'])}} }}"
+      - {step_name: start-indexer-for-refresh, _: "wf-refresh-1"}
+    expect:
+      output:
+        - ok: true
+      assert:
+        - "{{ data['table_name'] == 'kbr_moco_docs' and data['indexer'] == 'wf-refresh-1' }}"
+        - "{{ data['source']['status'] == 'ready' and data['source']['refreshing']['table_name'] == 'kbr_moco_docs' }}"
+
+  - id: the-next-refresh-goes-back-to-the-kb-table
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-refresh, _: {ok: true, data: {source: {name: moco-docs, status: ready, kind: pgvector, table_name: kbr_moco_docs, refresh: {sources: [{kind: site}]}}}}}
+      - {step_name: patch-for-refresh, _: {ok: true, data: {source: {name: moco-docs}}}}
+      - {step_name: start-indexer-for-refresh, _: "wf-refresh-2"}
+    expect:
+      assert:
+        - "{{ data['table_name'] == 'kb_moco_docs' }}"
+
+  - id: a-refresh-in-flight-is-not-started-twice
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: moco-docs}
+    mocks:
+      - step_name: read-for-refresh
+        _: "{{ {'ok': True, 'data': {'source': {'name': 'moco-docs', 'status': 'ready', 'kind': 'pgvector', 'table_name': 'kb_moco_docs', 'refresh': {'sources': [{'kind': 'site'}]}, 'refreshing': {'table_name': 'kbr_moco_docs', 'started_at': (now() - dt.timedelta(minutes=10)).isoformat()}}}} }}"
+      - {step_name: patch-for-refresh, _: "{{ 1 / 0 }}"}
+      - {step_name: start-indexer-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' and 'already refreshing' in error['message'] }}"
+
+  - id: a-stale-refresh-is-taken-as-dead
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: moco-docs}
+    mocks:
+      - step_name: read-for-refresh
+        _: "{{ {'ok': True, 'data': {'source': {'name': 'moco-docs', 'status': 'ready', 'kind': 'pgvector', 'table_name': 'kb_moco_docs', 'refresh': {'sources': [{'kind': 'site'}]}, 'refreshing': {'table_name': 'kbr_moco_docs', 'started_at': (now() - dt.timedelta(hours=3)).isoformat()}}}} }}"
+      - {step_name: patch-for-refresh, _: {ok: true, data: {source: {name: moco-docs}}}}
+      - {step_name: start-indexer-for-refresh, _: "wf-refresh-3"}
+    expect:
+      assert:
+        - "{{ ok == True and data['indexer'] == 'wf-refresh-3' }}"
+
+  - id: a-source-that-is-not-ready-must-be-reindexed
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-refresh, _: {ok: true, data: {source: {name: moco-docs, status: failed, kind: pgvector, table_name: kb_moco_docs, refresh: {sources: [{kind: site}]}}}}}
+      - {step_name: patch-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_state' and 'reindex' in error['message'] }}"
+
+  - id: a-wfspec-source-or-one-without-sources-cannot-be-refreshed
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: jira}
+    mocks:
+      - {step_name: read-for-refresh, _: {ok: true, data: {source: {name: jira, status: ready, kind: wfspec}}}}
+      - {step_name: patch-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+
+  - id: a-refused-patch-starts-no-indexer
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: moco-docs}
+    mocks:
+      - {step_name: read-for-refresh, _: *ready_row}
+      - {step_name: patch-for-refresh, _: {ok: false, data: null, error: {code: forbidden, message: "no", retryable: false}}}
+      - {step_name: start-indexer-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: false
+        - error: {code: forbidden, message: "no", retryable: false}
+
+  - id: an-unknown-source-is-not-found
+    input: {mode: refresh, config: {knowledge: {}, access: {}}, name: nope}
+    mocks:
+      - {step_name: read-for-refresh, _: {ok: false, data: null, error: {code: not_found, message: "no shared source nope", retryable: false}}}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  - id: set-refresh-keeps-the-sources-and-sets-the-interval
+    input: {mode: set_refresh, config: {knowledge: {}, access: {}}, name: moco-docs, every_hours: 6}
+    mocks:
+      - {step_name: read-for-refresh, _: *ready_row}
+      - step_name: patch-for-refresh
+        _: "{{ {'ok': True, 'data': {'source': dict(ref_row, **ref_patch)}} }}"
+      - {step_name: start-indexer-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['source']['refresh'] == {'sources': [{'kind': 'site', 'url': 'http://x'}], 'every_hours': 6} }}"
+
+  - id: set-refresh-zero-turns-it-off
+    input: {mode: set_refresh, config: {knowledge: {}, access: {}}, name: moco-docs, every_hours: 0}
+    mocks:
+      - {step_name: read-for-refresh, _: *ready_row}
+      - step_name: patch-for-refresh
+        _: "{{ {'ok': True, 'data': {'source': dict(ref_row, **ref_patch)}} }}"
+    expect:
+      assert:
+        - "{{ data['source']['refresh'] == {'sources': [{'kind': 'site', 'url': 'http://x'}]} }}"
+
+  - id: set-refresh-rejects-a-bad-interval
+    input: {mode: set_refresh, config: {knowledge: {}, access: {}}, name: moco-docs, every_hours: "daily"}
+    mocks:
+      - {step_name: read-for-refresh, _: *ready_row}
+      - {step_name: patch-for-refresh, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'invalid_input' }}"
+

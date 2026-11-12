@@ -1,0 +1,59 @@
+test_type: integration-test
+
+# conformance-kit (plan-03 step 9): each kind's contract check, a run that raises,
+# and a non-conforming output. The extension run is mocked by task name.
+
+wfspec:
+  name: conformance-kit
+
+test_cases:
+  - id: a-conforming-profile
+    input: {kind: profile, wfspec: subagent.kit}
+    mocks:
+      - {step_name: run-extension, _: {status: ok, answer: "A", sources: [{title: t, url: u}], grounded: true, usage: {}, pending_action: null, handoff: null}}
+    expect:
+      output:
+        - conforms: true
+        - problems: []
+
+  - id: a-profile-that-asks-for-approval-without-a-pending-action
+    input: {kind: profile, wfspec: subagent.kit}
+    mocks:
+      - {step_name: run-extension, _: {status: needs_approval, answer: "", sources: [], grounded: false, usage: {}}}
+    expect:
+      output:
+        - conforms: false
+        - problems: ["needs_approval needs pending_action {kind, summary}"]
+
+  - id: a-source-retriever
+    input: {kind: source, wfspec: source.kit}
+    mocks:
+      - {step_name: run-extension, _: {passages: [{text: "x", title: "t"}], error: null}}
+    expect:
+      output:
+        - conforms: true
+
+  - id: a-hook-with-a-bad-action
+    input: {kind: hook, wfspec: hook.kit}
+    mocks:
+      - {step_name: run-extension, _: {action: rewrite}}
+    expect:
+      output:
+        - conforms: false
+        - problems: ["action must be continue, patch or block"]
+
+  - id: a-router-and-a-provider
+    input: {kind: router, wfspec: router.kit}
+    mocks:
+      - {step_name: run-extension, _: {route: rag, sources: [moco-docs], tags: [], decided_by: kit}}
+    expect:
+      output:
+        - conforms: true
+
+  - id: a-run-that-raises-does-not-conform
+    input: {kind: provider, wfspec: context.kit}
+    mocks:
+      - {step_name: run-extension, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ conforms == False and problems[0].startswith('the run failed:') }}"

@@ -1,0 +1,108 @@
+test_type: unit-test
+
+# job-entity (plan-13): the state machine cannot be driven by events in a test, so
+# its decisions live in named steps and are tested here:
+#   decide-start   only a queued row starts; a queued row without config fails
+#   classify-run   the job wfspec's result → completed / awaiting_input / failed,
+#                  the pending action's expiry, the error carried to the row
+#   note-run-end   why the entity stopped (a refused report stops it)
+
+wfspec:
+  name: job-entity
+
+test_groups:
+
+  - step_name: decide-start
+    test_cases:
+      - id: a-queued-row-starts
+        input: {row: {status: queued}, cfg_ok: true}
+        expect:
+          assert:
+            - "{{ start_ok == True and start_to == 'running' and stop_reason == '' }}"
+
+      - id: a-queued-row-without-config-fails
+        input: {row: {status: queued}, cfg_ok: false}
+        expect:
+          assert:
+            - "{{ start_ok == False and start_to == 'failed' and stop_reason == 'config_unresolvable' }}"
+
+      - id: a-duplicate-start-does-nothing
+        input: {row: {status: running}, cfg_ok: true}
+        expect:
+          assert:
+            - "{{ start_ok == False and start_to is None and stop_reason == 'not_queued:running' }}"
+
+      - id: a-job-cancelled-before-its-entity-ran-does-nothing
+        input: {row: {status: cancelled}, cfg_ok: true}
+        expect:
+          assert:
+            - "{{ start_ok == False and start_to is None }}"
+
+  - step_name: classify-run
+    test_cases:
+      - id: ok-completes
+        input: {run_result: {status: ok, answer: "Built."}, config: {}}
+        expect:
+          assert:
+            - "{{ outcome == 'completed' and pending_action is None and run_error is None and expires_at == '' }}"
+
+      - id: declined-completes-too
+        input: {run_result: {status: declined, answer: "Cannot build that."}, config: {}}
+        expect:
+          assert:
+            - "{{ outcome == 'completed' }}"
+
+      - id: needs-approval-awaits-with-an-expiry
+        input:
+          run_result: {status: needs_approval, pending_action: {kind: plan_review, summary: "plan", expires_in_sec: 600}}
+          config: {hitl: {approval_timeout_sec: 86400}}
+        expect:
+          assert:
+            - "{{ outcome == 'awaiting_input' and pending_action['kind'] == 'plan_review' }}"
+            - "{{ 590 < (dt.datetime.fromisoformat(expires_at).replace(tzinfo=None) - now().replace(tzinfo=None)).total_seconds() <= 600 }}"
+
+      - id: the-expiry-defaults-to-the-approval-timeout
+        input:
+          run_result: {status: needs_approval, pending_action: {kind: plan_review, summary: "plan"}}
+          config: {hitl: {approval_timeout_sec: 3600}}
+        expect:
+          assert:
+            - "{{ 3590 < (dt.datetime.fromisoformat(expires_at).replace(tzinfo=None) - now().replace(tzinfo=None)).total_seconds() <= 3600 }}"
+
+      - id: needs-approval-without-an-action-fails
+        input: {run_result: {status: needs_approval}, config: {}}
+        expect:
+          assert:
+            - "{{ outcome == 'failed' and run_error == {'code': 'job_failed', 'message': 'the job ended with status needs_approval'} }}"
+
+      - id: an-error-carries-its-cause
+        input: {run_result: {status: error, error: {code: job_failed, message: "the model is down"}}, config: {}}
+        expect:
+          assert:
+            - "{{ outcome == 'failed' and run_error['message'] == 'the model is down' }}"
+
+      - id: a-profile-style-error-in-the-trace-is-used
+        input: {run_result: {status: error, trace: {error: {code: profile_failed, message: "timeout"}}}, config: {}}
+        expect:
+          assert:
+            - "{{ run_error == {'code': 'profile_failed', 'message': 'timeout'} }}"
+
+  - step_name: note-run-end
+    test_cases:
+      - id: an-accepted-wait-keeps-running
+        input: {outcome: awaiting_input, report_ok: true, report_result: {}, stop_reason: ""}
+        expect:
+          assert:
+            - "{{ stop_reason == '' }}"
+
+      - id: a-refused-report-stops-the-entity
+        input: {outcome: completed, report_ok: false, report_result: {error: {code: invalid_state}}, stop_reason: ""}
+        expect:
+          assert:
+            - "{{ stop_reason == 'report_refused:invalid_state' }}"
+
+      - id: a-finished-job-says-how
+        input: {outcome: failed, report_ok: true, report_result: {}, stop_reason: ""}
+        expect:
+          assert:
+            - "{{ stop_reason == 'failed' }}"

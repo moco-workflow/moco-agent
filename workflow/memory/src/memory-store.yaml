@@ -1,0 +1,640 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# MEMORY-STORE — long-term memory items, tombstones and mem-version (design §6.4.3)
+# ================================================================================
+#
+#   mode                  in                                        data out
+#   ───────────────────── ───────────────────────────────────────── ─────────────────────
+#   get                   scope, key                                {item}
+#   list                  scope, kinds?, status?, limit? (per kind) {items: [row]}
+#   save                  scope, item {kind, slug?, title, text,    {item, created, evicted}
+#                         tags, pinned, evidence, sources, status,
+#                         conflicts_with}
+#   add_evidence          scope, key, evidence: [{session_id, ...}] {item}
+#   touch                 keys (user scope)                         {touched: [key]}
+#   retire                scope, key, reason?                       {item}
+#   resolve_conflict      scope, key, to: active|retired            {item}
+#   feedback              scope, key, delta (negative events, ≥ 1)  {item}
+#   tombstone             statement                                 {hash}
+#   list_tombstones       —                                         {hashes: [hex]}
+#   agent_scope_snapshot  —                                         {version, items}
+#   enforce_caps          scope                                     {evicted: [key], decayed: [key]}
+#   list_pool             limit? (newest first)                     {items: [pool row]}
+#   every mode            agent_id, definition_access (for writes),
+#                         promotion_pool? (writes: the agent's memory.long_term.promotion)
+#
+# ONE OWNER (§4.3): only this wfspec reads or writes these keys, topic `memory`:
+#   user scope   <uid>:agent.<id>   (in_global_ns false)  mem:<kind>:<slug>, mem-tombstone:<hash>
+#   agent scope  agent.<id>         (global)              mem:<kind>:<slug>, mem-version
+#   pool         agent.<id>.memory-pool (global)        pool:<uid>:<mem key>  (topic memory-pool)
+# agent-config's `config` row shares those namespaces under another key and topic.
+#
+# ROW  {schema_version: 1, key, kind, slug, scope, title (≤120), text (≤600; episode
+#       ≤1500), tags (≤8, lowercase), pinned, evidence (≤10, oldest dropped,
+#       one per session+turn), sources, status, conflicts_with, supersedes,
+#       negative_feedback, created_at, updated_at, last_used_at}
+# kind and slug reach a key, so both are sanitised to ^[a-z0-9-]{1,48}$ (a slug from
+# the title when none is given). Reads accept schema_version 0 and 1.
+#
+# LIFECYCLE (row state machine; anything else is ok: false, invalid_state):
+#   save (new) ─▶ active | conflicted     active ⇄ conflicted (save / resolve_conflict)
+#   active | conflicted ──retire──▶ retired (never deleted: lineage and audit survive)
+# A save over a retired key is invalid_state (a forgotten item is not resurrected by
+# a save; remember / the curator check tombstones before saving).
+#
+# WEIGHT (§6.4.4), applied at read time:
+#   support          = distinct evidence session_ids + 2·pinned − negative_feedback (≥ 0)
+#   effective_weight = support · 0.5 ** (days since updated_at / 120)
+#
+# CAPS: user 300 (+ 200 episodes), agent 500. A save that creates an item first counts
+# the scope's keys (keys only, cheap); only when the count reaches the cap are the
+# rows read and the lowest-effective-weight ACTIVE, UNPINNED items retired to make
+# room. enforce_caps (session-housekeep) does the same on demand, and also retires DECAYED items
+# (§6.4.4): active, unpinned, effective_weight < decay_min_weight (0.25) and unused --
+# last_used_at, else created_at -- for decay_unused_days (180). retired_reason `decay`.
+#
+# AUTHORITY: writes call `access` (write; user scope → user, agent scope → agent,
+# i.e. admin). Guests write nothing. Agent scope is for seeding and promotion only,
+# never a conversation (§6.4.8); every agent-scope write bumps `mem-version`, by
+# which sessions cache the agent scope (agent_scope_snapshot). touch is user scope
+# only: agent-scope items carry no last_used_at.
+#
+# ONLY THE CALLER'S OWN user scope is reachable (F50 closed): caps and decay run in the
+# user's own session (session-housekeep), never from an admin job.
+#
+# PROMOTION POOL (§6.16, opt-in): with promotion_pool true, a user-scope fact or lesson
+# that is ACTIVE is mirrored to the GLOBAL namespace `agent.<id>.memory-pool`, key
+# `pool:<uid>:<mem key>`, topic memory-pool:
+#   {schema_version, user_id, key, kind, title, text, tags, status: active, updated_at}
+# memory-promote reads only this pool. It is readable by every user (writer implies
+# reader on a global namespace), which is why it is opt-in per agent and carries no
+# evidence. A write that leaves the item not active (retire, conflicted, cap / decay
+# eviction) deletes the pool row whatever the flag, so turning promotion off never
+# strands an item that should have left. Items saved before promotion was turned on
+# join the pool when next written.
+#
+# TOMBSTONES: hash = two 61-bit polynomial hashes (bases 31, 37, mod 2^61-1, 32 hex)
+# of the NORMALISED statement (lowercase words joined by one space) -- the sandbox has
+# no hash function. The curator and remember drop a candidate whose normalised title
+# hashes to a tombstone, so a forgotten item is not relearned.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: memory-store
+
+context:
+  valid_modes: ["get", "list", "save", "add_evidence", "touch", "retire", "resolve_conflict",
+                "feedback", "tombstone", "list_tombstones", "agent_scope_snapshot", "enforce_caps", "list_pool"]
+  write_modes: ["save", "add_evidence", "touch", "retire", "resolve_conflict", "feedback", "tombstone", "enforce_caps"]
+  key_modes: ["get", "save", "add_evidence", "retire", "resolve_conflict", "feedback"]
+  valid_scopes: ["user", "agent"]
+  agent_id_pattern: "^[a-z][a-z0-9-]{1,31}$"
+  slug_pattern: "^[a-z0-9-]{1,48}$"
+  key_pattern: "^mem:[a-z0-9-]{1,48}:[a-z0-9-]{1,48}$"
+  default_kinds: ["profile", "fact", "lesson", "episode"]
+  caps: {user: 300, user_episode: 200, agent: 500}
+  half_life_days: 120
+  decay_min_weight: 0.25
+  decay_unused_days: 180
+  decayed: []
+  title_chars: 120
+  text_chars: 600
+  episode_text_chars: 1500
+  max_tags: 8
+  max_evidence: 10
+  default_list_limit: 50
+  hash_mod: 2305843009213693951
+  schema_version: 1
+  supported_schema_versions: [0, 1]
+  ok: false
+  data:
+  error:
+  authz: {allow: true}
+  current:
+  new_row:
+  problem:
+  rows: []
+  cap_keys: []
+  cap_rows: []
+  evicted: []
+  version_row: {}
+  touch_rows: []
+  tombstone_keys: []
+  item_keys: []
+  created: false
+  check_caps: false
+  cap_group: user
+  pool_kinds: [fact, lesson]
+
+input:
+  mode: get
+  agent_id:
+  scope: user
+  key:
+  kinds: []
+  status:
+  limit:
+  item: {}
+  evidence: []
+  keys: []
+  reason:
+  to:
+  delta: 1
+  statement: ""
+  definition_access: {}
+  promotion_pool: false
+
+output:
+  ok: "{{ ok }}"
+  data: "{{ data }}"
+  error: "{{ error }}"
+
+main:
+  tasks:
+
+    - task_name: reject-unknown-mode
+      raise:
+        if: "{{ mode not in valid_modes }}"
+        type: error
+        error_type: AbortError
+        message: "memory-store: invalid mode '{{ mode }}'. Must be one of: {{ ', '.join(valid_modes) }}"
+
+    - task_name: check-input
+      set:
+        - aid: '{{ str(agent_id or "").strip() }}'
+        - sc: "{{ 'agent' if mode == 'agent_scope_snapshot' else ('user' if mode in ['touch', 'tombstone', 'list_tombstones'] else str(scope or 'user')) }}"
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+        - ns_global: "{{ sc == 'agent' }}"
+        - namespace: "{{ 'agent.' + aid }}"
+        - pool_ns: "{{ 'agent.' + aid + '.memory-pool' }}"
+        - now_iso: "{{ now().isoformat() }}"
+        - itm: "{{ item if isinstance(item, dict) else {} }}"
+        # The key: given, or built from the item's kind and slug (or title).
+        - item_kind: "{{ re.sub(r'[^a-z0-9-]+', '-', str(itm.get('kind') or '').lower()).strip('-')[:48] }}"
+        - _slug: >-
+            {{ re.sub(r'-+', '-', re.sub(r'[^a-z0-9-]+', '-', str(itm.get('slug') or itm.get('title') or '').lower())).strip('-')[:48].strip('-') }}
+        - mkey: "{{ str(key) if key else ('mem:' + item_kind + ':' + _slug) }}"
+        - _bad: >-
+            {{ 'agent_id must match ' + agent_id_pattern if not re.match(agent_id_pattern, aid) else
+               'scope must be one of ' + ', '.join(valid_scopes) if sc not in valid_scopes else
+               ('key must match ' + key_pattern + ' (got ' + mkey + ')')
+                 if mode in key_modes and not re.match(key_pattern, mkey) else
+               'title is required' if mode == 'save' and not str(itm.get('title') or '').strip() else
+               'keys must be memory keys' if mode == 'touch' and not all(re.match(key_pattern, str(k)) for k in (keys or [])) else
+               'statement is required' if mode == 'tombstone' and not str(statement or '').strip() else None }}
+        - proceed: "{{ _bad is None }}"
+        - error: "{{ None if _bad is None else {'code': 'invalid_input', 'message': _bad, 'retryable': False} }}"
+        - is_write: "{{ mode in write_modes }}"
+
+    - task_name: authorize-write
+      skip_if: "{{ not proceed or not is_write }}"
+      workflow:
+        ref: agent-harness-foundation/access
+        mode: inline
+        input:
+          mode: authorize
+          agent_id: "{{ aid }}"
+          action: write
+          scope: "{{ sc }}"
+          definition_access: "{{ definition_access }}"
+      output:
+        set:
+          - authz: "{{ (_ or {}).get('data') or {} }}"
+
+    - task_name: check-authority
+      skip_if: "{{ not proceed or not is_write }}"
+      set:
+        - proceed: "{{ bool(authz.get('allow')) }}"
+        - error: >-
+            {{ None if authz.get('allow') else
+               {'code': 'forbidden', 'message': 'not allowed to write ' + sc + ' memory (' + str(authz.get('reason')) + ')', 'retryable': False} }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # READS OVER A SCOPE — list, agent_scope_snapshot, list_tombstones
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-list
+      skip_if: "{{ not proceed or mode not in ['list', 'agent_scope_snapshot'] }}"
+      tasks:
+        - task_name: plan-list
+          set:
+            - list_kinds: "{{ [k for k in (kinds or default_kinds) if re.match(slug_pattern, str(k))] if mode == 'list' else default_kinds }}"
+            - list_limit: "{{ int(limit or default_list_limit) if mode == 'list' else caps['agent'] }}"
+        - task_name: list-kind-keys
+          loop:
+            in: "{{ list_kinds }}"
+            foreach: list_kind
+            execute_mode: parallel
+            do:
+              task_name: list-item-keys
+              activity:
+                type: builtin.state.list_states
+                input:
+                  in_global_ns: "{{ ns_global }}"
+                  namespace: "{{ namespace }}"
+                  key_pattern: "mem:{{ list_kind }}:*"
+                  topic_pattern: memory
+                  limit: "{{ list_limit }}"
+                  order_by: last_update_time
+                  order_direction: desc
+          output:
+            set:
+              - item_keys: "{{ [r.get('key') for rows in (_ or []) for r in (rows or []) if isinstance(r, dict)] }}"
+        - task_name: read-items
+          skip_if: "{{ not item_keys }}"
+          loop:
+            in: "{{ item_keys }}"
+            foreach: item_key
+            execute_mode: parallel
+            do:
+              task_name: read-item
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: "{{ ns_global }}", namespace: "{{ namespace }}", key: "{{ item_key }}"}
+          output:
+            set:
+              - rows: >-
+                  {{ [r for r in (_ or []) if isinstance(r, dict) and r.get('schema_version', 0) in supported_schema_versions] }}
+        - task_name: read-mem-version
+          skip_if: "{{ mode != 'agent_scope_snapshot' }}"
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: true, namespace: "{{ namespace }}", key: mem-version}
+          output:
+            set:
+              - version_row: "{{ _ if isinstance(_, dict) else {} }}"
+        - task_name: shape-list
+          set:
+            - ok: true
+            - data: >-
+                {{ {'items': [r for r in rows if (status is None or r.get('status') == status)]}
+                   if mode == 'list' else
+                   {'version': int(version_row.get('version') or 0),
+                    'items': [r for r in rows if r.get('status') in ['active', 'conflicted']]} }}
+
+    - task_name: mode-list-pool
+      skip_if: "{{ not proceed or mode != 'list_pool' }}"
+      tasks:
+        - task_name: list-pool-keys
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: true
+              namespace: "{{ pool_ns }}"
+              key_pattern: "pool:*"
+              topic_pattern: memory-pool
+              order_by: last_update_time
+              order_direction: desc
+              limit: "{{ int(limit or default_list_limit) }}"
+          output:
+            set:
+              - item_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict) and str(r.get('key', '')).startswith('pool:')] }}"
+        - task_name: read-pool-rows
+          skip_if: "{{ not item_keys }}"
+          loop:
+            in: "{{ item_keys }}"
+            foreach: pool_key
+            execute_mode: parallel
+            do:
+              task_name: read-pool-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: true, namespace: "{{ pool_ns }}", key: "{{ pool_key }}"}
+          output:
+            set:
+              - rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('user_id') and r.get('key')] }}"
+        - task_name: shape-pool
+          set:
+            - ok: true
+            - data: "{{ {'items': rows} }}"
+
+    - task_name: mode-list-tombstones
+      skip_if: "{{ not proceed or mode != 'list_tombstones' }}"
+      tasks:
+        - task_name: list-tombstone-keys
+          activity:
+            type: builtin.state.list_states
+            input: {in_global_ns: false, namespace: "{{ namespace }}", key_pattern: "mem-tombstone:*", topic_pattern: memory}
+          output:
+            set:
+              - tombstone_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict)] }}"
+        - task_name: shape-tombstones
+          set:
+            - ok: true
+            - data: "{{ {'hashes': sorted(str(k)[len('mem-tombstone:'):] for k in tombstone_keys)} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TOMBSTONE — the normalised statement's hash; idempotent
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-tombstone
+      skip_if: "{{ not proceed or mode != 'tombstone' }}"
+      tasks:
+        - task_name: plan-tombstone
+          set:
+            - _norm: "{{ ' '.join(re.findall(r'[a-z0-9]+', str(statement).lower())) }}"
+            - tomb_hash: >-
+                {{ '%016x%016x' % (sum(ord(c) * pow(31, i, hash_mod) for i, c in enumerate(_norm)) % hash_mod,
+                                   sum(ord(c) * pow(37, i, hash_mod) for i, c in enumerate(_norm)) % hash_mod) }}
+            - tomb_row: "{{ {'schema_version': schema_version, 'hash': tomb_hash, 'statement': _norm[:300], 'created_at': now_iso, 'created_by': uid} }}"
+        - task_name: write-tombstone
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: false
+              namespace: "{{ namespace }}"
+              key: "mem-tombstone:{{ tomb_hash }}"
+              value: "{{ tomb_row }}"
+              topic: memory
+        - task_name: shape-tombstone
+          set:
+            - ok: true
+            - data: "{{ {'hash': tomb_hash} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # TOUCH — last_used_at on the user-scope items a turn used (batched)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-touch
+      skip_if: "{{ not proceed or mode != 'touch' or not keys }}"
+      tasks:
+        - task_name: read-touched
+          loop:
+            in: "{{ sorted(set(str(k) for k in keys)) }}"
+            foreach: touch_key
+            execute_mode: parallel
+            do:
+              task_name: read-touch-row
+              activity:
+                type: builtin.state.get_state
+                input: {in_global_ns: false, namespace: "{{ namespace }}", key: "{{ touch_key }}"}
+          output:
+            set:
+              - touch_rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('key') and r.get('status') != 'retired'] }}"
+        - task_name: write-touched
+          skip_if: "{{ not touch_rows }}"
+          loop:
+            in: "{{ touch_rows }}"
+            foreach: touch_row
+            execute_mode: parallel
+            do:
+              task_name: write-touch-row
+              activity:
+                type: builtin.state.set_state
+                input:
+                  in_global_ns: false
+                  namespace: "{{ namespace }}"
+                  key: "{{ touch_row['key'] }}"
+                  value: "{{ dict(touch_row, last_used_at=now_iso, schema_version=schema_version) }}"
+                  topic: memory
+    - task_name: shape-touch
+      skip_if: "{{ not proceed or mode != 'touch' }}"
+      set:
+        - ok: true
+        - data: "{{ {'touched': [r['key'] for r in touch_rows]} }}"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ONE ITEM — get, save, add_evidence, retire, resolve_conflict, feedback
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: mode-item
+      skip_if: "{{ not proceed or mode not in key_modes }}"
+      tasks:
+        - task_name: read-current
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: "{{ ns_global }}", namespace: "{{ namespace }}", key: "{{ mkey }}"}
+          output:
+            set:
+              - current: >-
+                  {{ _ if isinstance(_, dict) and _.get('schema_version', 0) in supported_schema_versions else None }}
+
+        - task_name: plan-item
+          set:
+            - _st: "{{ (current or {}).get('status') }}"
+            - _ev_in: "{{ [e for e in (evidence if mode == 'add_evidence' else (itm.get('evidence') or [])) if isinstance(e, dict)] }}"
+            # Evidence: one entry per session+turn, newest last, at most max_evidence.
+            - _ev: >-
+                {{ list({(str(e.get('session_id')), str(e.get('turn'))): dict(e, ts=e.get('ts') or now_iso)
+                         for e in ((current or {}).get('evidence') or []) + _ev_in}.values())[-max_evidence:] }}
+            - _k: "{{ mkey.split(':')[1] if mkey.count(':') == 2 else item_kind }}"
+            - _tags: >-
+                {{ list(dict.fromkeys(t for t in (re.sub(r'[^a-z0-9-]+', '-', str(x).lower()).strip('-') for x in (itm.get('tags') or [])) if t))[:max_tags] }}
+            - _status_in: "{{ str(itm.get('status') or 'active') }}"
+            - problem#: >-
+                {{ None if mode == 'get' and current is not None else
+                   ('not_found', 'no ' + sc + ' memory item ' + mkey) if mode != 'save' and current is None else
+                   ('invalid_state', mkey + ' is retired') if mode in ['save', 'add_evidence', 'retire', 'feedback'] and _st == 'retired' else
+                   ('invalid_input', 'status must be active or conflicted') if mode == 'save' and _status_in not in ['active', 'conflicted'] else
+                   ('invalid_input', 'to must be active or retired') if mode == 'resolve_conflict' and to not in ['active', 'retired'] else
+                   ('invalid_state', mkey + ' is ' + str(_st) + ', not conflicted') if mode == 'resolve_conflict' and _st != 'conflicted' else
+                   ('invalid_input', 'delta must be a positive integer') if mode == 'feedback' and not (isinstance(delta, int) and delta > 0) else None }}
+            - created: "{{ mode == 'save' and current is None and problem is None }}"
+            - new_row: >-
+                {{ None if problem is not None or mode == 'get' else
+                   {'schema_version': schema_version, 'key': mkey, 'kind': _k, 'slug': mkey.split(':')[2], 'scope': sc,
+                    'title': str(itm.get('title') or (current or {}).get('title') or '').strip()[:title_chars],
+                    'text': str(itm.get('text') or (current or {}).get('text') or '').strip()[:(episode_text_chars if _k == 'episode' else text_chars)],
+                    'tags': _tags or list((current or {}).get('tags') or []),
+                    'pinned': bool(itm.get('pinned')) or bool((current or {}).get('pinned')),
+                    'evidence': _ev,
+                    'sources': list(itm.get('sources') or (current or {}).get('sources') or [])[:10],
+                    'status': _status_in,
+                    'conflicts_with': list(itm.get('conflicts_with') or (current or {}).get('conflicts_with') or []),
+                    'supersedes': list(itm.get('supersedes') or (current or {}).get('supersedes') or []),
+                    'negative_feedback': int((current or {}).get('negative_feedback') or 0),
+                    'created_at': (current or {}).get('created_at') or now_iso, 'updated_at': now_iso,
+                    'last_used_at': (current or {}).get('last_used_at'), 'updated_by': uid}
+                     if mode == 'save' else
+                   dict(current, evidence=_ev, updated_at=now_iso, schema_version=schema_version) if mode == 'add_evidence' else
+                   dict(current, status='retired', retired_reason=str(reason or 'retired'), updated_at=now_iso, schema_version=schema_version)
+                     if mode == 'retire' else
+                   dict(current, status=to, conflicts_with=[] if to == 'active' else list(current.get('conflicts_with') or []),
+                        updated_at=now_iso, schema_version=schema_version) if mode == 'resolve_conflict' else
+                   dict(current, negative_feedback=int(current.get('negative_feedback') or 0) + int(delta), schema_version=schema_version) }}
+            - cap_group: "{{ ('user_episode' if _k == 'episode' else 'user') if sc == 'user' else 'agent' }}"
+
+        # A new item may push the scope over its cap: count keys first (cheap).
+        - task_name: count-scope-keys
+          skip_if: "{{ not created }}"
+          activity:
+            type: builtin.state.list_states
+            input:
+              in_global_ns: "{{ ns_global }}"
+              namespace: "{{ namespace }}"
+              key_pattern: "{{ 'mem:episode:*' if cap_group == 'user_episode' else 'mem:*' }}"
+              topic_pattern: memory
+          output:
+            set:
+              - cap_keys: >-
+                  {{ [r.get('key') for r in (_ or []) if isinstance(r, dict) and str(r.get('key', '')).startswith('mem:')
+                      and (cap_group == 'agent' or (str(r.get('key')).startswith('mem:episode:')) == (cap_group == 'user_episode'))] }}
+
+        - task_name: write-item
+          skip_if: "{{ new_row is None }}"
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: "{{ ns_global }}"
+              namespace: "{{ namespace }}"
+              key: "{{ mkey }}"
+              value: "{{ new_row }}"
+              topic: memory
+
+        # The promotion pool (header). Best effort: the item row is the truth.
+        - task_name: write-pool-row
+          skip_if: >-
+            {{ not (sc == 'user' and new_row is not None and bool(promotion_pool)
+                    and new_row.get('kind') in pool_kinds and new_row.get('status') == 'active') }}
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: true
+              namespace: "{{ pool_ns }}"
+              key: "pool:{{ uid }}:{{ mkey }}"
+              value: >-
+                {{ {'schema_version': schema_version, 'user_id': uid, 'key': mkey, 'kind': new_row.get('kind'),
+                    'title': new_row.get('title'), 'text': new_row.get('text'), 'tags': list(new_row.get('tags') or []),
+                    'status': 'active', 'updated_at': now_iso} }}
+              topic: memory-pool
+          on_error:
+            catch: true
+
+        - task_name: delete-pool-row
+          skip_if: >-
+            {{ not (sc == 'user' and new_row is not None
+                    and new_row.get('kind') in pool_kinds and new_row.get('status') != 'active') }}
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: true, namespace: "{{ pool_ns }}", key: "pool:{{ uid }}:{{ mkey }}"}
+          on_error:
+            catch: true
+
+    # ══════════════════════════════════════════════════════════════════════
+    # CAPS — after a create that reached the cap, or on demand (enforce_caps)
+    # ══════════════════════════════════════════════════════════════════════
+    - task_name: plan-caps
+      skip_if: "{{ not proceed or mode not in ['save', 'enforce_caps'] }}"
+      set:
+        - cap_group: "{{ cap_group if mode == 'save' else ('agent' if sc == 'agent' else 'user') }}"
+        - check_caps#: "{{ mode == 'enforce_caps' or (created and len(cap_keys) >= caps[cap_group]) }}"
+
+    - task_name: list-cap-keys
+      skip_if: "{{ not proceed or mode != 'enforce_caps' }}"
+      activity:
+        type: builtin.state.list_states
+        input: {in_global_ns: "{{ ns_global }}", namespace: "{{ namespace }}", key_pattern: "mem:*", topic_pattern: memory}
+      output:
+        set:
+          - cap_keys: "{{ [r.get('key') for r in (_ or []) if isinstance(r, dict) and str(r.get('key', '')).startswith('mem:')] }}"
+
+    - task_name: read-cap-rows
+      skip_if: "{{ not proceed or not check_caps or not cap_keys }}"
+      loop:
+        in: "{{ cap_keys }}"
+        foreach: cap_key
+        execute_mode: parallel
+        do:
+          task_name: read-cap-row
+          activity:
+            type: builtin.state.get_state
+            input: {in_global_ns: "{{ ns_global }}", namespace: "{{ namespace }}", key: "{{ cap_key }}"}
+      output:
+        set:
+          - cap_rows: "{{ [r for r in (_ or []) if isinstance(r, dict) and r.get('key')] }}"
+
+    - task_name: pick-evictions
+      skip_if: "{{ not proceed or not check_caps }}"
+      set:
+        - _now: "{{ now().replace(tzinfo=None) }}"
+        # (group, row) for every active row; a just-saved key counts in its group.
+        - _groups: >-
+            {{ [g for g in (['user', 'user_episode'] if sc == 'user' else ['agent'])
+                if mode == 'enforce_caps' or g == cap_group] }}
+        - evicted#: >-
+            {{ [r['key'] for g in _groups
+                for r in sorted([r for r in cap_rows if r.get('status') == 'active' and not r.get('pinned')
+                                 and r.get('key') != (mkey if mode == 'save' else None)
+                                 and (g == 'agent' or (str(r['key']).startswith('mem:episode:')) == (g == 'user_episode'))],
+                                key=lambda r: max(0, len(set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict) and e.get('session_id')))
+                                                     + (2 if r.get('pinned') else 0) - int(r.get('negative_feedback') or 0))
+                                              * 0.5 ** (max(0.0, (_now - dt.datetime.fromisoformat(str(r.get('updated_at') or r.get('created_at') or now_iso)).replace(tzinfo=None)).total_seconds()) / 86400.0 / half_life_days))
+                [:max(0, len([x for x in cap_rows if x.get('status') == 'active'
+                              and x.get('key') != (mkey if mode == 'save' else None)
+                              and (g == 'agent' or (str(x['key']).startswith('mem:episode:')) == (g == 'user_episode'))])
+                         + (1 if mode == 'save' else 0) - caps[g])]] }}
+
+    - task_name: pick-decayed
+      skip_if: "{{ not proceed or mode != 'enforce_caps' }}"
+      set:
+        - _now: "{{ now().replace(tzinfo=None) }}"
+        - decayed#: >-
+            {{ [r['key'] for r in cap_rows
+                if r.get('status') == 'active' and not r.get('pinned') and r['key'] not in evicted
+                and (_now - dt.datetime.fromisoformat(str(r.get('last_used_at') or r.get('created_at') or now_iso)).replace(tzinfo=None)).total_seconds() >= decay_unused_days * 86400
+                and max(0, len(set(str(e.get('session_id')) for e in (r.get('evidence') or []) if isinstance(e, dict) and e.get('session_id')))
+                           - int(r.get('negative_feedback') or 0))
+                    * 0.5 ** (max(0.0, (_now - dt.datetime.fromisoformat(str(r.get('updated_at') or r.get('created_at') or now_iso)).replace(tzinfo=None)).total_seconds()) / 86400.0 / half_life_days)
+                    < decay_min_weight] }}
+        - evicted: "{{ evicted + decayed }}"
+
+    - task_name: write-evictions
+      skip_if: "{{ not proceed or not evicted }}"
+      loop:
+        in: "{{ [r for r in cap_rows if r['key'] in evicted] }}"
+        foreach: victim
+        execute_mode: parallel
+        do:
+          task_name: write-eviction
+          activity:
+            type: builtin.state.set_state
+            input:
+              in_global_ns: "{{ ns_global }}"
+              namespace: "{{ namespace }}"
+              key: "{{ victim['key'] }}"
+              value: "{{ dict(victim, status='retired', retired_reason='decay' if victim['key'] in decayed else 'cap', updated_at=now_iso, schema_version=schema_version) }}"
+              topic: memory
+
+    - task_name: delete-evicted-pool-rows
+      skip_if: "{{ not proceed or sc != 'user' or not [k for k in evicted if str(k).split(':')[1:2] and str(k).split(':')[1] in pool_kinds] }}"
+      loop:
+        in: "{{ [k for k in evicted if str(k).split(':')[1:2] and str(k).split(':')[1] in pool_kinds] }}"
+        foreach: pool_victim
+        execute_mode: parallel
+        do:
+          task_name: delete-evicted-pool-row
+          activity:
+            type: builtin.state.del_state
+            input: {in_global_ns: true, namespace: "{{ pool_ns }}", key: "pool:{{ uid }}:{{ pool_victim }}"}
+          on_error:
+            catch: true
+
+    # Every agent-scope write bumps mem-version, by which sessions cache the scope.
+    - task_name: read-version-for-bump
+      skip_if: "{{ not proceed or sc != 'agent' or not is_write or (new_row is None and not evicted) }}"
+      activity:
+        type: builtin.state.get_state
+        input: {in_global_ns: true, namespace: "{{ namespace }}", key: mem-version}
+      output:
+        set:
+          - version_row: "{{ _ if isinstance(_, dict) else {} }}"
+
+    - task_name: bump-mem-version
+      skip_if: "{{ not proceed or sc != 'agent' or not is_write or (new_row is None and not evicted) }}"
+      activity:
+        type: builtin.state.set_state
+        input:
+          in_global_ns: true
+          namespace: "{{ namespace }}"
+          key: mem-version
+          value: "{{ {'schema_version': schema_version, 'version': int(version_row.get('version') or 0) + 1, 'updated_at': now_iso} }}"
+          topic: memory
+
+    - task_name: shape-item
+      skip_if: "{{ not proceed or mode not in key_modes + ['enforce_caps'] }}"
+      set:
+        - ok: "{{ problem is None }}"
+        - error: "{{ None if problem is None else {'code': problem[0], 'message': problem[1], 'retryable': False} }}"
+        - data: >-
+            {{ None if problem is not None else
+               {'evicted': [k for k in evicted if k not in decayed], 'decayed': decayed} if mode == 'enforce_caps' else
+               {'item': current} if mode == 'get' else
+               {'item': new_row, 'created': created, 'evicted': evicted} if mode == 'save' else
+               {'item': new_row} }}

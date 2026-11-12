@@ -1,0 +1,19 @@
+test_type: integration-test
+
+# qset.memory.gate: one exchange per request (F44); worth/user_stated nouls and a kind
+# choice over the agent's kinds (episodes excluded); sorted; every question instructed.
+
+wfspec:
+  name: qset.memory.gate
+
+test_cases:
+  - id: one-exchange-three-questions
+    input: {exchange: {user: "I deploy with helm", assistant: "Noted."}, kinds: [profile, fact, lesson, episode], hints: {profile: "About the user"}}
+    expect:
+      output:
+        - kind: system_one
+        - state: "User: I deploy with helm\n\nAssistant: Noted."
+      assert:
+        - "{{ list(questions) == ['kind', 'user_stated', 'worth_remembering'] }}"
+        - "{{ sorted(questions['kind']['criteria']) == ['fact', 'lesson', 'profile'] and questions['kind']['criteria']['profile'] == 'About the user' }}"
+        - "{{ all(bool(q['instructions']) for q in questions.values()) and list(questions['kind']) == sorted(questions['kind']) }}"

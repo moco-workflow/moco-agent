@@ -1,0 +1,512 @@
+test_type: integration-test
+
+# session-store, phase 0 (plan-14 step 1; plan-00a §6).
+#
+# Every state activity is mocked by task name. An UNMOCKED set_state is a
+# real write into persist_state, so every case mocks each write its branch runs.
+# Asserts use bare output keys (ok / data / error); nothing else is in scope.
+
+wfspec:
+  name: session-store
+
+test_data:
+  meta_v1: &meta_v1
+    schema_version: 1
+    session_id: s1
+    title: "hello"
+    status: active
+    throwaway: false
+    turn_count: 2
+    config_overrides: {}
+    pending_action_id: null
+    jobs: []
+    last_route: chat
+    last_curated_turn: 0
+    usage: {tokens_in: 100, tokens_out: 40, llm_calls: 2}
+    config_version: "d0.1.0+a0.1.0"
+    created_at: "2026-09-28T10:00:00"
+    updated_at: "2026-09-28T10:05:00"
+  turn3: &turn3
+    - {turn: 3, message_id: m3, role: user, content: "and then?", ts: "2026-09-28T10:06:00"}
+    - {turn: 3, message_id: m3, role: assistant, content: "then this.", route: chat, status: ok, ts: "2026-09-28T10:06:05"}
+
+test_cases:
+
+  # ── The id guard ────────────────────────────────────────────────────────
+  # Both ids reach keys and namespaces; nothing is read until they are safe.
+  - id: a-path-traversal-session-id-is-invalid-input
+    input: {mode: get, agent_id: skeleton, session_id: "../../x"}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_input' }}"
+        - "{{ 'session_id' in error['message'] }}"
+
+  - id: a-65-character-session-id-is-invalid-input
+    input: {mode: get, agent_id: skeleton, session_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: a-bad-agent-id-is-invalid-input
+    input: {mode: get, agent_id: "Skeleton!", session_id: s1}
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+        - "{{ 'agent_id' in error['message'] }}"
+
+  # What agent-cli mints, and what a browser mints.
+  - id: a-minted-throwaway-id-and-a-uuid-are-accepted
+    input: {mode: get, agent_id: skeleton, session_id: "cli-3f2b1c4d9a7e"}
+    mocks:
+      - step_name: read-meta
+        _: null
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  - id: an-unknown-mode-is-a-bug
+    input: {mode: purge, agent_id: skeleton, session_id: s1}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: "session-store: invalid mode 'purge'. Must be one of: create, get, commit_turn, patch_meta, put_context, list, get_turns, delete, submit_feedback"
+
+  # ── create ──────────────────────────────────────────────────────────────
+  - id: create-writes-a-v1-row
+    input: {mode: create, agent_id: skeleton, session_id: s1, throwaway: true}
+    mocks:
+      - step_name: read-meta
+        _: null
+      - step_name: write-new-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['created'] == True }}"
+        - "{{ data['meta']['schema_version'] == 1 }}"
+        - "{{ data['meta']['session_id'] == 's1' }}"
+        - "{{ data['meta']['status'] == 'active' }}"
+        - "{{ data['meta']['throwaway'] == True }}"
+        - "{{ data['meta']['turn_count'] == 0 }}"
+        - "{{ data['meta']['created_at'] == data['meta']['updated_at'] }}"
+
+  - id: create-is-idempotent-and-returns-the-existing-row
+    input: {mode: create, agent_id: skeleton, session_id: s1, throwaway: true}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['created'] == False }}"
+        # The stored row wins: a second create cannot flip throwaway or reset it.
+        - "{{ data['meta']['throwaway'] == False }}"
+        - "{{ data['meta']['turn_count'] == 2 }}"
+
+  # ── get ─────────────────────────────────────────────────────────────────
+  - id: get-returns-meta-and-context
+    input: {mode: get, agent_id: skeleton, session_id: s1}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: read-context
+        _: {schema_version: 1, summary: "", summary_upto_turn: 0, summary_degraded: false, recent: [{role: user, content: hi}]}
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['meta']['title'] == 'hello' }}"
+        - "{{ data['context']['recent'] == [{'role': 'user', 'content': 'hi'}] }}"
+        - "{{ data['turns'] is None }}"
+
+  # Phase 2: the tool audit rows commit_turn appends (agent-admin tools area, rollup).
+  - id: get-with-toolcalls-unwraps-the-audit-entries
+    input: {mode: get, agent_id: skeleton, session_id: s1, parts: [meta, toolcalls]}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: read-toolcalls
+        _: {schema_version: 1, entries: [{turn: 2, tool: k8s_get_secret, status: ok, approved_by: u1}]}
+    expect:
+      assert:
+        - "{{ data['toolcalls'] == [{'turn': 2, 'tool': 'k8s_get_secret', 'status': 'ok', 'approved_by': 'u1'}] and data['turns'] is None }}"
+
+  - id: get-with-turns-unwraps-the-entries
+    input: {mode: get, agent_id: skeleton, session_id: s1, parts: [meta, context, turns]}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: read-context
+        _: null
+      - step_name: read-turns
+        _: {schema_version: 1, entries: *turn3}
+    expect:
+      assert:
+        - "{{ len(data['turns']) == 2 }}"
+        # A missing context row reads as the empty v1 shape.
+        - "{{ data['context']['recent'] == [] }}"
+        - "{{ data['context']['summary'] == '' }}"
+
+  - id: get-of-an-unknown-session-is-not-found
+    input: {mode: get, agent_id: skeleton, session_id: s1}
+    mocks:
+      - step_name: read-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ data is None }}"
+        - "{{ error['code'] == 'not_found' }}"
+
+  # ── schema_version (§4.3) ───────────────────────────────────────────────
+  # A row with no schema_version is v0: read, normalised to the v1 shape.
+  - id: a-v0-row-without-schema-version-is-readable
+    input: {mode: get, agent_id: skeleton, session_id: s1, parts: [meta, context, turns]}
+    mocks:
+      - step_name: read-meta
+        _: {session_id: s1, title: "old", status: active, question_count: 5}
+      - step_name: read-context
+        _: {recent: []}
+      # v0 list rows were bare lists.
+      - step_name: read-turns
+        _: [{turn: 1, role: user, content: "x"}]
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['meta']['title'] == 'old' }}"
+        # v0 -> v1 field mapping.
+        - "{{ data['meta']['turn_count'] == 5 }}"
+        # Fields v0 never had are filled from the v1 defaults.
+        - "{{ data['meta']['usage'] == {} }}"
+        - "{{ data['meta']['last_curated_turn'] == 0 }}"
+        - "{{ data['turns'] == [{'turn': 1, 'role': 'user', 'content': 'x'}] }}"
+
+  # A newer writer's row must not be rewritten in an older shape.
+  - id: a-row-from-a-newer-schema-is-refused
+    input: {mode: get, agent_id: skeleton, session_id: s1}
+    mocks:
+      - step_name: read-meta
+        _: {schema_version: 2, session_id: s1, status: active}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'unsupported_schema_version' }}"
+
+  # ── commit_turn ─────────────────────────────────────────────────────────
+  - id: commit-turn-appends-the-transcript-and-writes-every-row
+    input:
+      mode: commit_turn
+      agent_id: skeleton
+      session_id: s1
+      turn_entries: *turn3
+      context: {recent: [{role: user, content: "and then?"}, {role: assistant, content: "then this."}]}
+      meta_patch: {last_route: chat, usage: {tokens_in: 10, tokens_out: 5, llm_calls: 1}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: read-turns-to-append
+        _:
+          schema_version: 1
+          entries:
+            - {turn: 1, role: user, content: a}
+            - {turn: 1, role: assistant, content: b}
+            - {turn: 2, role: user, content: c}
+            - {turn: 2, role: assistant, content: d}
+      - step_name: write-turns
+        _: null
+      - step_name: write-context
+        _: null
+      - step_name: write-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['turn_count'] == 3 }}"
+        - "{{ data['duplicate'] == False }}"
+
+  # The rows this commit writes are pinned by session-store.unit.test.yaml
+  # (step build-commit); this case pins the envelope.
+
+  # Re-running a turn that is already committed writes nothing.
+  - id: a-re-run-of-a-committed-turn-is-a-no-op
+    input: {mode: commit_turn, agent_id: skeleton, session_id: s1, turn_entries: [{turn: 2, role: user, content: c}], context: {}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['duplicate'] == True }}"
+        - "{{ data['turn_count'] == 2 }}"
+
+  - id: commit-turn-on-a-retired-session-is-invalid-state
+    input: {mode: commit_turn, agent_id: skeleton, session_id: s1, turn_entries: *turn3, context: {}}
+    mocks:
+      - step_name: read-meta
+        _: {schema_version: 1, session_id: s1, status: retired, turn_count: 2}
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: commit-turn-on-an-unknown-session-is-not-found
+    input: {mode: commit_turn, agent_id: skeleton, session_id: s1, turn_entries: *turn3, context: {}}
+    mocks:
+      - step_name: read-meta
+        _: null
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  - id: commit-turn-without-turn-numbers-is-invalid-input
+    input: {mode: commit_turn, agent_id: skeleton, session_id: s1, turn_entries: [{role: user, content: x}], context: {}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+    expect:
+      assert:
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  # ── patch_meta: the row state machine (every legal and illegal transition) ──
+  - id: active-to-retired-is-legal
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {status: retired}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: write-patched-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['meta']['status'] == 'retired' }}"
+        - "{{ data['meta']['schema_version'] == 1 }}"
+
+  - id: retired-to-active-is-legal
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {status: active}}
+    mocks:
+      - step_name: read-meta
+        _: {schema_version: 1, session_id: s1, status: retired, turn_count: 2}
+      - step_name: write-patched-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['meta']['status'] == 'active' }}"
+
+  - id: an-unknown-status-is-invalid-state
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {status: deleted}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_state' }}"
+
+  - id: a-patch-that-keeps-the-status-is-not-a-transition
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {status: active, title: "renamed"}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: write-patched-meta
+        _: null
+    expect:
+      assert:
+        - "{{ ok == True }}"
+        - "{{ data['meta']['title'] == 'renamed' }}"
+
+  - id: patch-meta-refuses-protected-fields
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {turn_count: 99}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+    expect:
+      assert:
+        - "{{ ok == False }}"
+        - "{{ error['code'] == 'invalid_input' }}"
+
+  - id: patch-meta-usage-is-additive
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {usage: {tokens_in: 1}}}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - step_name: write-patched-meta
+        _: null
+    expect:
+      assert:
+        - "{{ data['meta']['usage']['tokens_in'] == 101 }}"
+        - "{{ data['meta']['usage']['tokens_out'] == 40 }}"
+
+  - id: patch-meta-of-an-unknown-session-is-not-found
+    input: {mode: patch_meta, agent_id: skeleton, session_id: s1, patch: {status: retired}}
+    mocks:
+      - step_name: read-meta
+        _: null
+    expect:
+      assert:
+        - "{{ error['code'] == 'not_found' }}"
+
+  # ── list / get_turns / delete (plan-14 step 5, for agent-admin) ─────────
+  - id: list-returns-this-users-sessions-newest-first
+    input: {mode: list, agent_id: skeleton, limit: 10}
+    mocks:
+      - {step_name: list-meta-keys, _: [{key: "session:s2:meta"}, {key: "session:s1:meta"}]}
+      - {step_name: read-one-meta, _: {schema_version: 1, session_id: s2, title: "t", turn_count: 3, status: active}}
+    expect:
+      assert:
+        - "{{ ok == True and len(data['sessions']) == 2 and data['sessions'][0]['turn_count'] == 3 }}"
+        - "{{ data['sessions'][0]['jobs'] == [] }}"
+
+  - id: list-needs-no-session-id
+    input: {mode: list, agent_id: skeleton, session_id: null}
+    mocks:
+      - {step_name: list-meta-keys, _: []}
+    expect:
+      output:
+        - ok: true
+        - data: {sessions: []}
+
+  # session-housekeep: least recently updated first (retention candidates).
+  - id: list-oldest-first-uses-the-ascending-listing
+    input: {mode: list, agent_id: skeleton, oldest_first: true}
+    mocks:
+      - {step_name: list-meta-keys, _: "{{ 1 / 0 }}"}
+      - {step_name: list-meta-keys-oldest, _: [{key: "session:s1:meta"}]}
+      - {step_name: read-one-meta, _: {schema_version: 1, session_id: s1, status: retired}}
+    expect:
+      assert:
+        - "{{ ok == True and [m['session_id'] for m in data['sessions']] == ['s1'] }}"
+
+  - id: get-turns-pages-the-transcript
+    input: {mode: get_turns, agent_id: skeleton, session_id: s1, page: 0}
+    mocks:
+      - {step_name: read-meta, _: {schema_version: 1, session_id: s1, status: active, turn_count: 1}}
+      - {step_name: read-all-turns, _: {schema_version: 1, entries: [{turn: 1, role: user, content: "q"}, {turn: 1, role: assistant, content: "a"}]}}
+    expect:
+      assert:
+        - "{{ ok == True and len(data['turns']) == 2 and data['next_page'] is None }}"
+
+  - id: delete-removes-every-row
+    input: {mode: delete, agent_id: skeleton, session_id: s1}
+    mocks:
+      - {step_name: read-meta, _: {schema_version: 1, session_id: s1, status: active}}
+      - step_name: list-session-rows
+        _: [{key: "session:s1:meta"}, {key: "session:s1:turns"}, {key: "session:s1:pending"}, {key: "session:s1:artifact:art_000000000001"}, {key: "session:s1:feedback:2"}]
+      - {step_name: list-session-grants, _: [{key: "tool_grant:s1:k8s_scale"}]}
+      - {step_name: delete-one-row, _: null}
+      - {step_name: delete-tool-audit, _: "{{ None if namespace == 'agent.skeleton.tool-audit' else 1 / 0 }}"}
+      - {step_name: retire-session-memory, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - ok: true
+        - data:
+            deleted_keys: ["session:s1:artifact:art_000000000001", "session:s1:context", "session:s1:feedback:2", "session:s1:pending",
+                           "session:s1:toolcalls", "session:s1:turns", "tool_grant:s1:k8s_scale", "session:s1:meta"]
+            retired_memory: []
+
+  # F65: memory is told which sessions still exist (the deleted one's meta is gone).
+  - id: delete-passes-the-remaining-sessions-to-memory
+    input: {mode: delete, agent_id: skeleton, session_id: s1, config: {memory: {long_term: {enabled: true}}}}
+    mocks:
+      - {step_name: read-meta, _: {schema_version: 1, session_id: s1, status: active}}
+      - {step_name: list-session-rows, _: [{key: "session:s1:meta"}]}
+      - {step_name: list-session-grants, _: []}
+      - {step_name: delete-one-row, _: null}
+      - {step_name: delete-tool-audit, _: null}
+      - {step_name: list-live-sessions, _: [{key: "session:s2:meta"}, {key: "session:s3:meta"}]}
+      - {step_name: retire-session-memory, _: "{{ {'ok': True, 'data': {'retired': live_session_ids}} }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['retired_memory'] == ['s2', 's3'] }}"
+
+  - id: deleting-an-unknown-session-is-not-found
+    input: {mode: delete, agent_id: skeleton, session_id: nope}
+    mocks:
+      - {step_name: read-meta, _: null}
+      - {step_name: delete-one-row, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+
+  # F50 closed: there is no owner override, an input user id is ignored.
+  - id: an-owner-user-id-input-does-not-reach-another-users-rows
+    input: {mode: get, agent_id: skeleton, session_id: s1, owner_user_id: someone-else}
+    mocks:
+      - step_name: read-meta
+        _: "{{ {'schema_version': 1, 'session_id': 's1', 'status': 'active'} if namespace == 'agent.skeleton.sessions' else 1 / 0 }}"
+    expect:
+      assert:
+        - "{{ ok == True and data['meta']['session_id'] == 's1' }}"
+
+  # ── submit_feedback (phase 2, §6.10.5) ─────────────────────────────────
+  - id: a-thumbs-down-writes-the-row-and-lowers-memory-support
+    input: {mode: submit_feedback, agent_id: skeleton, session_id: s1, turn: 2, rating: down, comment: "wrong"}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - {step_name: authorize-feedback, _: {ok: true, data: {allow: true, reason: ok}}}
+      - step_name: read-feedback-turns
+        _: {entries: [{turn: 2, role: user, content: q}, {turn: 2, role: assistant, content: a, used_memory: ["mem:fact:x"]}]}
+      - {step_name: write-feedback, _: null}
+      - {step_name: memory-feedback-down, _: {ok: true, data: {adjusted: ["mem:fact:x"]}}}
+      - {step_name: memory-record-up, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['feedback']['rating'] == 'down' and data['feedback']['used_memory'] == ['mem:fact:x'] and data['memory'] == True }}"
+        - "{{ data['feedback']['source'] == 'explicit' and data['feedback']['schema_version'] == 1 }}"
+
+  - id: a-thumbs-up-records-the-exchange
+    input: {mode: submit_feedback, agent_id: skeleton, session_id: s1, turn: 2, rating: up}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - {step_name: authorize-feedback, _: {ok: true, data: {allow: true, reason: ok}}}
+      - step_name: read-feedback-turns
+        _: {entries: [{turn: 2, role: user, content: q}, {turn: 2, role: assistant, content: a}]}
+      - {step_name: write-feedback, _: null}
+      - {step_name: memory-record-up, _: {ok: true, data: {started: true}}}
+      - {step_name: memory-feedback-down, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['feedback']['rating'] == 'up' }}"
+
+  - id: a-guest-cannot-give-feedback
+    input: {mode: submit_feedback, agent_id: skeleton, session_id: s1, turn: 2, rating: up}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - {step_name: authorize-feedback, _: {ok: true, data: {allow: false, reason: guest_no_feedback}}}
+      - step_name: read-feedback-turns
+        _: {entries: [{turn: 2, role: assistant, content: a}]}
+      - {step_name: write-feedback, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'forbidden' }}"
+
+  - id: implicit-feedback-leaves-memory-alone-unless-enabled
+    input: {mode: submit_feedback, agent_id: skeleton, session_id: s1, turn: 2, rating: down, feedback_source: implicit}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - {step_name: authorize-feedback, _: "{{ 1 / 0 }}"}
+      - step_name: read-feedback-turns
+        _: {entries: [{turn: 2, role: assistant, content: a, used_memory: ["mem:fact:x"]}]}
+      - {step_name: write-feedback, _: null}
+      - {step_name: memory-feedback-down, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == True and data['memory'] == False and data['feedback']['source'] == 'implicit' }}"
+
+  - id: feedback-on-an-unanswered-turn-is-not-found
+    input: {mode: submit_feedback, agent_id: skeleton, session_id: s1, turn: 9, rating: up}
+    mocks:
+      - step_name: read-meta
+        _: *meta_v1
+      - {step_name: authorize-feedback, _: {ok: true, data: {allow: true, reason: ok}}}
+      - step_name: read-feedback-turns
+        _: {entries: [{turn: 2, role: assistant, content: a}]}
+      - {step_name: write-feedback, _: "{{ 1 / 0 }}"}
+    expect:
+      assert:
+        - "{{ ok == False and error['code'] == 'not_found' }}"
+

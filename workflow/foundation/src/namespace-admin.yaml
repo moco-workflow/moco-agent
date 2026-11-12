@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# NAMESPACE-ADMIN — is the caller an admin of the namespace that owns a package?
+# ================================================================================
+#
+#   in                              out
+#   ─────────────────────────────── ──────────────────────────────────
+#   package_name, exclude_user_ids  {namespace_id, is_admin}
+#
+# agent-config resolve's source of namespace admins (design §6.13, F48): a holder
+# of `<ns>:manage_ns` in the namespace owning `agent-<id>` is an admin of that
+# agent. The platform grants it with the `<ns>:admin` role that
+# sys.deploy.namespace.authorization init creates (creator as member); a custom
+# role carrying manage_ns counts too. The check is the platform's own
+# (sys.deploy.assert_privilege), called directly because that wfspec raises on deny.
+#
+# FOUNDATION and pure: two deploy-DB reads, no storage, owns nothing. The caller
+# is __user_info__.user_id, read here, never an input (§4.3). __sys_info__ has no
+# namespace, so it is the package's wfspec row's `namespace_id`.
+#
+# FAILS CLOSED: no stage (`__sys_info__.tier`; note a local dev server reports
+# "dev" even for `moco run <file>` and `moco test`), a guest or excluded caller (the
+# caller passes guest + denied ids, which beat admin anyway), a missing package or
+# a failing read -> is_admin false. A caught activity's output is not applied, so
+# the seeded context values stand.
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: namespace-admin
+
+context:
+  privilege: manage_ns
+  # Seeded: they are the result on every fail-closed path.
+  namespace_id:
+  is_admin: false
+
+input:
+  package_name:
+  exclude_user_ids: []
+
+output:
+  namespace_id: "{{ namespace_id }}"
+  is_admin: "{{ is_admin }}"
+
+main:
+  tasks:
+    - task_name: read-identity
+      set:
+        - stage#: "{{ __sys_info__.get('tier') }}"
+        - uid: '{{ str(__user_info__.get("user_id")) }}'
+
+    # Named, so the rule is unit-tested without __user_info__ / __sys_info__.
+    - task_name: decide-lookup
+      set:
+        - lookup#: >-
+            {{ bool(stage) and bool(package_name) and uid not in ['None', '']
+               and uid not in [str(u) for u in (exclude_user_ids or [])] }}
+
+    - task_name: lookup
+      skip_if: "{{ not lookup }}"
+      tasks:
+        - task_name: read-owning-namespace
+          activity:
+            type: builtin.deploy.wfspec.get
+            input:
+              wfspec_name: "{{ package_name }}"
+            options:
+              retry_policy: {timeout_sec: 20, max_attempts: 2}
+          on_error: {catch: true}
+          output:
+            set:
+              - namespace_id#: "{{ _.get('namespace_id') if isinstance(_, dict) else None }}"
+
+        - task_name: check-namespace-admin
+          skip_if: "{{ not namespace_id }}"
+          activity:
+            type: builtin.deploy.auth.check_user_privilege
+            input:
+              user_id: "{{ uid }}"
+              privilege_id: "{{ namespace_id }}:{{ privilege }}"
+            options:
+              retry_policy: {timeout_sec: 20, max_attempts: 2}
+          on_error: {catch: true}
+          output:
+            set:
+              - is_admin#: "{{ isinstance(_, dict) and _.get('has_privilege') is True }}"

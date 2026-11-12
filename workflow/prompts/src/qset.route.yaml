@@ -1,0 +1,158 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# ================================================================================
+# QSET.ROUTE — the router's one System One request (design §7.2, plan-01 step 6)
+# ================================================================================
+#
+#   variables                                   out
+#   ─────────────────────────────────────────── ─────────────────────────────────
+#   message, history, profiles, sources,        {kind: system_one, state, questions,
+#   offer_sources, pending_action,              keymap, trace}
+#   previous_answer, is_guest, long_term_memory,
+#   episodes, max_questions
+#
+# A data wfspec: it only BUILDS the request. `decide` sends it, query-router reads
+# the answer back through `keymap` (plan-09). Ported from the old agent's
+# query-analyzer, generalised from domains to profiles + sources.
+#
+# Questions, offered only when legal (§6.3.2):
+#   route              choice   always; labels profile_<i> + pending_* while an action is pending
+#   needs_context      noul     history exists
+#   ambiguity          score    always
+#   negative_feedback  noul     a previous answer exists
+#   states_preference  noul     not a guest and long-term memory on
+#   refers_to_past     noul     episodes enabled
+#   source_<i>         noul     offer_sources, in the slots left under max_questions
+#
+# QUESTION CAP (§7.3, M1: ~240 ms per question). At most `max_questions` (10)
+# questions: the fixed ones first, then sources. With more sources than slots, the
+# ones whose name, description and keywords share the most words with the message
+# are kept (ties in name order); the rest are listed in `trace.dropped_sources`.
+#
+# POSITIONAL KEYS. Profiles and sources are `profile_<i>` / `source_<i>`, with
+# `keymap` from key to name, so a name can never collide with a fixed key and an
+# unknown name can never be selected.
+#
+# SORTED. Temporal serialises activity input with sorted keys, at every level, and
+# System One is sensitive to the order; the request is returned already sorted so
+# --in-memory and Temporal ask the same thing (§6.3.2).
+# ================================================================================
+
+header:
+  schema_version: 2.0.0
+  workflow_name: qset.route
+
+context:
+  pending_labels:
+    pending_approve: "A reply approving the pending action -- \"looks good\", \"go ahead\", \"yes\"."
+    pending_reject: "A reply refusing or abandoning the pending action -- \"no\", \"cancel that\", \"never mind\"."
+    pending_revise: "A reply asking for changes to the pending action before it goes ahead."
+  ambiguity_levels:
+    - "clear"
+    - "somewhat ambiguous"
+    - "too ambiguous to answer without asking"
+  history_exchanges: 4
+  history_chars: 300
+
+input:
+  message: ""
+  # [{role, content}], oldest first.
+  history: []
+  # The AVAILABLE profiles (§6.7.1): [{name, route_description, examples?}].
+  profiles: []
+  # The knowledge catalog: [{name, description, keywords?}].
+  sources: []
+  # True when an available profile requires sources (§7.2).
+  offer_sources: false
+  # null, or {id, summary} while an action awaits this conversation's reply.
+  pending_action:
+  previous_answer: false
+  is_guest: true
+  long_term_memory: false
+  episodes: false
+  max_questions: 10
+
+output:
+  kind: system_one
+  state: "{{ state }}"
+  questions: "{{ questions }}"
+  keymap: "{{ keymap }}"
+  trace: "{{ trace }}"
+
+main:
+  tasks:
+
+    - task_name: build-route-qset
+      set:
+        - _msg: "{{ str(message or '').strip() }}"
+        - _hist: >-
+            {{ [m for m in (history or []) if isinstance(m, dict) and m.get('content')][-2 * history_exchanges:] }}
+        - _history_block: >-
+            {{ '\n'.join(str(m.get('role', '?')) + ': ' + str(m.get('content'))[:history_chars] for m in _hist) }}
+        - state: >-
+            {{ ('Conversation so far:\n' + _history_block + '\n\n' if _history_block else '')
+               + 'Current message: ' + _msg }}
+        - _profiles: "{{ [p for p in (profiles or []) if isinstance(p, dict) and p.get('name')] }}"
+        - _pending: "{{ isinstance(pending_action, dict) and bool(pending_action) }}"
+        - _route_criteria: >-
+            {{ dict({('profile_' + str(i)): str(p.get('route_description') or p['name'])
+                       + ((' For example: ' + '; '.join(str(e) for e in p['examples'][:3]) + '.')
+                          if p.get('examples') else '')
+                     for i, p in enumerate(_profiles)},
+                    **({k: v + ((' Pending: ' + str(pending_action.get('summary'))) if pending_action.get('summary') else '')
+                        for k, v in pending_labels.items()} if _pending else {})) }}
+        - _fixed: >-
+            {{ dict(
+                 {'route': {'type': 'choice',
+                            'instructions': 'Which of these best describes the current message? '
+                                            'Use the conversation so far only to understand it.',
+                            'criteria': _route_criteria},
+                  'ambiguity': {'type': 'score',
+                                'instructions': 'How clear is it what the current message asks for?',
+                                'criteria': ambiguity_levels}},
+                 **({'needs_context': {'type': 'noul',
+                                       'instructions': 'Does the current message only make sense with the '
+                                                       'conversation so far -- does it use "it", "that", '
+                                                       '"those" or otherwise refer back to an earlier turn?'}}
+                    if _history_block else {}),
+                 **({'negative_feedback': {'type': 'noul',
+                                           'instructions': 'Is the user saying the previous answer was wrong '
+                                                           'or unhelpful?'}}
+                    if previous_answer else {}),
+                 **({'states_preference': {'type': 'noul',
+                                           'instructions': 'Does the user state a preference, constraint, or '
+                                                           'fact about their environment?'}}
+                    if long_term_memory and not is_guest else {}),
+                 **({'refers_to_past': {'type': 'noul',
+                                        'instructions': 'Does the user refer to a previous conversation or '
+                                                        'earlier work?'}}
+                    if episodes else {})) }}
+        # Sources fill the slots left. Ranked by word overlap with the message, ties
+        # in name order, so the same catalog and message always pick the same ones.
+        - _words: "{{ set(re.findall(r'[a-z0-9]+', _msg.lower())) }}"
+        - _ranked: >-
+            {{ sorted([s for s in (sources or []) if isinstance(s, dict) and s.get('name')],
+                      key=lambda s: (-len(_words & set(re.findall(r'[a-z0-9]+',
+                                        (str(s['name']) + ' ' + str(s.get('description') or '') + ' '
+                                         + ' '.join(str(k) for k in (s.get('keywords') or []))).lower()))),
+                                     str(s['name']))) if offer_sources else [] }}
+        - _slots: "{{ max(0, int(max_questions) - len(_fixed)) }}"
+        - _kept: "{{ _ranked[:_slots] }}"
+        - _sources_q: >-
+            {{ {('source_' + str(i)): {'type': 'noul',
+                                       'instructions': 'Could the "' + str(s['name']) + '" source ('
+                                                       + str(s.get('description') or 'no description')
+                                                       + ((', keywords: ' + ', '.join(str(k) for k in s['keywords']))
+                                                          if s.get('keywords') else '')
+                                                       + ') help answer the current message?'}
+                for i, s in enumerate(_kept)} }}
+        - _all: "{{ dict(_fixed, **_sources_q) }}"
+        - questions: >-
+            {{ {k: {qk: (dict(sorted(qv.items())) if isinstance(qv, dict) else qv)
+                    for qk, qv in sorted(_all[k].items())}
+                for k in sorted(_all)} }}
+        - keymap: >-
+            {{ dict(sorted(dict({('profile_' + str(i)): p['name'] for i, p in enumerate(_profiles)},
+                                **{('source_' + str(i)): s['name'] for i, s in enumerate(_kept)}).items())) }}
+        - trace:
+            question_count: "{{ len(questions) }}"
+            dropped_sources: "{{ [s['name'] for s in _ranked[_slots:]] }}"

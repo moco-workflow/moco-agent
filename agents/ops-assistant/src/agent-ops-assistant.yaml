@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=../../../../moco-devkit/moco-workflow-dev/skills/moco-developing-workflows/workflowspec_schema.json
+# AGENT-OPS-ASSISTANT — the package's main wfspec; the definition is agent.ops-assistant.
+header:
+  schema_version: 2.0.0
+  workflow_name: agent-ops-assistant
+
+context:
+  info: {agent_id: ops-assistant, definition: agent-ops-assistant/agent.ops-assistant}
+
+output: '{{ info }}'
+
+main:
+  task_name: describe
+  set:
+    - _described: true

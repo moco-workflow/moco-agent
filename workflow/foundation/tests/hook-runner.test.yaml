@@ -1,0 +1,167 @@
+test_type: integration-test
+
+# hook-runner (plan-03 step 8, design §5.4): the patch allowlist, block where allowed,
+# declaration order with the patched payload feeding the next hook, a failure is
+# `continue`, async hooks only observe. One mock answers every hook, so a mock
+# picks its answer by hook['wfspec'] (and reads `payload` to prove the chain).
+
+wfspec:
+  name: hook-runner
+
+test_cases:
+  - id: a-turn-received-hook-may-patch-the-message-and-nothing-else
+    input:
+      hook_event: turn.received
+      payload: {message: "my ssn is 123-45-6789", meta: {title: t}}
+      hooks: [{event: turn.received, wfspec: hook.redact, mode: sync}]
+    mocks:
+      - {step_name: run-sync-hook, _: {action: patch, patch: {message: "my ssn is [redacted]", meta: {title: hacked}}}}
+    expect:
+      output:
+        - action: continue
+        - payload: {message: "my ssn is [redacted]", meta: {title: t}}
+        - trace: [{hook: hook.redact, action: patch, dropped: [meta], failure: null}]
+
+  - id: hooks-run-in-order-and-each-sees-the-previous-patch
+    input:
+      hook_event: answer.ready
+      payload: {answer: "A", sources: []}
+      hooks:
+        - {event: answer.ready, wfspec: hook.one}
+        - {event: turn.received, wfspec: hook.other-event}
+        - {event: answer.ready, wfspec: hook.two}
+    mocks:
+      - step_name: run-sync-hook
+        _: "{{ {'action': 'patch', 'patch': {'answer': payload['answer'] + ('1' if hook['wfspec'] == 'hook.one' else '2')}} }}"
+    expect:
+      output:
+        - payload: {answer: "A12", sources: []}
+      assert:
+        - "{{ [t['hook'] for t in trace] == ['hook.one', 'hook.two'] }}"
+
+  - id: a-block-on-turn-received-stops-the-chain-with-its-reason
+    input:
+      hook_event: turn.received
+      payload: {message: "x"}
+      hooks: [{event: turn.received, wfspec: hook.block}, {event: turn.received, wfspec: hook.never}]
+    mocks:
+      - step_name: run-sync-hook
+        _: "{{ {'action': 'block', 'reason': 'not allowed here'} if hook['wfspec'] == 'hook.block' else 1 / 0 }}"
+    expect:
+      output:
+        - action: block
+        - reason: "not allowed here"
+      assert:
+        - "{{ len(trace) == 1 }}"
+
+  - id: a-tool-before-block-is-honoured
+    input: {hook_event: tool.before, payload: {call: {name: k8s_get_secret}}, hooks: [{event: tool.before, wfspec: hook.veto}]}
+    mocks:
+      - {step_name: run-sync-hook, _: {action: block, reason: "secrets are off limits on fridays"}}
+    expect:
+      output:
+        - action: block
+
+  - id: an-answer-ready-block-is-ignored
+    input: {hook_event: answer.ready, payload: {answer: "A", sources: []}, hooks: [{event: answer.ready, wfspec: hook.rude}]}
+    mocks:
+      - {step_name: run-sync-hook, _: {action: block, reason: "no"}}
+    expect:
+      output:
+        - action: continue
+        - payload: {answer: "A", sources: []}
+      assert:
+        - "{{ trace[0]['action'] == 'block_ignored' }}"
+
+  - id: a-failing-hook-is-continue-and-logged
+    input: {hook_event: answer.ready, payload: {answer: "A", sources: []}, hooks: [{event: answer.ready, wfspec: hook.broken, timeout_sec: 2}]}
+    mocks:
+      - {step_name: run-sync-hook, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - action: continue
+        - payload: {answer: "A", sources: []}
+      assert:
+        - "{{ 'ZeroDivisionError' in trace[0]['failure'] or 'division' in trace[0]['failure'] }}"
+
+  - id: an-async-hook-only-observes
+    input: {hook_event: answer.ready, payload: {answer: "A", sources: []}, hooks: [{event: answer.ready, wfspec: hook.audit, mode: async}]}
+    mocks:
+      - {step_name: run-async-hook, _: "wf-123"}
+      - {step_name: run-sync-hook, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - action: continue
+        - payload: {answer: "A", sources: []}
+
+  - id: no-hooks-for-the-event-is-a-no-op
+    input: {hook_event: tool.before, payload: {call: {name: x}}, hooks: [{event: answer.ready, wfspec: hook.x}]}
+    mocks:
+      - {step_name: run-sync-hook, _: "{{ 1 / 0 }}"}
+    expect:
+      output:
+        - action: continue
+        - trace: []
+
+  - id: an-unknown-event-is-a-bug
+    input: {hook_event: route.changed, payload: {}, hooks: []}
+    expect:
+      error:
+        error_type: AbortError
+        error_message: null
+
+  # ── the deferred events (phase 3) ───────────────────────────────────────
+  - id: route-decided-may-patch-sources-only-and-not-block
+    input:
+      hook_event: route.decided
+      payload: {route: rag, sources: [a, b], message: m}
+      hooks: [{event: route.decided, wfspec: hook.narrow}]
+    mocks:
+      - {step_name: run-sync-hook, _: {action: patch, patch: {sources: [a], route: chat}}}
+    expect:
+      output:
+        - action: continue
+        - payload: {route: rag, sources: [a], message: m}
+        - trace: [{hook: hook.narrow, action: patch, dropped: [route], failure: null}]
+
+  - id: tool-after-may-replace-the-content
+    input:
+      hook_event: tool.after
+      payload: {call: {name: pods}, content: "token=abc123"}
+      hooks: [{event: tool.after, wfspec: hook.redact}]
+    mocks:
+      - {step_name: run-sync-hook, _: {action: patch, patch: {content: "token=[redacted]"}}}
+    expect:
+      output:
+        - payload: {call: {name: pods}, content: "token=[redacted]"}
+
+  - id: observe-only-events-drop-every-patch-and-ignore-a-block
+    input:
+      hook_event: turn.committed
+      payload: {turn: 3, status: ok}
+      hooks: [{event: turn.committed, wfspec: hook.audit}]
+    mocks:
+      - {step_name: run-sync-hook, _: {action: block, reason: no}}
+    expect:
+      output:
+        - action: continue
+        - payload: {turn: 3, status: ok}
+        - trace: [{hook: hook.audit, action: block_ignored, dropped: [], failure: null}]
+
+
+  # A bare name is run qualified with the agent package (a break-away caller such as
+  # agent-loop has not loaded it); a qualified name is run as written.
+  - id: a-bare-hook-name-runs-from-the-agent-package
+    input:
+      hook_event: answer.ready
+      payload: {answer: "", sources: []}
+      agent_id: moco-assistant
+      hooks:
+        - {event: answer.ready, wfspec: hook.moco.link-check}
+        - {event: answer.ready, wfspec: agent-other/hook.shared}
+    mocks:
+      - step_name: run-sync-hook
+        _: "{{ {'action': 'patch', 'patch': {'answer': payload['answer'] + hook['ref'] + ';'}} }}"
+    expect:
+      output:
+        - payload: {answer: "agent-moco-assistant/hook.moco.link-check;agent-other/hook.shared;", sources: []}
