@@ -95,7 +95,7 @@ The ops-assistant tools come from `agents/ops-assistant/src/tools.ops-assistant.
        `skip_cert_verify: false` and `proxy` (seen live: after a certificate error the model
        offered to retry with `skip_cert_verify`), and a base `url` where only one host is meant.
      - **Deployed workflows**: lists the workflows deployed to you on this stage that declare
-       `header.metadata.tool` (see the moco-doc guide "Workflows as Agent Tools"). Side effects
+       `header.metadata.tool` (see the moco-docs guide "Workflows as Agent Tools"). Side effects
        come from the declaration; the provider can only make them stricter. A workflow tool
        runs as the calling user.
 2. **Opt the agent in:** list its toolsets in `toolsets: [...]`, and include `react` (or another

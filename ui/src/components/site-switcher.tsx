@@ -12,7 +12,7 @@ export type SiteId = 'home' | 'docs' | 'playground' | 'agent' | 'console';
  * basename, so a client-side navigation to `/docs` would resolve against this SPA
  * and render its not-found route instead of leaving for the docs site.
  *
- * Keep this set and its labels in step with the switchers in moco-home, moco-doc,
+ * Keep this set and its labels in step with the switchers in moco-home, moco-docs,
  * moco-ui and the sibling apps under moco-apps/.
  */
 const SITES: { id: SiteId; href: string; label: string; Icon: typeof House }[] = [

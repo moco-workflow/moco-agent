@@ -128,7 +128,7 @@ Changed: `access` (honours the flag), `agent-config` (computes it in `resolve`, 
 7. **Docs**: design §6.13 (new authority source, table row, policy paragraph), §6.1.1 (the
    two computed keys and the definition-only field), plan-00 F48, plan-04 steps/tests,
    `CLAUDE.md` rule *"Authority comes from `__user_info__.user_id`"* (unchanged: the lookup
-   is keyed by it), and the moco-doc agent admin page if one exists.
+   is keyed by it), and the moco-docs agent admin page if one exists.
 
 ## 6. Tests
 

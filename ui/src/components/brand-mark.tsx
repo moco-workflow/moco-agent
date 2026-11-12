@@ -8,7 +8,7 @@ import { cn } from '@/lib/utils';
  *
  * Inline rather than an `<img>` so it can sit on any surface and scale with the
  * surrounding type; the favicon version lives in public/moco-mark.svg. Keep the
- * geometry in step with moco-ui, moco-doc, moco-home and the sibling apps under
+ * geometry in step with moco-ui, moco-docs, moco-home and the sibling apps under
  * moco-apps/ — these are separate Vite builds with no shared package, so the
  * component is duplicated the same way site-switcher and lib/utils already are.
  *
